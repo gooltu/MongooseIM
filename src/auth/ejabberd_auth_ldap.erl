@@ -82,7 +82,8 @@
                                                      derefFindingBaseObj |
                                                      derefAlways,
         dn_filter              :: binary() | undefined,
-        dn_filter_attrs = []   :: [binary()]
+        dn_filter_attrs = []   :: [binary()],
+        check_user_password = true :: boolean()
        }).
 -type state() :: #state{}.
 
@@ -134,7 +135,12 @@ init(Host) ->
                           State#state.password, State#state.tls_options),
     {ok, State}.
 
-store_type(_) -> external.
+store_type(Host) ->
+    {ok, State} = eldap_utils:get_state(Host, ?MODULE),
+    case State#state.check_user_password of
+        true -> external;
+        false -> scram
+    end.
 
 config_change(Acc, Host, ldap, _NewConfig) ->
     stop(Host),
@@ -146,7 +152,25 @@ config_change(Acc, _, _, _) ->
 -spec authorize(mongoose_credentials:t()) -> {ok, mongoose_credentials:t()}
                                            | {error, any()}.
 authorize(Creds) ->
-    ejabberd_auth:authorize_with_check_password(?MODULE, Creds).
+    LServer = mongoose_credentials:lserver(Creds),
+    {ok, State} = eldap_utils:get_state(LServer, ?MODULE),
+    case State#state.check_user_password of
+        true -> ejabberd_auth:authorize_with_check_password(?MODULE, Creds);
+        false -> verify_user_exists(Creds)
+    end.
+
+verify_user_exists(Creds) ->
+    User = mongoose_credentials:get(Creds, username),
+    case jid:nodeprep(User) of
+        error ->
+            error({nodeprep_error, User});
+        LUser ->
+            LServer = mongoose_credentials:lserver(Creds),
+            case does_user_exist(LUser, LServer) of
+                true -> {ok, mongoose_credentials:extend(Creds, [{auth_module, ?MODULE}])};
+                false -> {error, not_authorized}
+            end
+    end.
 
 -spec check_password(LUser :: jid:luser(),
                      LServer :: jid:lserver(),
@@ -533,6 +557,8 @@ parse_options(Host) ->
                             end, {undefined, []}),
     LocalFilter = eldap_utils:get_opt(
                     {ldap_local_filter, Host}, [], fun(V) -> V end),
+    CheckUserPassword = eldap_utils:get_opt(
+                      {ldap_check_user_password, Host}, [], fun(V) -> V end, true),
     #state{host = Host, eldap_id = EldapID,
            bind_eldap_id = BindEldapID,
            servers = Cfg#eldap_config.servers,
@@ -545,7 +571,8 @@ parse_options(Host) ->
            deref = Cfg#eldap_config.deref,
            uids = UIDs, ufilter = UserFilter,
            sfilter = SearchFilter, lfilter = LocalFilter,
-           dn_filter = DNFilter, dn_filter_attrs = DNFilterAttrs}.
+           dn_filter = DNFilter, dn_filter_attrs = DNFilterAttrs,
+           check_user_password = CheckUserPassword}.
 
 
 -spec check_filter(F :: iolist()) -> binary().
