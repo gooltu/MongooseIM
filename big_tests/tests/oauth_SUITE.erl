@@ -110,14 +110,9 @@ init_per_group(GroupName, Config0) ->
                  commands -> ejabberd_node_utils:init(Config0);
                  _ -> Config0
              end,
-    case get_auth_method() of
-        external ->
-            {skip, "external authentication requires plain password"};
-        _ ->
-            config_password_format(GroupName),
-            Config2 = escalus:create_users(Config, escalus:get_users([bob, alice])),
-            assert_password_format(GroupName, Config2)
-    end.
+    config_password_format(GroupName),
+    Config2 = escalus:create_users(Config, escalus:get_users([bob, alice])),
+    assert_password_format(GroupName, Config2).
 
 end_per_group(cleanup, Config) ->
     escalus:delete_users(Config, escalus:get_users([alice]));
@@ -360,9 +355,9 @@ extract_tokens(#xmlel{name = <<"iq">>, children = [#xmlel{name = <<"items">>} = 
     RTD = exml_query:path(Items, [{element, <<"refresh_token">>}, cdata]),
     {base64:decode(ATD), base64:decode(RTD)}.
 
-get_auth_method() ->
+supports_password_type(PasswordType) ->
     XMPPDomain = escalus_ejabberd:unify_str_arg(ct:get_config({hosts, mim, domain})),
-    rpc(mim(), ejabberd_auth, store_type, [XMPPDomain]).
+    rpc(mim(), ejabberd_auth, supports_password_type, [XMPPDomain, PasswordType]).
 
 set_store_password(Type) ->
     XMPPDomain = escalus_ejabberd:unify_str_arg(ct:get_config({hosts, mim, domain})),
