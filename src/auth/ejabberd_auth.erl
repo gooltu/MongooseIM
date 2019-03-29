@@ -124,7 +124,7 @@ get_opt(Host, Opt) ->
 
 -spec supports_password_type(jid:lserver(), cyrsasl:password_type()) -> boolean().
 supports_password_type(Server, PasswordType) ->
-    lists:any(fun(M) -> M:supports_password_type(Server, PasswordType) end, auth_modules()).
+    lists:any(fun(M) -> M:supports_password_type(Server, PasswordType) end, auth_modules(Server)).
 
 -spec authorize(mongoose_credentials:t()) -> {ok, mongoose_credentials:t()}
                                            | {error, any()}.

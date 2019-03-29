@@ -113,7 +113,7 @@ listmech(Host) ->
     Mechs = ets:foldl(fun(#sasl_mechanism{password_type = PasswordType, mechanism = M}, MechAcc) ->
                               case ejabberd_auth:supports_password_type(Host, PasswordType) of
                                   true -> [M | MechAcc];
-                                  false -> [M]
+                                  false -> MechAcc
                               end
                       end, [], sasl_mechanism),
     filter_mechanisms(Host, Mechs,

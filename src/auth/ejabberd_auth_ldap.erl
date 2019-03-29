@@ -136,7 +136,8 @@ init(Host) ->
 
 -spec supports_password_type(jid:lserver(), cyrsasl:password_type()) -> boolean().
 supports_password_type(_, plain) -> true;
-supports_password_type(_, cert) -> true.
+supports_password_type(_, cert) -> true;
+supports_password_type(_, _) -> false.
 
 config_change(Acc, Host, ldap, _NewConfig) ->
     stop(Host),
