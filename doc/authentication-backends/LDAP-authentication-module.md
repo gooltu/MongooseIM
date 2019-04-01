@@ -5,7 +5,7 @@ It provides a read-only abstraction over an LDAP directory.
 
 The following SASL methods are supported:
 * SASL PLAIN: user credentials are verified by performing an LDAP search followed by a bind with the user name and password provided by the client.
-* SASL EXTERNAL: user credentials are verified by performing an LDAP search with the user name provided by the client. This can be used to verify that the user is allowed to log in after the provided certificate has been verified. This method requires setting `{password_format, scram}` in `auth_opts`.
+* SASL EXTERNAL: user credentials are verified by performing an LDAP search with the user name provided by the client. This can be used to verify that the user is allowed to log in after the provided certificate has been verified.
 
 ## Configuration options
 
