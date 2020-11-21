@@ -188,8 +188,8 @@ get_password(_Config) ->
             <<"makota">> = ejabberd_auth_http:get_password(<<"alice">>, ?DOMAIN1),
             <<"makota">> = ejabberd_auth_http:get_password_s(<<"alice">>, ?DOMAIN1);
         true ->
-            % tuple with SCRAM data
-            {_, _, _, _} = ejabberd_auth_http:get_password(<<"alice">>, ?DOMAIN1),
+            % map with SCRAM data
+            is_map(ejabberd_auth_http:get_password(<<"alice">>, ?DOMAIN1)),
             <<>> = ejabberd_auth_http:get_password_s(<<"alice">>, ?DOMAIN1)
     end,
     false = ejabberd_auth_http:get_password(<<"anakin">>, ?DOMAIN1),
@@ -199,19 +199,21 @@ is_user_exists(_Config) ->
     true = ejabberd_auth_http:does_user_exist(<<"alice">>, ?DOMAIN1),
     false = ejabberd_auth_http:does_user_exist(<<"madhatter">>, ?DOMAIN1).
 
-% remove_user/2,3
+% remove_user/2
 remove_user(_Config) ->
     true = ejabberd_auth_http:does_user_exist(<<"toremove1">>, ?DOMAIN1),
     ok = ejabberd_auth_http:remove_user(<<"toremove1">>, ?DOMAIN1),
     false = ejabberd_auth_http:does_user_exist(<<"toremove1">>, ?DOMAIN1).
 
 supported_sasl_mechanisms(Config) ->
-    Modules = [cyrsasl_plain, cyrsasl_digest, cyrsasl_scram, cyrsasl_external],
+    Modules = [cyrsasl_plain, cyrsasl_digest, cyrsasl_external,
+               cyrsasl_scram_sha1, cyrsasl_scram_sha224, cyrsasl_scram_sha256,
+               cyrsasl_scram_sha384, cyrsasl_scram_sha512],
     DigestSupported = case lists:keyfind(scram_group, 1, Config) of
                           {_, true} -> false;
                           _ -> true
                       end,
-    [true, DigestSupported, true, false] =
+    [true, DigestSupported, false, true, true, true, true, true] =
         [ejabberd_auth_http:supports_sasl_module(?DOMAIN1, Mod) || Mod <- Modules].
 
 cert_auth_fail(Config) ->
@@ -238,7 +240,7 @@ creds_with_cert(Config, Username) ->
 meck_config(Config) ->
     meck:unload(),
     ScramOpts = case lists:keyfind(scram_group, 1, Config) of
-                    {_, true} -> [{password_format, scram}];
+                    {_, false} -> [{password_format, plain}];
                     _ -> []
                 end,
     meck:new(ejabberd_config),
@@ -258,7 +260,7 @@ meck_cleanup() ->
 do_scram(Pass, Config) ->
     case lists:keyfind(scram_group, 1, Config) of
         {_, true} ->
-            mongoose_scram:serialize(mongoose_scram:password_to_scram(Pass, mongoose_scram:iterations(?DOMAIN1)));
+            mongoose_scram:serialize(mongoose_scram:password_to_scram(?DOMAIN1, Pass, mongoose_scram:iterations(?DOMAIN1)));
         _ ->
             Pass
     end.

@@ -52,7 +52,7 @@
                 pres_i = gb_sets:new() :: jid_set() | debug_presences(),
                 pending_invitations = [],
                 pres_last, pres_pri,
-                pres_timestamp :: calendar:datetime() | undefined,
+                pres_timestamp :: integer() | undefined, % unix time in seconds
                 %% Are we invisible?
                 pres_invis = false :: boolean(),
                 privacy_list = #userlist{} :: mongoose_privacy:userlist(),
@@ -77,7 +77,7 @@
                 csi_buffer = [] :: [mongoose_acc:t()],
                 hibernate_after = 0 :: non_neg_integer(),
                 replaced_pids = [] :: [{MonitorRef :: reference(), ReplacedPid :: pid()}],
-                info_handlers = #{} :: #{ term() => {module(), atom(), term()} }
+                handlers = #{} :: #{ term() => {module(), atom(), term()} }
                 }).
 -type aux_key() :: atom().
 -type aux_value() :: any().

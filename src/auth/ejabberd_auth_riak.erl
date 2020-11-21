@@ -50,14 +50,12 @@ start(_Host) ->
 
 -spec stop(jid:lserver()) -> ok.
 stop(_Host) ->
-    ok.
+ok.
 
 -spec supports_sasl_module(jid:lserver(), cyrsasl:sasl_module()) -> boolean().
-supports_sasl_module(_, cyrsasl_plain) -> true;
-supports_sasl_module(_, cyrsasl_scram) -> true;
-supports_sasl_module(_, cyrsasl_scram_sha256) -> true;
+supports_sasl_module(_Host, cyrsasl_plain) -> true;
 supports_sasl_module(Host, cyrsasl_digest) -> not mongoose_scram:enabled(Host);
-supports_sasl_module(_, _) -> false.
+supports_sasl_module(Host, Mechanism) -> mongoose_scram:enabled(Host, Mechanism).
 
 -spec set_password(jid:luser(), jid:lserver(), binary())
         -> ok | {error, not_allowed | invalid_jid}.
@@ -67,7 +65,10 @@ set_password(LUser, LServer, Password) ->
             {error, invalid_password};
         Password ->
             User = mongoose_riak:fetch_type(bucket_type(LServer), LUser),
-            do_set_password(User, LUser, LServer, Password)
+            do_set_password(User, LUser, LServer, Password);
+        {<<>>, Scram} ->
+            User = mongoose_riak:fetch_type(bucket_type(LServer), LUser),
+            do_set_password(User, LUser, LServer, {<<>>, Scram})
     end.
 
 -spec authorize(mongoose_credentials:t()) -> {ok, mongoose_credentials:t()}
@@ -80,7 +81,7 @@ check_password(LUser, LServer, Password) ->
     case do_get_password(LUser, LServer) of
         false ->
             false;
-        #scram{} = Scram ->
+        Scram when is_record(Scram, scram) orelse is_map(Scram)->
             mongoose_scram:check_password(Password, Scram);
         Password when is_binary(Password) ->
             Password /= <<"">>;
@@ -97,7 +98,7 @@ check_password(LUser, LServer, Password, Digest, DigestGen) ->
     case do_get_password(LUser, LServer) of
         false ->
             false;
-        #scram{} = Scram ->
+        Scram when is_record(Scram, scram) orelse is_map(Scram) ->
             mongoose_scram:check_digest(Scram, Digest, DigestGen, Password);
         PassRiak when is_binary(PassRiak) ->
             ejabberd_auth:check_digest(Digest, DigestGen, Password, PassRiak)
@@ -146,8 +147,10 @@ get_password(LUser, LServer) ->
     case do_get_password(LUser, LServer) of
         false ->
             false;
+        Scram when is_map(Scram) ->
+            Scram;
         #scram{} = Scram ->
-            mongoose_scram:scram_to_tuple(Scram);
+            mongoose_scram:scram_record_to_map(Scram);
         Password ->
             Password
     end.
@@ -222,15 +225,15 @@ do_set_password({ok, Map}, LUser, LServer, Password) ->
     UpdateMap = mongoose_riak:update_map(Map, Ops),
     mongoose_riak:update_type(bucket_type(LServer), LUser, riakc_map:to_op(UpdateMap)).
 
-prepare_password(Iterations, Password) when is_integer(Iterations) ->
-    Scram = mongoose_scram:password_to_scram(Password, Iterations),
+prepare_password(Server, Iterations, Password) when is_integer(Iterations) ->
+    Scram = mongoose_scram:password_to_scram(Server, Password, Iterations),
     PassDetails = mongoose_scram:serialize(Scram),
-    {<<"">>, PassDetails};
+    {<<"">>, PassDetails}.
 
 prepare_password(Server, Password) ->
     case mongoose_scram:enabled(Server) of
         true ->
-            prepare_password(mongoose_scram:iterations(Server), Password);
+            prepare_password(Server, mongoose_scram:iterations(Server), Password);
         _ ->
             Password
     end.

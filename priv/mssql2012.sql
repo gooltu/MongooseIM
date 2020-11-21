@@ -66,14 +66,21 @@ CREATE TABLE [dbo].[mam_message](
 	[direction] [nvarchar](1) NOT NULL,
 	[message] [varbinary](max) NOT NULL,
 	[search_body] [nvarchar](max) NOT NULL,
+	[origin_id] [nvarchar](250) NULL,
  CONSTRAINT [PK_mam_message_user_id] PRIMARY KEY CLUSTERED
 (
 	[user_id] ASC,
 	[id] ASC
 )WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, IGNORE_DUP_KEY = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON) ON [PRIMARY]
 ) ON [PRIMARY] TEXTIMAGE_ON [PRIMARY]
-
 GO
+
+CREATE INDEX i_mam_message_username_jid_id ON mam_message (user_id, remote_bare_jid, id);
+GO
+
+CREATE INDEX i_mam_message_username_jid_origin_id ON mam_message (user_id, remote_bare_jid, origin_id);
+GO
+
 SET ANSI_PADDING OFF
 GO
 /****** Object:  Table [dbo].[mam_muc_message]    Script Date: 9/17/2014 6:20:03 AM ******/
@@ -92,6 +99,7 @@ CREATE TABLE [dbo].[mam_muc_message](
 	[nick_name] [nvarchar](250) NOT NULL,
 	[message] [varbinary](max) NOT NULL,
 	[search_body] [nvarchar](max) NOT NULL,
+	[origin_id] [nvarchar](250) NULL,
  CONSTRAINT [PK_mam_muc_message_id] PRIMARY KEY CLUSTERED
 (
     [room_id] ASC,
@@ -101,6 +109,9 @@ CREATE TABLE [dbo].[mam_muc_message](
 GO
 
 CREATE INDEX i_mam_muc_message_sender_id ON mam_muc_message(sender_id);
+GO
+
+CREATE INDEX i_mam_muc_message_room_id_sender_id_origin_id ON mam_muc_message (room_id, sender_id, origin_id);
 GO
 
 SET ANSI_PADDING OFF
@@ -642,3 +653,42 @@ CREATE TABLE muc_registered(
     nick VARCHAR(250)       NOT NULL,
     PRIMARY KEY (muc_host, luser, lserver)
 );
+
+-- from_jid, to_jid and thread have 250 characters in MySQL
+-- but here we are limited by index size (900 bytes)
+CREATE TABLE smart_markers (
+    from_jid NVARCHAR(150) NOT NULL,
+    to_jid NVARCHAR(150) NOT NULL,
+    thread NVARCHAR(145) NOT NULL,
+    -- chat marker types:
+    -- 'R' - received
+    -- 'D' - displayed
+    -- 'A' - acknowledged
+    type NVARCHAR(1) NOT NULL,
+    msg_id NVARCHAR(250) NOT NULL,
+    timestamp BIGINT NOT NULL,
+    CONSTRAINT pk_smart_markers PRIMARY KEY CLUSTERED(
+            from_jid ASC,
+            to_jid ASC,
+            thread ASC,
+            type ASC
+        )
+);
+
+CREATE INDEX i_smart_markers ON smart_markers(to_jid, thread);
+
+-- jid, thread and room have 250 characters in MySQL
+-- but here we are limited by index size (900 bytes)
+CREATE TABLE offline_markers (
+    jid NVARCHAR(150) NOT NULL,
+    thread NVARCHAR(145) NOT NULL,
+    room NVARCHAR(150) NOT NULL,
+    timestamp BIGINT NOT NULL,
+    CONSTRAINT pk_offline_markers PRIMARY KEY CLUSTERED(
+                jid ASC,
+                thread ASC,
+                room ASC
+        )
+);
+
+CREATE INDEX i_offline_markers ON offline_markers(jid);

@@ -4,6 +4,7 @@ ARG dockerfile_platform
 FROM $dockerfile_platform AS builder
 
 # Install build deps
+ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update
 RUN apt-get install -y locales git make zlib1g-dev unixodbc-dev gcc g++ libssl-dev
 
@@ -44,6 +45,7 @@ RUN apt-get update; dpkg -i *.deb; apt-get install -y -f
 # Simple check if MiM works
 COPY --from=builder /root/mongooseim/tools/wait-for-it.sh .
 COPY --from=builder /root/mongooseim/tools/pkg/scripts/smoke_test.sh .
+COPY --from=builder /root/mongooseim/tools/pkg/scripts/smoke_templates.escript .
 
 RUN ./smoke_test.sh
 

@@ -87,9 +87,12 @@
          stanza_prefs_get_request/1,
          stanza_query_get_request/1,
          parse_prefs_result_iq/1,
+         namespaces/0,
          mam_ns_binary/0,
          mam_ns_binary_v04/0,
          mam_ns_binary_v06/0,
+         retract_ns/0,
+         retract_tombstone_ns/0,
          make_alice_and_bob_friends/2,
          run_prefs_case/6,
          prefs_cases2/0,
@@ -187,10 +190,7 @@ wait_for_complete_archive_response(P, Alice, ExpectedCompleteValue)
                         #{mam_props => P, parsed_iq => ParsedIQ}).
 
 make_iso_time(Micro) ->
-    Now = usec:to_now(Micro),
-    DateTime = calendar:now_to_datetime(Now),
-    {Time, TimeZone} = rpc_apply(jlib, timestamp_to_iso, [DateTime, utc]),
-    Time ++ TimeZone.
+    calendar:system_time_to_rfc3339(usec:to_sec(Micro), [{offset, "Z"}]).
 
 generate_message_text(N) when is_integer(N) ->
     <<"Message #", (list_to_binary(integer_to_list(N)))/binary>>.
@@ -221,9 +221,17 @@ nick(User) ->
     Name = escalus_utils:get_username(User),
     <<"unique_", Name/binary, "_nickname">>.
 
+namespaces() ->
+    [mam_ns_binary_v04(),
+     mam_ns_binary_v06(),
+     retract_ns(),
+     retract_tombstone_ns()].
+
 mam_ns_binary() -> mam_ns_binary_v04().
 mam_ns_binary_v04() -> <<"urn:xmpp:mam:1">>.
 mam_ns_binary_v06() -> <<"urn:xmpp:mam:2">>.
+retract_ns() -> <<"urn:xmpp:message-retract:0">>.
+retract_tombstone_ns() -> <<"urn:xmpp:message-retract:0#tombstone">>.
 
 skip_undefined(Xs) ->
     [X || X <- Xs, X =/= undefined].
@@ -485,13 +493,13 @@ parse_children_message_result_forwarded_message(#xmlel{name = <<"x">>,
     M#forwarded_message{has_x_user_element = IsUser,
                         message_xs = [XEl | M#forwarded_message.message_xs]};
 %% Parse `<archived />' or chat markers.
-parse_children_message_result_forwarded_message(MaybeChatMarker, M) ->
-    case exml_query:attr(MaybeChatMarker, <<"xmlns">>) of
+parse_children_message_result_forwarded_message(Elem, M) ->
+    case exml_query:attr(Elem, <<"xmlns">>) of
         ?NS_CHAT_MARKERS ->
-            M#forwarded_message{ chat_marker = MaybeChatMarker#xmlel.name };
+            M#forwarded_message{ chat_marker = Elem#xmlel.name };
         _ ->
             % Not relevant
-            M
+            M#forwarded_message{ message_children = [Elem | M#forwarded_message.message_children] }
     end.
 
 %% Num is 1-based.
@@ -864,7 +872,7 @@ generate_msg_for_date_user(Owner, Remote, DateTime) ->
 
 generate_msg_for_date_user(Owner, {RemoteBin, _, _} = Remote, DateTime, Content) ->
     MicrosecDateTime = datetime_to_microseconds(DateTime),
-    NowMicro = rpc_apply(mod_mam_utils, now_to_microseconds, [rpc_apply(erlang, now, [])]),
+    NowMicro = rpc_apply(erlang, system_time, [microsecond]),
     Microsec = min(NowMicro, MicrosecDateTime),
     MsgIdOwner = rpc_apply(mod_mam_utils, encode_compact_uuid, [Microsec, random:uniform(20)]),
     MsgIdRemote = rpc_apply(mod_mam_utils, encode_compact_uuid, [Microsec+1, random:uniform(20)]),
@@ -891,8 +899,8 @@ put_msg({{MsgIdOwner, MsgIdRemote},
          {_ToBin, ToJID, ToArcID},
          {_, Source, _}, Packet}) ->
     Host = ct:get_config({hosts, mim, domain}),
-    archive_message([Host, MsgIdOwner, FromArcID, FromJID, ToJID, Source, outgoing, Packet]),
-    archive_message([Host, MsgIdRemote, ToArcID, ToJID, FromJID, Source, incoming, Packet]).
+    archive_message([Host, MsgIdOwner, FromArcID, FromJID, ToJID, Source, none, outgoing, Packet]),
+    archive_message([Host, MsgIdRemote, ToArcID, ToJID, FromJID, Source, none, incoming, Packet]).
 
 archive_message(Args) ->
     rpc_apply(mod_mam, archive_message, Args).
@@ -940,7 +948,7 @@ archive_muc_msg(Host, {{MsgID, _},
                 {_RoomBin, RoomJID, RoomArcID},
                 {_FromBin, FromJID, SrcJID}, _, Packet}) ->
     rpc_apply(mod_mam_muc, archive_message, [Host, MsgID, RoomArcID, RoomJID,
-                                             FromJID, SrcJID, incoming, Packet]).
+                                             FromJID, SrcJID, none, incoming, Packet]).
 
 %% @doc Get a binary jid of the user, that tagged with `UserName' in the config.
 nick_to_jid(UserName, Config) when is_atom(UserName) ->

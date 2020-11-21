@@ -81,6 +81,18 @@ You can check server loglevel:
 mongooseimctl get_loglevel
 ```
 
+Run bootstrap scripts for initial configuration:
+
+```
+mongooseimctl bootstrap
+```
+
+It executes scripts inside the `scripts/` directory with a `bootstrap` prefix in alphabetical order. [More information](Bootstrap-Scripts.md)
+
+Execute /Users/mikhailuvarov/erlang/esl/MongooseIM/_build/prod/rel/mongooseim/scripts/bootstrap01-hello.sh
+Hello from /Users/mikhailuvarov/erlang/esl/MongooseIM/_build/prod/rel/mongooseim/scripts/bootstrap01-hello.sh script.
+MongooseIM is installed into /Users/mikhailuvarov/erlang/esl/MongooseIM/_build/prod/rel/mongooseim
+
 ## Chat users
 
 ### Registering (creating) users
@@ -134,7 +146,7 @@ mongooseimctl  unregister dan localhost
 
 ### Populate the contact lists (rosters)
 
-Fo a given user (`localuser` and `localserver`), add a contact (`user` and `server`):
+For a given user (`localuser` and `localserver`), add a contact (`user` and `server`):
 ```bash
 mongooseimctl add_rosteritem localuser localserver user server nick group subs 
 ```

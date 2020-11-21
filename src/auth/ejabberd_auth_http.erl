@@ -45,11 +45,9 @@ start(_Host) ->
     ok.
 
 -spec supports_sasl_module(jid:lserver(), cyrsasl:sasl_module()) -> boolean().
-supports_sasl_module(_, cyrsasl_plain) -> true;
-supports_sasl_module(_, cyrsasl_scram) -> true;
-supports_sasl_module(_, cyrsasl_scram_sha256) -> true;
-supports_sasl_module(Host, cyrsasl_digest) -> not mongoose_scram:enabled(Host);
-supports_sasl_module(_, _) -> false.
+supports_sasl_module(_Host, cyrsasl_plain) -> true;
+supports_sasl_module(Host, cyrsasl_digest) ->  not mongoose_scram:enabled(Host);
+supports_sasl_module(Host, Mechanism) -> mongoose_scram:enabled(Host, Mechanism).
 
 -spec authorize(mongoose_credentials:t()) -> {ok, mongoose_credentials:t()}
                                            | {error, any()}.
@@ -94,7 +92,7 @@ check_password(LUser, LServer, Password, Digest, DigestGen) ->
 -spec set_password(jid:luser(), jid:lserver(), binary()) -> ok | {error, not_allowed}.
 set_password(LUser, LServer, Password) ->
     PasswordFinal = case mongoose_scram:enabled(LServer) of
-                        true -> mongoose_scram:serialize(mongoose_scram:password_to_scram(
+                        true -> mongoose_scram:serialize(mongoose_scram:password_to_scram(LServer,
                                                   Password, mongoose_scram:iterations(LServer)));
                         false -> Password
                     end,
@@ -108,7 +106,7 @@ set_password(LUser, LServer, Password) ->
     ok | {error, exists | not_allowed}.
 try_register(LUser, LServer, Password) ->
     PasswordFinal = case mongoose_scram:enabled(LServer) of
-                        true -> mongoose_scram:serialize(mongoose_scram:password_to_scram(
+                        true -> mongoose_scram:serialize(mongoose_scram:password_to_scram(LServer,
                                                   Password, mongoose_scram:iterations(LServer)));
                         false -> Password
                     end,
@@ -233,8 +231,8 @@ verify_scram_password(LUser, LServer, Password) ->
     case make_req(get, <<"get_password">>, LUser, LServer, <<"">>) of
         {ok, RawPassword} ->
             case mongoose_scram:deserialize(RawPassword) of
-                {ok, #scram{} = ScramRecord} ->
-                    {ok, mongoose_scram:check_password(Password, ScramRecord)};
+                {ok, DeserializedScramMap} ->
+                    {ok, mongoose_scram:check_password(Password, DeserializedScramMap)};
                 _ ->
                     {error, bad_request}
             end;
@@ -263,7 +261,7 @@ stop(_Host) ->
 -spec check_scram_password(binary(), binary(), binary(), fun()) -> boolean().
 check_scram_password(OriginalPassword, GotPassword, Digest, DigestGen) ->
     case mongoose_scram:deserialize(GotPassword) of
-        {ok, #scram{} = Scram} ->
+        {ok, Scram} ->
             mongoose_scram:check_digest(Scram, Digest, DigestGen, OriginalPassword);
         _ ->
             false
@@ -272,8 +270,8 @@ check_scram_password(OriginalPassword, GotPassword, Digest, DigestGen) ->
 -spec convert_scram_to_tuple(binary()) -> ejabberd_auth:passterm() | false.
 convert_scram_to_tuple(Password) ->
     case mongoose_scram:deserialize(Password) of
-        {ok, #scram{} = Scram} ->
-            mongoose_scram:scram_to_tuple(Scram);
+        {ok, Scram} ->
+           Scram;
         _ ->
             false
     end.

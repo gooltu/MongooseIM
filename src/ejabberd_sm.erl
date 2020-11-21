@@ -336,10 +336,9 @@ bounce_offline_message(Acc, #jid{server = Server} = From, To, Packet) ->
 -spec disconnect_removed_user(mongoose_acc:t(), User :: jid:user(),
                               Server :: jid:server()) -> mongoose_acc:t().
 disconnect_removed_user(Acc, User, Server) ->
-    ejabberd_sm:route(jid:make_noprep(<<>>, <<>>, <<>>),
-                      jid:make(User, Server, <<>>),
-                      Acc,
-                      {broadcast, {exit, <<"User removed">>}}).
+    lists:map(fun({_, Pid}) -> ejabberd_c2s:terminate_session(Pid, <<"User removed">>) end,
+              get_user_present_pids(User, Server)),
+    Acc.
 
 
 -spec get_user_resources(JID :: jid:jid()) -> [binary()].
@@ -420,12 +419,9 @@ close_session_unset_presence(Acc, SID, JID, Status, Reason) ->
 -spec get_session_pid(JID) -> none | pid() when
       JID :: jid:jid().
 get_session_pid(JID) ->
-    #jid{luser = LUser, lserver = LServer, lresource = LResource} = JID,
-    case ejabberd_gen_sm:get_sessions(sm_backend(), LUser, LServer, LResource) of
-        [#session{sid = {_, Pid}}] ->
-            Pid;
-        _ ->
-            none
+    case get_session(JID) of
+        offline -> none;
+        {_, {_, Pid}, _, _} -> Pid
     end.
 
 -spec get_unique_sessions_number() -> integer().

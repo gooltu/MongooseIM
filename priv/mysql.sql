@@ -239,6 +239,7 @@ CREATE TABLE mam_message(
   -- Type test_types.binary_data_16m
   message mediumblob NOT NULL,
   search_body mediumtext,
+  origin_id varchar(250) CHARACTER SET binary,
   PRIMARY KEY (user_id, id),
   INDEX i_mam_message_rem USING BTREE (user_id, remote_bare_jid, id)
 ) CHARACTER SET utf8mb4
@@ -249,7 +250,7 @@ CREATE TABLE mam_message(
 -- Partition is selected based on MOD(user_id, 32)
 -- See for more information
 -- http://dev.mysql.com/doc/refman/5.1/en/partitioning-hash.html
-
+CREATE INDEX i_mam_message_username_jid_origin_id USING BTREE ON mam_message (user_id, remote_bare_jid, origin_id);
 
 CREATE TABLE mam_config(
   user_id INT UNSIGNED NOT NULL,
@@ -283,11 +284,13 @@ CREATE TABLE mam_muc_message(
   -- Term-encoded message packet
   message mediumblob NOT NULL,
   search_body mediumtext,
+  origin_id varchar(250) CHARACTER SET binary,
   PRIMARY KEY (room_id, id)
 ) CHARACTER SET utf8mb4
   ROW_FORMAT=DYNAMIC;
 
 CREATE INDEX i_mam_muc_message_sender_id USING BTREE ON mam_muc_message(sender_id);
+CREATE INDEX i_mam_muc_message_room_id_sender_id_origin_id USING BTREE ON mam_muc_message (room_id, sender_id, origin_id);
 
 CREATE TABLE offline_message(
   id BIGINT UNSIGNED        NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -475,3 +478,29 @@ CREATE TABLE mongoose_cluster_id (
     k varchar(50) PRIMARY KEY,
     v text
 );
+
+CREATE TABLE smart_markers (
+    from_jid VARCHAR(250) NOT NULL,
+    to_jid VARCHAR(250) NOT NULL,
+    thread VARCHAR(250) NOT NULL,
+    -- 'R' - received
+    -- 'D' - displayed
+    -- 'A' - acknowledged
+    type ENUM('R', 'D', 'A') NOT NULL,
+    msg_id VARCHAR(250) NOT NULL,
+    timestamp BIGINT NOT NULL,
+    PRIMARY KEY(from_jid, to_jid, thread, type)
+) CHARACTER SET utf8mb4;
+
+CREATE INDEX i_smart_markers USING BTREE ON smart_markers(to_jid, thread);
+
+
+CREATE TABLE offline_markers (
+    jid VARCHAR(250) NOT NULL,
+    thread VARCHAR(250) NOT NULL,
+    room VARCHAR(250) NOT NULL,
+    timestamp BIGINT NOT NULL,
+    PRIMARY KEY(jid, thread, room)
+) CHARACTER SET utf8mb4;
+
+CREATE INDEX i_offline_markers ON offline_markers(jid);

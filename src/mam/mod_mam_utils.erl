@@ -6,11 +6,7 @@
 %%%-------------------------------------------------------------------
 -module(mod_mam_utils).
 %% Time
--export([maybe_microseconds/1,
-         now_to_microseconds/1,
-         microseconds_to_now/1,
-         datetime_to_microseconds/1,
-         microseconds_to_datetime/1]).
+-export([maybe_microseconds/1]).
 
 %% UID
 -export([generate_message_id/0,
@@ -33,6 +29,9 @@
          get_one_of_path/2,
          get_one_of_path/3,
          is_archivable_message/4,
+         get_retract_id/3,
+         get_origin_id/1,
+         tombstone/2,
          wrap_message/6,
          wrap_message/7,
          result_set/4,
@@ -44,7 +43,8 @@
          decode_optimizations/1,
          form_borders_decode/1,
          form_decode_optimizations/1,
-         is_mam_result_message/1]).
+         is_mam_result_message/1,
+         features/2]).
 
 %% Forms
 -export([
@@ -99,8 +99,6 @@
 -compile({inline, [
                    rsm_ns_binary/0,
                    mam_ns_binary/0,
-                   now_to_microseconds/1,
-                   iso8601_datetime_binary_to_timestamp/1,
                    is_archived_elem_for/2,
                    is_valid_message/3,
                    is_valid_message_type/3,
@@ -123,6 +121,7 @@
 
 -include("mod_mam.hrl").
 -include("mongoose_rsm.hrl").
+-include("mongoose_ns.hrl").
 
 -define(MAYBE_BIN(X), (is_binary(X) orelse (X) =:= undefined)).
 
@@ -152,41 +151,9 @@ rsm_ns_binary() -> <<"http://jabber.org/protocol/rsm">>.
                           (<<>>) -> undefined.
 maybe_microseconds(<<>>) -> undefined;
 maybe_microseconds(ISODateTime) ->
-    case iso8601_datetime_binary_to_timestamp(ISODateTime) of
-        undefined -> undefined;
-        Stamp -> now_to_microseconds(Stamp)
+    try calendar:rfc3339_to_system_time(binary_to_list(ISODateTime), [{unit, microsecond}])
+    catch error:_Error -> undefined
     end.
-
-
--spec now_to_microseconds(erlang:timestamp()) -> unix_timestamp().
-now_to_microseconds({Mega, Secs, Micro}) ->
-    (1000000 * Mega + Secs) * 1000000 + Micro.
-
-
--spec microseconds_to_now(unix_timestamp()) -> erlang:timestamp().
-microseconds_to_now(MicroSeconds) when is_integer(MicroSeconds) ->
-    Seconds = MicroSeconds div 1000000,
-    {Seconds div 1000000, Seconds rem 1000000, MicroSeconds rem 1000000}.
-
-
-%% @doc Returns time in `timestamp()' format.
--spec iso8601_datetime_binary_to_timestamp(iso8601_datetime_binary())
-        -> erlang:timestamp() | undefined.
-iso8601_datetime_binary_to_timestamp(DateTime) when is_binary(DateTime) ->
-    jlib:datetime_binary_to_timestamp(DateTime).
-
-
--spec datetime_to_microseconds(calendar:datetime()) -> integer().
-datetime_to_microseconds({{_, _, _}, {_, _, _}} = DateTime) ->
-    S1 = calendar:datetime_to_gregorian_seconds(DateTime),
-    S0 = calendar:datetime_to_gregorian_seconds({{1970, 1, 1}, {0, 0, 0}}),
-    Seconds = S1 - S0,
-    Seconds * 1000000.
-
-
--spec microseconds_to_datetime(non_neg_integer()) -> calendar:datetime().
-microseconds_to_datetime(MicroSeconds) when is_integer(MicroSeconds) ->
-    calendar:now_to_datetime(mod_mam_utils:microseconds_to_now(MicroSeconds)).
 
 %% -----------------------------------------------------------------------
 %% UID
@@ -367,20 +334,18 @@ is_valid_message(_Mod, _Dir, Packet, ArchiveChatMarkers) ->
     Body       = exml_query:subelement(Packet, <<"body">>, false),
     ChatMarker = ArchiveChatMarkers
                  andalso has_chat_marker(Packet),
+    Retract    = get_retract_id(Packet) =/= none,
     %% Used in MAM
     Result     = exml_query:subelement(Packet, <<"result">>, false),
     %% Used in mod_offline
     Delay      = exml_query:subelement(Packet, <<"delay">>, false),
     %% Message Processing Hints (XEP-0334)
     NoStore    = exml_query:subelement(Packet, <<"no-store">>, false),
-    is_valid_message_children(Body, ChatMarker, Result, Delay, NoStore).
 
-%% Forwarded by MAM message, or just a message without body or chat marker
-is_valid_message_children(false, false, _,     _,     _    ) -> false;
-is_valid_message_children(_,     _,     false, false, false) -> true;
-%% Forwarded by MAM message or delivered by mod_offline
-%% See mam_SUITE:offline_message for a test case
-is_valid_message_children(_,     _,     _,    _,     _    ) -> false.
+    has_any([Body, ChatMarker, Retract]) andalso not has_any([Result, Delay, NoStore]).
+
+has_any(Elements) ->
+    lists:any(fun(El) -> El =/= false end, Elements).
 
 has_chat_marker(Packet) ->
     case exml_query:subelement_with_ns(Packet, ?NS_CHAT_MARKERS) of
@@ -390,25 +355,59 @@ has_chat_marker(Packet) ->
         _                                 -> false
     end.
 
+get_retract_id(Module, Host, Packet) ->
+    case has_message_retraction(Module, Host) of
+        true -> get_retract_id(Packet);
+        false -> none
+    end.
+
+get_retract_id(Packet) ->
+    case exml_query:subelement_with_name_and_ns(Packet, <<"apply-to">>, ?NS_FASTEN) of
+        El = #xmlel{} ->
+            case exml_query:subelement_with_name_and_ns(El, <<"retract">>, ?NS_RETRACT) of
+                #xmlel{} -> exml_query:attr(El, <<"id">>, none);
+                undefined -> none
+            end;
+        undefined -> none
+    end.
+
+get_origin_id(Packet) ->
+    exml_query:path(Packet, [{element_with_ns, <<"origin-id">>, ?NS_STANZAID},
+                             {attr, <<"id">>}], none).
+
+tombstone(Packet, OriginID) ->
+    Packet#xmlel{children = [retracted_element(OriginID)]}.
+
+retracted_element(OriginID) ->
+    Timestamp = calendar:system_time_to_rfc3339(erlang:system_time(second), [{offset, "Z"}]),
+    #xmlel{name = <<"retracted">>,
+           attrs = [{<<"xmlns">>, ?NS_RETRACT},
+                    {<<"stamp">>, list_to_binary(Timestamp)}],
+           children = [#xmlel{name = <<"origin-id">>,
+                              attrs = [{<<"xmlns">>, ?NS_STANZAID},
+                                       {<<"id">>, OriginID}]}
+                      ]}.
+
 %% @doc Forms `<forwarded/>' element, according to the XEP.
 -spec wrap_message(MamNs :: binary(), Packet :: exml:element(), QueryID :: binary(),
-                   MessageUID :: term(), DateTime :: calendar:datetime(),
+                   MessageUID :: term(), TS :: calendar:rfc3339_string(),
                    SrcJID :: jid:jid()) -> Wrapper :: exml:element().
-wrap_message(MamNs, Packet, QueryID, MessageUID, DateTime, SrcJID) ->
-    wrap_message(MamNs, Packet, QueryID, MessageUID, wrapper_id(), DateTime, SrcJID).
+wrap_message(MamNs, Packet, QueryID, MessageUID, TS, SrcJID) ->
+    wrap_message(MamNs, Packet, QueryID, MessageUID, wrapper_id(), TS, SrcJID).
 
 -spec wrap_message(MamNs :: binary(), Packet :: exml:element(), QueryID :: binary(),
-                   MessageUID :: term(), WrapperI :: binary(), DateTime :: calendar:datetime(),
+                   MessageUID :: term(), WrapperI :: binary(),
+                   TS :: calendar:rfc3339_string(),
                    SrcJID :: jid:jid()) -> Wrapper :: exml:element().
-wrap_message(MamNs, Packet, QueryID, MessageUID, WrapperID, DateTime, SrcJID) ->
+wrap_message(MamNs, Packet, QueryID, MessageUID, WrapperID, TS, SrcJID) ->
     #xmlel{ name = <<"message">>,
             attrs = [{<<"id">>, WrapperID}],
             children = [result(MamNs, QueryID, MessageUID,
-                               [forwarded(Packet, DateTime, SrcJID)])] }.
+                               [forwarded(Packet, TS, SrcJID)])] }.
 
--spec forwarded(exml:element(), calendar:datetime(), jid:jid())
+-spec forwarded(exml:element(), calendar:rfc3339_string(), jid:jid())
                -> exml:element().
-forwarded(Packet, DateTime, SrcJID) ->
+forwarded(Packet, TS, SrcJID) ->
     #xmlel{
        name = <<"forwarded">>,
        attrs = [{<<"xmlns">>, ?NS_FORWARD}],
@@ -416,11 +415,11 @@ forwarded(Packet, DateTime, SrcJID) ->
        %% - delay.from - optional XEP-0297 (TODO: depricate adding it?)
        %% - message.from - required XEP-0313
        %% Also, mod_mam_muc will replace it again with SrcJID
-       children = [delay(DateTime, SrcJID), replace_from_attribute(SrcJID, Packet)]}.
+       children = [delay(TS, SrcJID), replace_from_attribute(SrcJID, Packet)]}.
 
--spec delay(calendar:datetime(), jid:jid()) -> exml:element().
-delay(DateTime, SrcJID) ->
-    jlib:timestamp_to_xml(DateTime, utc, SrcJID, <<>>).
+-spec delay(calendar:rfc3339_string(), jid:jid()) -> exml:element().
+delay(TS, SrcJID) ->
+    jlib:timestamp_to_xml(TS, SrcJID, <<>>).
 
 replace_from_attribute(From, Packet=#xmlel{attrs = Attrs}) ->
     Attrs1 = lists:keydelete(<<"from">>, 1, Attrs),
@@ -639,10 +638,20 @@ is_mam_result_message(_) ->
 maybe_get_result_namespace(Packet) ->
     exml_query:path(Packet, [{element, <<"result">>}, {attr, <<"xmlns">>}], <<>>).
 
-is_mam_namespace(?NS_MAM_04) -> true;
-is_mam_namespace(?NS_MAM_06) -> true;
-is_mam_namespace(_)          -> false.
+is_mam_namespace(NS) ->
+    lists:member(NS, mam_features()).
 
+features(Module, Host) ->
+    mam_features() ++ retraction_features(Module, Host).
+
+mam_features() ->
+    [?NS_MAM_04, ?NS_MAM_06].
+
+retraction_features(Module, Host) ->
+    case has_message_retraction(Module, Host) of
+        true -> [?NS_RETRACT, ?NS_RETRACT_TOMBSTONE];
+        false -> [?NS_RETRACT]
+    end.
 
 %% -----------------------------------------------------------------------
 %% Forms
@@ -763,6 +772,12 @@ packet_to_search_body(Module, Host, Packet) ->
 -spec has_full_text_search(Module :: mod_mam | mod_mam_muc, Host :: jid:server()) -> boolean().
 has_full_text_search(Module, Host) ->
     gen_mod:get_module_opt(Host, Module, full_text_search, true).
+
+%% Message retraction
+
+-spec has_message_retraction(Module :: mod_mam | mod_mam_muc, Host :: jid:server()) -> boolean().
+has_message_retraction(Module, Host) ->
+    gen_mod:get_module_opt(Host, Module, message_retraction, true).
 
 %% -----------------------------------------------------------------------
 %% JID serialization
