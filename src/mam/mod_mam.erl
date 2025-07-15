@@ -1,109 +1,31 @@
-%%%-------------------------------------------------------------------
-%%% @author Uvarov Michael <arcusfelis@gmail.com>
-%%% @copyright (C) 2013, Uvarov Michael
-%%% @doc XEP-0313: Message Archive Management
-%%%
-%%% The module uses several backend modules:
-%%%
-%%% <ul>
-%%% <li>Preference manager ({@link mod_mam_muc_rdbms_prefs});</li>
-%%% <li>Writer ({@link mod_mam_muc_rdbms_arch} or {@link mod_mam_muc_rdbms_async_pool_writer});</li>
-%%% <li>Archive manager ({@link mod_mam_muc_rdbms_arch});</li>
-%%% <li>User's ID generator ({@link mod_mam_muc_user}).</li>
-%%% </ul>
-%%%
-%%% Preferencies can be also stored in Mnesia ({@link mod_mam_mnesia_prefs}).
-%%% This module handles simple archives.
-%%%
-%%% This module should be started for each host.
-%%% Message archivation is not shaped here (use standard support for this).
-%%% MAM's IQs are shaped inside {@link shaper_srv}.
-%%%
-%%% Message identifiers (or UIDs in the spec) are generated based on:
-%%%
-%%% <ul>
-%%% <li>date (using `timestamp()');</li>
-%%% <li>node number (using {@link ejabberd_node_id}).</li>
-%%% </ul>
-%%% @end
-%%%-------------------------------------------------------------------
+%%==============================================================================
+%% Copyright 2016 Erlang Solutions Ltd.
+%%
+%% Licensed under the Apache License, Version 2.0 (the "License");
+%% you may not use this file except in compliance with the License.
+%% You may obtain a copy of the License at
+%%
+%% http://www.apache.org/licenses/LICENSE-2.0
+%%
+%% Unless required by applicable law or agreed to in writing, software
+%% distributed under the License is distributed on an "AS IS" BASIS,
+%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+%% See the License for the specific language governing permissions and
+%% limitations under the License.
+%%==============================================================================
+
 -module(mod_mam).
--behavior(gen_mod).
+-behaviour(gen_mod).
 -behaviour(mongoose_module_metrics).
--xep([{xep, 313}, {version, "0.4.1"}]).
--xep([{xep, 313}, {version, "0.5"}]).
--xep([{xep, 313}, {version, "0.6"}]).
-%% ----------------------------------------------------------------------
-%% Exports
+-xep([{xep, 313}, {version, "1.1.0"}, {legacy_versions, ["0.5"]}]).
+-xep([{xep, 441}, {version, "0.2.0"}]).
+-xep([{xep, 424}, {version, "0.3.0"}]).
 
-%% Client API
--export([delete_archive/2,
-         archive_size/2,
-         archive_id/2]).
-
-%% gen_mod handlers
--export([start/2, stop/1]).
-
-%% ejabberd handlers
--export([process_mam_iq/4,
-         user_send_packet/4,
-         remove_user/3,
-         filter_packet/1,
-         determine_amp_strategy/5,
-         sm_filter_offline_message/4]).
-
-%% gdpr callbacks
--export([get_personal_data/2]).
-
-%%private
--export([archive_message/9]).
--export([lookup_messages/2]).
--export([archive_id_int/2]).
-
--export([config_metrics/1]).
-
-%% ----------------------------------------------------------------------
-%% Imports
-
-%% UID
--import(mod_mam_utils,
-        [generate_message_id/0,
-         decode_compact_uuid/1]).
-
-%% XML
--import(mod_mam_utils,
-        [maybe_add_arcid_elems/4,
-         wrap_message/6,
-         result_set/4,
-         result_query/2,
-         result_prefs/4,
-         make_fin_message/5,
-         make_fin_element/4,
-         parse_prefs/1,
-         borders_decode/1,
-         is_mam_result_message/1,
-         features/2]).
-
-%% Forms
--import(mod_mam_utils,
-        [message_form/3]).
-
-%% Other
--import(mod_mam_utils,
-        [mess_id_to_external_binary/1,
-         is_complete_result_page/4]).
-
-%% ejabberd
--import(mod_mam_utils,
-        [send_message/3,
-         is_jid_in_user_roster/2]).
-
-
--include("mongoose.hrl").
--include("jlib.hrl").
--include("amp.hrl").
--include_lib("exml/include/exml.hrl").
 -include("mod_mam.hrl").
+-include("mongoose_config_spec.hrl").
+
+-type module_opts() :: gen_mod:module_opts().
+-type module_map() :: gen_mod_deps:module_map().
 
 %% ----------------------------------------------------------------------
 %% Datetime types
@@ -118,9 +40,16 @@
 -type archive_id()          :: non_neg_integer().
 
 -type borders()             :: #mam_borders{}.
+
+-type message_row() :: #{id := message_id(), jid := jid:jid(), packet := exml:element()}.
 -type lookup_result() :: {TotalCount :: non_neg_integer() | undefined,
                           Offset :: non_neg_integer() | undefined,
-                          MessageRows :: [{message_id(), jid:jid(), exml:element()}]}.
+                          MessageRows :: [message_row()]}.
+
+-type lookup_result_map() :: #{total_count := TotalCount :: non_neg_integer() | undefined,
+                               offset := Offset :: non_neg_integer() | undefined,
+                               messages := MessageRows :: [message_row()],
+                               is_complete => boolean()}.
 
 %% Internal types
 -type iterator_fun() :: fun(() -> {'ok', {_, _}}).
@@ -132,6 +61,20 @@
 -type preference() :: {DefaultMode :: archive_behaviour(),
                        AlwaysJIDs  :: [jid:literal_jid()],
                        NeverJIDs   :: [jid:literal_jid()]}.
+
+-type archive_message_params() :: #{message_id := message_id(),
+                                    archive_id := archive_id(),
+                                    local_jid := jid:jid(),
+                                    remote_jid := jid:jid(),
+                                    source_jid := jid:jid(),
+                                    origin_id := binary() | none,
+                                    direction := atom(),
+                                    packet := exml:element(),
+                                    %% Only in mod_mam_pm
+                                    is_groupchat => boolean(),
+                                    %% Only in mod_mam_muc_rdbms_arch:retract_message/2
+                                    sender_id => archive_id()}.
+
 -export_type([rewriter_fun/0,
               borders/0,
               preference/0,
@@ -140,542 +83,266 @@
               unix_timestamp/0,
               archive_id/0,
               lookup_result/0,
+              lookup_result_map/0,
+              message_row/0,
               message_id/0,
-              restore_option/0
+              restore_option/0,
+              archive_message_params/0,
+              mam_type/0
              ]).
 
-%% ----------------------------------------------------------------------
+-export([start/2, stop/1, config_spec/0, supported_features/0, deps/2, config_metrics/1]).
+
+%%--------------------------------------------------------------------
 %% API
+%%--------------------------------------------------------------------
 
--spec get_personal_data(gdpr:personal_data(), jid:jid()) -> gdpr:personal_data().
-get_personal_data(Acc, #jid{ lserver = LServer } = JID) ->
-    Schema = ["id", "from", "message"],
-    Entries = mongoose_hooks:get_mam_pm_gdpr_data(LServer, [], JID),
-    [{mam_pm, Schema, Entries} | Acc].
+-spec supported_features() -> [atom()].
+supported_features() ->
+    [dynamic_domains].
 
--spec delete_archive(jid:server(), jid:user()) -> 'ok'.
-delete_archive(Server, User)
-  when is_binary(Server), is_binary(User) ->
-    ?DEBUG("Remove user ~p from ~p.", [User, Server]),
-    ArcJID = jid:make(User, Server, <<>>),
-    Host = server_host(ArcJID),
-    ArcID = archive_id_int(Host, ArcJID),
-    remove_archive_hook(Host, ArcID, ArcJID),
+-spec start(mongooseim:host_type(), module_opts()) -> any().
+start(_HostType, _Opts) ->
     ok.
 
-
--spec archive_size(jid:server(), jid:user()) -> integer().
-archive_size(Server, User)
-  when is_binary(Server), is_binary(User) ->
-    ArcJID = jid:make(User, Server, <<>>),
-    Host = server_host(ArcJID),
-    ArcID = archive_id_int(Host, ArcJID),
-    archive_size(Host, ArcID, ArcJID).
-
-
--spec archive_id(jid:server(), jid:user()) -> integer() | undefined.
-archive_id(Server, User)
-  when is_binary(Server), is_binary(User) ->
-    ArcJID = jid:make(User, Server, <<>>),
-    Host = server_host(ArcJID),
-    archive_id_int(Host, ArcJID).
-
-%% gen_mod callbacks
-%% Starting and stopping functions for users' archives
-
--spec start(Host :: jid:server(), Opts :: list()) -> any().
-start(Host, Opts) ->
-    ?DEBUG("mod_mam starting", []),
-    ?WARNING_MSG_IF(
-       gen_mod:get_opt(archive_groupchats, Opts, undefined) == undefined,
-       "mod_mam is enabled without explicit archive_groupchats option value."
-       " It will default to `false` in one of future releases."
-       " Please check the mod_mam documentation for more details.", []),
-
-    %% `parallel' is the only one recommended here.
-    IQDisc = gen_mod:get_opt(iqdisc, Opts, parallel), %% Type
-    [mod_disco:register_feature(Host, Feature) || Feature <- features(?MODULE, Host)],
-    gen_iq_handler:add_iq_handler(ejabberd_sm, Host, ?NS_MAM_04,
-                                  ?MODULE, process_mam_iq, IQDisc),
-    gen_iq_handler:add_iq_handler(ejabberd_sm, Host, ?NS_MAM_06,
-                                  ?MODULE, process_mam_iq, IQDisc),
-    ejabberd_hooks:add(user_send_packet, Host, ?MODULE, user_send_packet, 90),
-    ejabberd_hooks:add(rest_user_send_packet, Host, ?MODULE, user_send_packet, 90),
-    ejabberd_hooks:add(filter_local_packet, Host, ?MODULE, filter_packet, 90),
-    ejabberd_hooks:add(remove_user, Host, ?MODULE, remove_user, 50),
-    ejabberd_hooks:add(anonymous_purge_hook, Host, ?MODULE, remove_user, 50),
-    ejabberd_hooks:add(amp_determine_strategy, Host, ?MODULE, determine_amp_strategy, 20),
-    ejabberd_hooks:add(sm_filter_offline_message, Host, ?MODULE, sm_filter_offline_message, 50),
-    ejabberd_hooks:add(get_personal_data, Host, ?MODULE, get_personal_data, 50),
-    mongoose_metrics:ensure_metric(Host, [backends, ?MODULE, lookup], histogram),
-    mongoose_metrics:ensure_metric(Host, [Host, modMamLookups, simple], spiral),
-    mongoose_metrics:ensure_metric(Host, [backends, ?MODULE, archive], histogram),
+-spec stop(mongooseim:host_type()) -> any().
+stop(_HostType) ->
     ok.
 
+-spec config_spec() -> mongoose_config_spec:config_section().
+config_spec() ->
+    Items = maps:merge(common_config_items(), root_config_items()),
+    #section{
+       items = Items#{<<"pm">> => pm_config_spec(),
+                      <<"muc">> => muc_config_spec()},
+       defaults = #{<<"backend">> => rdbms,
+                    <<"no_stanzaid_element">> => false,
+                    <<"is_archivable_message">> => mod_mam_utils,
+                    <<"send_message">> => mod_mam_utils,
+                    <<"archive_chat_markers">> => false,
+                    <<"message_retraction">> => true,
+                    <<"full_text_search">> => true,
+                    <<"cache_users">> => true,
+                    <<"default_result_limit">> => 50,
+                    <<"max_result_limit">> => 50,
+                    <<"enforce_simple_queries">> => false}
+      }.
 
--spec stop(Host :: jid:server()) -> any().
-stop(Host) ->
-    ?DEBUG("mod_mam stopping", []),
-    ejabberd_hooks:delete(sm_filter_offline_message, Host, ?MODULE, sm_filter_offline_message, 50),
-    ejabberd_hooks:delete(user_send_packet, Host, ?MODULE, user_send_packet, 90),
-    ejabberd_hooks:delete(rest_user_send_packet, Host, ?MODULE, user_send_packet, 90),
-    ejabberd_hooks:delete(filter_local_packet, Host, ?MODULE, filter_packet, 90),
-    ejabberd_hooks:delete(remove_user, Host, ?MODULE, remove_user, 50),
-    ejabberd_hooks:delete(anonymous_purge_hook, Host, ?MODULE, remove_user, 50),
-    ejabberd_hooks:delete(amp_determine_strategy, Host, ?MODULE, determine_amp_strategy, 20),
-    ejabberd_hooks:delete(get_personal_data, Host, ?MODULE, get_personal_data, 50),
-    gen_iq_handler:remove_iq_handler(ejabberd_sm, Host, ?NS_MAM_04),
-    gen_iq_handler:remove_iq_handler(ejabberd_sm, Host, ?NS_MAM_06),
-    [mod_disco:unregister_feature(Host, Feature) || Feature <- features(?MODULE, Host)],
-    ok.
+pm_config_spec() ->
+    #section{items = maps:merge(common_config_items(), pm_config_items()),
+             defaults = #{<<"archive_groupchats">> => false,
+                          <<"same_mam_id_for_peers">> => false}}.
 
-%% ----------------------------------------------------------------------
-%% hooks and handlers
+muc_config_spec() ->
+    #section{items = maps:merge(common_config_items(), muc_config_items()),
+             defaults = #{<<"host">> => mod_muc:default_host()}}.
 
-%% `To' is an account or server entity hosting the archive.
-%% Servers that archive messages on behalf of local users SHOULD expose archives
-%% to the user on their bare JID (i.e. `From.luser'),
-%% while a MUC service might allow MAM queries to be sent to the room's bare JID
-%% (i.e `To.luser').
--spec process_mam_iq(From :: jid:jid(), To :: jid:jid(), Acc :: mongoose_acc:t(),
-                     IQ :: jlib:iq()) -> {mongoose_acc:t(), jlib:iq() | ignore}.
-process_mam_iq(From=#jid{lserver=Host}, To, Acc, IQ) ->
-    mod_mam_utils:maybe_log_deprecation(IQ),
-    Action = mam_iq:action(IQ),
-    case is_action_allowed(Action, From, To) of
-        true  ->
-            case mod_mam_utils:wait_shaper(Host, Action, From) of
-                ok ->
-                    handle_error_iq(Host, Acc, To, Action,
-                                    handle_mam_iq(Action, From, To, IQ));
-                {error, max_delay_reached} ->
-                    ?WARNING_MSG("issue=max_delay_reached, action=~p, host=~p, from=~p",
-                                 [Action, Host, From]),
-                    mongoose_metrics:update(Host, modMamDroppedIQ, 1),
-                    {Acc, return_max_delay_reached_error_iq(IQ)}
-            end;
-        false ->
-            mongoose_metrics:update(Host, modMamDroppedIQ, 1),
-            {Acc, return_action_not_allowed_error_iq(IQ)}
-    end.
+root_config_items() ->
+    Cache = mongoose_user_cache:config_spec(),
+    AsyncWriter = async_config_spec(),
+    #{<<"cache">> => Cache#section{include = always},
+      <<"async_writer">> => AsyncWriter#section{include = always}}.
 
+common_config_items() ->
+    #{%% General options
+      <<"backend">> => #option{type = atom,
+                               validate = {enum, [rdbms, cassandra, elasticsearch]}},
+      <<"no_stanzaid_element">> => #option{type = boolean},
+      <<"is_archivable_message">> => #option{type = atom,
+                                             validate = module},
+      <<"send_message">> => #option{type = atom,
+                                    validate = module},
+      <<"archive_chat_markers">> => #option{type = boolean},
+      <<"message_retraction">> => #option{type = boolean},
 
-%% @doc Handle an outgoing message.
-%%
-%% Note: for outgoing messages, the server MUST use the value of the 'to'
-%%       attribute as the target JID.
--spec user_send_packet(Acc :: mongoose_acc:t(), From :: jid:jid(),
-                       To :: jid:jid(),
-                       Packet :: exml:element()) -> mongoose_acc:t().
-user_send_packet(Acc, From, To, Packet) ->
-    ?DEBUG("Send packet~n    from ~p ~n    to ~p~n    packet ~p.",
-           [From, To, Packet]),
-    handle_package(outgoing, false, From, To, From, Packet),
-    Acc.
+      %% Common backend options
+      <<"user_prefs_store">> => #option{type = atom,
+                                        validate = {enum, [rdbms, cassandra, mnesia]}},
+      <<"full_text_search">> => #option{type = boolean},
 
+      %% RDBMS-specific options
+      <<"cache_users">> => #option{type = boolean},
 
-%% @doc Handle an incoming message.
-%%
-%% Note: For incoming messages, the server MUST use the value of the
-%%       'from' attribute as the target JID.
-%%
-%% Return drop to drop the packet, or the original input to let it through.
-%% From and To are jid records.
--type fpacket() :: {From :: jid:jid(),
-                    To :: jid:jid(),
-                    Acc :: mongoose_acc:t(),
-                    Packet :: exml:element()}.
--spec filter_packet(Value :: fpacket() | drop) -> fpacket() | drop.
-filter_packet(drop) ->
-    drop;
-filter_packet({From, To=#jid{luser=LUser, lserver=LServer}, Acc, Packet}) ->
-    % let them to their amp-related mambo jumbo on stanza
-    ?DEBUG("Receive packet~n    from ~p ~n    to ~p~n    packet ~p.",
-           [From, To, Packet]),
-    {AmpEvent, PacketAfterArchive} =
-        case ejabberd_users:does_user_exist(LUser, LServer) of
-            false ->
-                {mam_failed, Packet};
-            true ->
-                PacketWithoutAmp = mod_amp:strip_amp_el_from_request(Packet),
-                case process_incoming_packet(From, To, PacketWithoutAmp) of
-                    undefined -> {mam_failed, Packet};
-                    MessID -> {archived, maybe_add_arcid_elems(
-                                           To, MessID, Packet,
-                                           mod_mam_params:add_stanzaid_element(?MODULE, LServer))}
-                end
-        end,
-    Acc1 = mongoose_acc:update_stanza(#{ element => PacketAfterArchive,
-                                         from_jid => From,
-                                         to_jid => To }, Acc),
-    Acc2 = mod_amp:check_packet(Acc1, From, AmpEvent),
-    {From, To, Acc2, mongoose_acc:element(Acc2)}.
+      %% Low-level options
+      <<"default_result_limit">> => #option{type = integer,
+                                            validate = non_negative},
+      <<"enforce_simple_queries">> => #option{type = boolean},
+      <<"delete_domain_limit">> => #option{type = int_or_infinity,
+                                           validate = positive},
+      <<"max_result_limit">> => #option{type = integer,
+                                        validate = non_negative},
+      <<"db_jid_format">> => #option{type = atom,
+                                     validate = module},
+      <<"db_message_format">> => #option{type = atom,
+                                         validate = module},
+      <<"extra_fin_element">> => #option{type = atom,
+                                         validate = module},
+      <<"extra_lookup_params">> => #option{type = atom,
+                                           validate = module}
+     }.
 
+pm_config_items() ->
+    #{<<"async_writer">> => async_config_spec(),
+      <<"archive_groupchats">> => #option{type = boolean},
+      <<"same_mam_id_for_peers">> => #option{type = boolean}}.
 
-process_incoming_packet(From, To, Packet) ->
-    handle_package(incoming, true, To, From, From, Packet).
+muc_config_items() ->
+    #{<<"async_writer">> => async_config_spec(),
+      <<"host">> => #option{type = string,
+                            validate = subdomain_template,
+                            process = fun mongoose_subdomain_utils:make_subdomain_pattern/1}}.
 
-%% hook handler
--spec remove_user(mongoose_acc:t(), jid:user(), jid:server()) -> mongoose_acc:t().
-remove_user(Acc, User, Server) ->
-    delete_archive(Server, User),
-    Acc.
+async_config_spec() ->
+    #section{
+       items = #{<<"enabled">> => #option{type = boolean},
+                 <<"flush_interval">> => #option{type = integer, validate = non_negative},
+                 <<"batch_size">> => #option{type = integer, validate = non_negative},
+                 <<"pool_size">> => #option{type = integer, validate = non_negative}},
+       defaults = #{<<"enabled">> => true,
+                    <<"flush_interval">> => 2000,
+                    <<"batch_size">> => 30,
+                    <<"pool_size">> => 4 * erlang:system_info(schedulers_online)}
+      }.
 
-sm_filter_offline_message(_Drop=false, _From, _To, Packet) ->
-    %% If ...
-    is_mam_result_message(Packet);
-    %% ... than drop the message
-sm_filter_offline_message(Other, _From, _To, _Packet) ->
-    Other.
+-spec deps(mongooseim:host_type(), module_opts()) -> gen_mod_deps:deps().
+deps(_HostType, Opts) ->
+    DepsWithPm = handle_nested_opts(pm, Opts, #{}),
+    DepsWithPmAndMuc = handle_nested_opts(muc, Opts, DepsWithPm),
 
-%% ----------------------------------------------------------------------
-%% Internal functions
+    [{DepMod, DepOpts, hard} || {DepMod, DepOpts} <- maps:to_list(DepsWithPmAndMuc)].
 
--spec server_host(jid:jid()) -> jid:lserver().
-server_host(#jid{lserver=LServer}) ->
-    LServer.
-
--spec is_action_allowed(Action :: mam_iq:action(), From :: jid:jid(),
-                        To :: jid:jid()) -> boolean().
-is_action_allowed(Action, From, To=#jid{lserver=Host}) ->
-    case acl:match_rule(Host, Action, From, default) of
-        allow   -> true;
-        deny    -> false;
-        default -> is_action_allowed_by_default(Action, From, To)
-    end.
-
--spec is_action_allowed_by_default(Action :: mam_iq:action(), From :: jid:jid(),
-                                   To :: jid:jid()) -> boolean().
-is_action_allowed_by_default(_Action, From, To) ->
-    compare_bare_jids(From, To).
-
-
--spec compare_bare_jids(jid:simple_jid() | jid:jid(),
-                        jid:simple_jid() | jid:jid()) -> boolean().
-compare_bare_jids(JID1, JID2) ->
-    jid:to_bare(JID1) =:= jid:to_bare(JID2).
-
--spec handle_mam_iq(mam_iq:action(), From :: jid:jid(), To :: jid:jid(),
-                    IQ :: jlib:iq()) -> jlib:iq() | {error, term(), jlib:iq()}.
-handle_mam_iq(Action, From, To, IQ) ->
-    case Action of
-        mam_get_prefs ->
-            handle_get_prefs(To, IQ);
-        mam_set_prefs ->
-            handle_set_prefs(To, IQ);
-        mam_set_message_form ->
-            handle_set_message_form(From, To, IQ);
-        mam_get_message_form ->
-            handle_get_message_form(From, To, IQ)
-    end.
-
--spec handle_set_prefs(jid:jid(), jlib:iq()) ->
-                              jlib:iq() | {error, term(), jlib:iq()}.
-handle_set_prefs(ArcJID=#jid{},
-                 IQ=#iq{sub_el = PrefsEl}) ->
-    {DefaultMode, AlwaysJIDs, NeverJIDs} = parse_prefs(PrefsEl),
-    ?DEBUG("Parsed data~n\tDefaultMode ~p~n\tAlwaysJIDs ~p~n\tNeverJIDS ~p~n",
-           [DefaultMode, AlwaysJIDs, NeverJIDs]),
-    Host = server_host(ArcJID),
-    ArcID = archive_id_int(Host, ArcJID),
-    Res = set_prefs(Host, ArcID, ArcJID, DefaultMode, AlwaysJIDs, NeverJIDs),
-    handle_set_prefs_result(Res, DefaultMode, AlwaysJIDs, NeverJIDs, IQ).
-
-handle_set_prefs_result(ok, DefaultMode, AlwaysJIDs, NeverJIDs, IQ) ->
-    Namespace = IQ#iq.xmlns,
-    ResultPrefsEl = result_prefs(DefaultMode, AlwaysJIDs, NeverJIDs, Namespace),
-    IQ#iq{type = result, sub_el = [ResultPrefsEl]};
-handle_set_prefs_result({error, Reason},
-                        _DefaultMode, _AlwaysJIDs, _NeverJIDs, IQ) ->
-    return_error_iq(IQ, Reason).
-
-
--spec handle_get_prefs(jid:jid(), IQ :: jlib:iq()) ->
-                              jlib:iq() | {error, term(), jlib:iq()}.
-handle_get_prefs(ArcJID=#jid{}, IQ=#iq{}) ->
-    Host = server_host(ArcJID),
-    ArcID = archive_id_int(Host, ArcJID),
-    Res = get_prefs(Host, ArcID, ArcJID, always),
-    handle_get_prefs_result(Res, IQ).
-
-handle_get_prefs_result({DefaultMode, AlwaysJIDs, NeverJIDs}, IQ) ->
-    ?DEBUG("Extracted data~n\tDefaultMode ~p~n\tAlwaysJIDs ~p~n\tNeverJIDS ~p~n",
-           [DefaultMode, AlwaysJIDs, NeverJIDs]),
-    Namespace = IQ#iq.xmlns,
-    ResultPrefsEl = result_prefs(DefaultMode, AlwaysJIDs, NeverJIDs, Namespace),
-    IQ#iq{type = result, sub_el = [ResultPrefsEl]};
-handle_get_prefs_result({error, Reason}, IQ) ->
-    return_error_iq(IQ, Reason).
-
--spec handle_set_message_form(From :: jid:jid(), ArcJID :: jid:jid(),
-                              IQ :: jlib:iq()) ->
-    jlib:iq() | ignore | {error, term(), jlib:iq()}.
-handle_set_message_form(#jid{} = From, #jid{} = ArcJID,
-                        #iq{xmlns=MamNs, sub_el = QueryEl} = IQ) ->
-    Host = server_host(ArcJID),
-    ArcID = archive_id_int(Host, ArcJID),
-    QueryID = exml_query:attr(QueryEl, <<"queryid">>, <<>>),
-    Params0 = mam_iq:form_to_lookup_params(IQ, mod_mam_params:max_result_limit(?MODULE, Host),
-                                           mod_mam_params:default_result_limit(?MODULE, Host),
-                                           mod_mam_params:extra_params_module(?MODULE, Host)),
-    Params = mam_iq:lookup_params_with_archive_details(Params0, ArcID, ArcJID),
-    case lookup_messages(Host, Params) of
-        {error, Reason} ->
-            report_issue(Reason, mam_lookup_failed, ArcJID, IQ),
-            return_error_iq(IQ, Reason);
-        {ok, {TotalCount, Offset, MessageRows}} ->
-            %% Forward messages
-            {FirstMessID, LastMessID} = forward_messages(From, ArcJID, MamNs,
-                                                         QueryID, MessageRows, true),
-            %% Make fin iq
-            IsComplete = is_complete_result_page(TotalCount, Offset, MessageRows, Params),
-            IsStable = true,
-            ResultSetEl = result_set(FirstMessID, LastMessID, Offset, TotalCount),
-            FinElem = make_fin_element(IQ#iq.xmlns, IsComplete, IsStable, ResultSetEl),
-            IQ#iq{type = result, sub_el = [FinElem]}
-    end.
-
-forward_messages(From, ArcJID, MamNs, QueryID, MessageRows, SetClientNs) ->
-    %% Forward messages
-    {FirstMessID, LastMessID} =
-    case MessageRows of
-        [] -> {undefined, undefined};
-        [_|_] -> {message_row_to_ext_id(hd(MessageRows)),
-                  message_row_to_ext_id(lists:last(MessageRows))}
-    end,
-
-    [send_message(ArcJID, From,
-                  message_row_to_xml(MamNs, M, QueryID, SetClientNs))
-     || M <- MessageRows],
-    {FirstMessID, LastMessID}.
-
--spec handle_get_message_form(jid:jid(), jid:jid(), jlib:iq()) ->
-                                     jlib:iq().
-handle_get_message_form(_From=#jid{lserver = Host}, _ArcJID=#jid{}, IQ=#iq{}) ->
-    return_message_form_iq(Host, IQ).
-
-
-determine_amp_strategy(Strategy = #amp_strategy{deliver = Deliver},
-                       FromJID, ToJID, Packet, initial_check) ->
-    #jid{luser = LUser, lserver = LServer} = ToJID,
-    ShouldBeStored = is_archivable_message(LServer, incoming, Packet)
-        andalso is_interesting(ToJID, FromJID)
-        andalso ejabberd_auth:is_user_exists(LUser, LServer),
-    case ShouldBeStored of
-        true -> Strategy#amp_strategy{deliver = amp_deliver_strategy(Deliver)};
-        false -> Strategy
-    end;
-determine_amp_strategy(Strategy, _, _, _, _) ->
-    Strategy.
-
-amp_deliver_strategy([none]) -> [stored, none];
-amp_deliver_strategy([direct, none]) -> [direct, stored, none].
-
--spec handle_package(Dir :: incoming | outgoing, ReturnMessID :: boolean(),
-                     LocJID :: jid:jid(), RemJID :: jid:jid(), SrcJID :: jid:jid(),
-                     Packet :: exml:element()) -> MaybeMessID :: binary() | undefined.
-handle_package(Dir, ReturnMessID,
-               LocJID = #jid{},
-               RemJID = #jid{},
-               SrcJID = #jid{}, Packet) ->
-    Host = server_host(LocJID),
-    case is_archivable_message(Host, Dir, Packet)
-         andalso should_archive_if_groupchat(Host, exml_query:attr(Packet, <<"type">>)) of
-        true ->
-            ArcID = archive_id_int(Host, LocJID),
-            OriginID = mod_mam_utils:get_origin_id(Packet),
-            case is_interesting(Host, LocJID, RemJID, ArcID) of
-                true ->
-                    MessID = generate_message_id(),
-                    Result = archive_message(Host, MessID, ArcID,
-                                             LocJID, RemJID, SrcJID, OriginID, Dir, Packet),
-                    return_external_message_id_if_ok(ReturnMessID, Result, MessID);
-                false ->
-                    undefined
-            end;
-        false ->
-            undefined
-    end.
-
-should_archive_if_groupchat(Host, <<"groupchat">>) ->
-    gen_mod:get_module_opt(Host, ?MODULE, archive_groupchats, true);
-should_archive_if_groupchat(_, _) ->
-    true.
-
--spec return_external_message_id_if_ok(ReturnMessID :: boolean(),
-                                       ArchivingResult :: ok | any(),
-                                       MessID :: integer()) -> binary() | undefined.
-return_external_message_id_if_ok(true, ok, MessID) -> mess_id_to_external_binary(MessID);
-return_external_message_id_if_ok(_, _, _MessID) -> undefined.
-
-is_interesting(LocJID, RemJID) ->
-    Host = server_host(LocJID),
-    ArcID = archive_id_int(Host, LocJID),
-    is_interesting(Host, LocJID, RemJID, ArcID).
-
-is_interesting(Host, LocJID, RemJID, ArcID) ->
-    case get_behaviour(Host, ArcID, LocJID, RemJID, always) of
-        always -> true;
-        never  -> false;
-        roster -> is_jid_in_user_roster(LocJID, RemJID)
-    end.
-
-%% ----------------------------------------------------------------------
-%% Backend wrappers
-
--spec archive_id_int(jid:server(), jid:jid()) ->
-                            non_neg_integer() | undefined.
-archive_id_int(Host, ArcJID=#jid{}) ->
-    mongoose_hooks:mam_archive_id(Host, undefined, ArcJID).
-
-
--spec archive_size(jid:server(), archive_id(), jid:jid()) -> integer().
-archive_size(Host, ArcID, ArcJID=#jid{}) ->
-    mongoose_hooks:mam_archive_size(Host, 0, ArcID, ArcJID).
-
-
--spec get_behaviour(jid:server(), archive_id(), LocJID :: jid:jid(),
-                    RemJID :: jid:jid(), Default :: 'always') -> atom().
-get_behaviour(Host, ArcID,
-              LocJID=#jid{},
-              RemJID=#jid{}, DefaultBehaviour) ->
-  mongoose_hooks:mam_get_behaviour(Host, DefaultBehaviour, ArcID, LocJID, RemJID).
-
-
--spec set_prefs(jid:server(), archive_id(), ArcJID :: jid:jid(),
-                DefaultMode :: atom(), AlwaysJIDs :: [jid:literal_jid()],
-                NeverJIDs :: [jid:literal_jid()]) -> any().
-set_prefs(Host, ArcID, ArcJID, DefaultMode, AlwaysJIDs, NeverJIDs) ->
-    mongoose_hooks:mam_set_prefs(Host, {error, not_implemented},
-                                 ArcID, ArcJID, DefaultMode, AlwaysJIDs, NeverJIDs).
-
-
-%% @doc Load settings from the database.
--spec get_prefs(Host :: jid:server(), ArcID :: archive_id(),
-                ArcJID :: jid:jid(), GlobalDefaultMode :: archive_behaviour()
-               ) -> preference() | {error, Reason :: term()}.
-get_prefs(Host, ArcID, ArcJID, GlobalDefaultMode) ->
-    mongoose_hooks:mam_get_prefs(Host, {GlobalDefaultMode, [], []}, ArcID, ArcJID).
-
--spec remove_archive_hook(jid:server(), archive_id(), jid:jid()) -> 'ok'.
-remove_archive_hook(Host, ArcID, ArcJID=#jid{}) ->
-    mongoose_hooks:mam_remove_archive(Host, ok, ArcID, ArcJID),
-    ok.
-
--spec lookup_messages(Host :: jid:server(),
-                      Params :: map()) ->
-    {ok, mod_mam:lookup_result()}
-    | {error, 'policy-violation'}
-    | {error, Reason :: term()}.
-lookup_messages(Host, Params) ->
-    Result = lookup_messages_without_policy_violation_check(Host, Params),
-    %% If a query returns a number of stanzas greater than this limit and the
-    %% client did not specify a limit using RSM then the server should return
-    %% a policy-violation error to the client.
-    mod_mam_utils:check_result_for_policy_violation(Params, Result).
-
-lookup_messages_without_policy_violation_check(Host, #{search_text := SearchText} = Params) ->
-    case SearchText /= undefined andalso not mod_mam_params:has_full_text_search(?MODULE, Host) of
-        true -> %% Use of disabled full text search
-            {error, 'not-supported'};
-        false ->
-            StartT = os:timestamp(),
-            R = mongoose_hooks:mam_lookup_messages(Host, {ok, {0, 0, []}}, Params),
-            Diff = timer:now_diff(os:timestamp(), StartT),
-            mongoose_metrics:update(Host, [backends, ?MODULE, lookup], Diff),
-            R
-    end.
-
-
--spec archive_message(Host :: jid:server(), MessID :: message_id(),
-                      ArcID :: archive_id(), LocJID :: jid:jid(), RemJID :: jid:jid(),
-                      SrcJID :: jid:jid(), OriginID :: binary() | none,
-                      Dir :: incoming | outgoing, Packet :: term()
-                     ) -> ok | {error, timeout}.
-archive_message(Host, MessID, ArcID, LocJID, RemJID, SrcJID, OriginID, Dir, Packet) ->
-    StartT = os:timestamp(),
-    R = mongoose_hooks:mam_archive_message(Host, ok, MessID, ArcID,
-                                           LocJID, RemJID, SrcJID, OriginID, Dir, Packet),
-    Diff = timer:now_diff(os:timestamp(), StartT),
-    mongoose_metrics:update(Host, [backends, ?MODULE, archive], Diff),
-    R.
-
-%% ----------------------------------------------------------------------
+%%--------------------------------------------------------------------
 %% Helpers
+%%--------------------------------------------------------------------
 
--type messid_jid_packet() :: {MessId :: integer(),
-                              SrcJID :: jid:jid(),
-                              Packet :: exml:element()}.
--spec message_row_to_xml(binary(), messid_jid_packet(), QueryId :: binary(), boolean()) ->
-    exml:element().
-message_row_to_xml(MamNs, {MessID, SrcJID, Packet}, QueryID, SetClientNs)  ->
-    {Microseconds, _NodeMessID} = decode_compact_uuid(MessID),
-    TS = calendar:system_time_to_rfc3339(usec:to_sec(Microseconds), [{offset, "Z"}]),
-    BExtMessID = mess_id_to_external_binary(MessID),
-    Packet1 = mod_mam_utils:maybe_set_client_xmlns(SetClientNs, Packet),
-    wrap_message(MamNs, Packet1, QueryID, BExtMessID, TS, SrcJID).
+-type mam_type() :: pm | muc.
+-type mam_backend() :: rdbms | cassandra | elasticsearch.
 
--spec message_row_to_ext_id(messid_jid_packet()) -> binary().
-message_row_to_ext_id({MessID, _, _}) ->
-    mess_id_to_external_binary(MessID).
+-spec handle_nested_opts(mam_type(), module_opts(), module_map()) -> module_map().
+handle_nested_opts(Key, RootOpts, Deps) ->
+    case maps:find(Key, RootOpts) of
+        error -> Deps;
+        {ok, Opts} ->
+            FullOpts = maps:merge(maps:without([pm, muc], RootOpts), Opts),
+            parse_opts(Key, FullOpts, Deps)
+    end.
 
-handle_error_iq(Host, Acc, _To, _Action, {error, _Reason, IQ}) ->
-    mongoose_metrics:update(Host, modMamDroppedIQ, 1),
-    {Acc, IQ};
-handle_error_iq(_Host, Acc, _To, _Action, IQ) ->
-    {Acc, IQ}.
+-spec parse_opts(mam_type(), module_opts(), module_map()) -> module_map().
+parse_opts(Type, Opts, Deps) ->
+    %% Opts are merged root options with options inside pm or muc section
+    CoreMod = mam_type_to_core_mod(Type),
+    CoreModOpts = maps:with(valid_core_mod_opts(CoreMod), Opts),
+    WithCoreDeps = add_dep(CoreMod, CoreModOpts, Deps),
+    {Backend, BackendOpts} = maps:take(backend, Opts),
+    WithPrefs = add_prefs_store_module(Backend, Type, Opts, WithCoreDeps),
+    parse_backend_opts(Backend, Type, BackendOpts, WithPrefs).
 
--spec return_action_not_allowed_error_iq(jlib:iq()) -> jlib:iq().
-return_action_not_allowed_error_iq(IQ) ->
-    ErrorEl = jlib:stanza_errort(<<"">>, <<"cancel">>, <<"not-allowed">>,
-                                 <<"en">>, <<"The action is not allowed.">>),
-    IQ#iq{type = error, sub_el = [ErrorEl]}.
+-spec mam_type_to_core_mod(mam_type()) -> module().
+mam_type_to_core_mod(pm) -> mod_mam_pm;
+mam_type_to_core_mod(muc) -> mod_mam_muc.
 
--spec return_max_delay_reached_error_iq(jlib:iq()) -> jlib:iq().
-return_max_delay_reached_error_iq(IQ) ->
-    %% Message not found.
-    ErrorEl = mongoose_xmpp_errors:resource_constraint(
-                 <<"en">>, <<"The action is cancelled because of flooding.">>),
-    IQ#iq{type = error, sub_el = [ErrorEl]}.
+%% Get a list of options to pass into the two modules.
+%% They don't have to be defined in pm or muc sections, the root section is enough.
+-spec valid_core_mod_opts(module()) -> [atom()].
+valid_core_mod_opts(mod_mam_pm) ->
+    [archive_groupchats, same_mam_id_for_peers] ++ common_opts();
+valid_core_mod_opts(mod_mam_muc) ->
+    [host] ++ common_opts().
 
+common_opts() ->
+    [async_writer,
+     is_archivable_message,
+     send_message,
+     archive_chat_markers,
+     extra_fin_element,
+     extra_lookup_params,
+     full_text_search,
+     message_retraction,
+     default_result_limit,
+     max_result_limit,
+     enforce_simple_queries,
+     no_stanzaid_element].
 
--spec return_error_iq(jlib:iq(), Reason :: term()) -> {error, term(), jlib:iq()}.
-return_error_iq(IQ, {Reason, {stacktrace, _Stacktrace}}) ->
-    return_error_iq(IQ, Reason);
-return_error_iq(IQ, timeout) ->
-    {error, timeout, IQ#iq{type = error, sub_el = [mongoose_xmpp_errors:service_unavailable()]}};
-return_error_iq(IQ, item_not_found) ->
-    {error, item_not_found, IQ#iq{type = error, sub_el = [mongoose_xmpp_errors:item_not_found()]}};
-return_error_iq(IQ, not_implemented) ->
-    {error, not_implemented, IQ#iq{type = error, sub_el = [mongoose_xmpp_errors:feature_not_implemented()]}};
-return_error_iq(IQ, Reason) ->
-    {error, Reason, IQ#iq{type = error, sub_el = [mongoose_xmpp_errors:internal_server_error()]}}.
+-spec add_prefs_store_module(mam_backend(), mam_type(), module_opts(), module_map()) -> module_map().
+add_prefs_store_module(Backend, Type, #{user_prefs_store := Store}, Deps) ->
+    PrefsModule = prefs_module(Backend, Store),
+    add_dep(PrefsModule, #{Type => true}, Deps);
+add_prefs_store_module(_Backend, _Type, _Opts, Deps) ->
+    Deps.
 
-return_message_form_iq(Host, IQ) ->
-    IQ#iq{type = result, sub_el = [message_form(?MODULE, Host, IQ#iq.xmlns)]}.
+-spec parse_backend_opts(mam_backend(), mam_type(), module_opts(), module_map()) -> module_map().
+parse_backend_opts(cassandra, Type, Opts, Deps) ->
+    Opts1 = maps:with([db_message_format], Opts),
+    add_dep(cassandra_arch_module(Type), maps:merge(arch_defaults(), Opts1), Deps);
+parse_backend_opts(rdbms, Type, Opts, Deps) ->
+    lists:foldl(fun(OptionGroup, DepsIn) -> add_rdbms_deps(OptionGroup, Type, Opts, DepsIn) end,
+                Deps, [basic, user_cache, async_writer]);
+parse_backend_opts(elasticsearch, Type, _Opts, Deps0) ->
+    add_dep(elasticsearch_arch_module(Type), Deps0).
 
-report_issue({Reason, {stacktrace, Stacktrace}}, Issue, ArcJID, IQ) ->
-    report_issue(Reason, Stacktrace, Issue, ArcJID, IQ);
-report_issue(Reason, Issue, ArcJID, IQ) ->
-    report_issue(Reason, [], Issue, ArcJID, IQ).
+-spec add_rdbms_deps(basic | user_cache | async_writer,
+                     mam_type(), module_opts(), module_map()) -> module_map().
+add_rdbms_deps(basic, Type, Opts, Deps) ->
+    Opts1 = maps:with([db_message_format, db_jid_format, delete_domain_limit], Opts),
+    Deps1 = add_dep(rdbms_arch_module(Type), maps:merge(rdbms_arch_defaults(Type), Opts1), Deps),
+    add_dep(mod_mam_rdbms_user, user_db_types(Type), Deps1);
+add_rdbms_deps(user_cache, Type, #{cache_users := true, cache := CacheOpts}, Deps) ->
+    Deps1 = case gen_mod:get_opt(module, CacheOpts, internal) of
+                internal -> Deps;
+                mod_cache_users -> add_dep(mod_cache_users, Deps)
+            end,
+    add_dep(mod_mam_cache_user, CacheOpts#{Type => true}, Deps1);
+add_rdbms_deps(async_writer, Type, #{async_writer := AsyncOpts = #{enabled := true}}, Deps) ->
+    Deps1 = add_dep(rdbms_arch_module(Type), #{no_writer => true}, Deps),
+    add_dep(rdbms_async_arch_module(Type), AsyncOpts, Deps1);
+add_rdbms_deps(_, _Type, _Opts, Deps) ->
+    Deps.
 
-report_issue(item_not_found, _Stacktrace, _Issue, _ArcJID, _IQ) ->
-    expected;
-report_issue(not_implemented, _Stacktrace, _Issue, _ArcJID, _IQ) ->
-    expected;
-report_issue(timeout, _Stacktrace, _Issue, _ArcJID, _IQ) ->
-    expected;
-report_issue(Reason, Stacktrace, Issue, #jid{lserver=LServer, luser=LUser}, IQ) ->
-    ?ERROR_MSG("issue=~p, server=~p, user=~p, reason=~p, iq=~p, stacktrace=~p",
-               [Issue, LServer, LUser, Reason, IQ, Stacktrace]).
+% muc backend requires both pm and muc user DB to populate sender_id column
+-spec user_db_types(mam_type()) -> module_opts().
+user_db_types(pm) -> #{pm => true};
+user_db_types(muc) -> #{pm => true, muc => true}.
 
--spec is_archivable_message(Host :: ejabberd:lserver(), Dir :: incoming | outgoing,
-                            Packet :: exml:element()) -> boolean().
-is_archivable_message(Host, Dir, Packet) ->
-    {M, F} = mod_mam_params:is_archivable_message_fun(?MODULE, Host),
-    ArchiveChatMarkers = mod_mam_params:archive_chat_markers(?MODULE, Host),
-    erlang:apply(M, F, [?MODULE, Dir, Packet, ArchiveChatMarkers]).
+cassandra_arch_module(pm) -> mod_mam_cassandra_arch;
+cassandra_arch_module(muc) -> mod_mam_muc_cassandra_arch.
+
+arch_defaults() -> #{db_message_format => mam_message_xml}.
+
+rdbms_arch_defaults(pm) ->
+    maps:merge(rdbms_arch_defaults(), #{db_jid_format => mam_jid_mini});
+rdbms_arch_defaults(muc) ->
+    maps:merge(rdbms_arch_defaults(), #{db_jid_format => mam_jid_rfc}).
+
+rdbms_arch_defaults() ->
+    #{db_message_format => mam_message_compressed_eterm,
+      no_writer => false, delete_domain_limit => infinity}.
+
+rdbms_arch_module(pm) -> mod_mam_rdbms_arch;
+rdbms_arch_module(muc) -> mod_mam_muc_rdbms_arch.
+
+rdbms_async_arch_module(pm) -> mod_mam_rdbms_arch_async;
+rdbms_async_arch_module(muc) -> mod_mam_muc_rdbms_arch_async.
+
+elasticsearch_arch_module(pm) -> mod_mam_elasticsearch_arch;
+elasticsearch_arch_module(muc) -> mod_mam_muc_elasticsearch_arch.
+
+prefs_module(rdbms, rdbms) -> mod_mam_rdbms_prefs;
+prefs_module(cassandra, cassandra) -> mod_mam_cassandra_prefs;
+prefs_module(_, mnesia) -> mod_mam_mnesia_prefs;
+prefs_module(Backend, PrefsStore) ->
+    error(#{what => invalid_mam_user_prefs_store,
+            backend => Backend,
+            user_prefs_store => PrefsStore}).
+
+-spec add_dep(module(), module_map()) -> module_map().
+add_dep(Dep, Deps) ->
+    add_dep(Dep, #{}, Deps).
+
+-spec add_dep(module(), module_opts(), module_map()) -> module_map().
+add_dep(Dep, Opts, Deps) ->
+    PrevOpts = maps:get(Dep, Deps, #{}),
+    NewOpts = maps:merge(PrevOpts, Opts),
+    maps:put(Dep, NewOpts, Deps).
 
 config_metrics(Host) ->
-    OptsToReport = [{backend, rdbms}], %list of tuples {option, defualt_value}
-    mongoose_module_metrics:opts_for_module(Host, ?MODULE, OptsToReport).
+    mongoose_module_metrics:opts_for_module(Host, ?MODULE, [backend]).

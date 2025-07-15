@@ -29,157 +29,77 @@
 -behaviour(supervisor).
 
 -export([start_link/0, init/1]).
--export([start_child/1, stop_child/1]).
+-export([start_child/1, start_child/2, stop_child/1]).
+-export([create_ets_table/2, template_supervisor_spec/2]).
+
+-export([start_linked_child/2]).
+-ignore_xref([start_linked_child/2]).
 
 -include("mongoose_logger.hrl").
 
+-spec start_link() -> supervisor:startlink_err().
 start_link() ->
-    supervisor:start_link({local, ?MODULE}, ?MODULE, []).
+    supervisor:start_link({local, ?MODULE}, ?MODULE, noargs).
 
-init([]) ->
-    Hooks =
-        {ejabberd_hooks,
-         {ejabberd_hooks, start_link, []},
-         permanent,
-         brutal_kill,
-         worker,
-         [ejabberd_hooks]},
-    Cleaner =
-        {mongoose_cleaner,
-         {mongoose_cleaner, start_link, []},
-         permanent,
-         brutal_kill,
-         worker,
-         [mongoose_cleaner]},
-    Router =
-        {ejabberd_router,
-         {ejabberd_router, start_link, []},
-         permanent,
-         brutal_kill,
-         worker,
-         [ejabberd_router]},
-    S2S =
-        {ejabberd_s2s,
-         {ejabberd_s2s, start_link, []},
-         permanent,
-         brutal_kill,
-         worker,
-         [ejabberd_s2s]},
-    Local =
-        {ejabberd_local,
-         {ejabberd_local, start_link, []},
-         permanent,
-         brutal_kill,
-         worker,
-         [ejabberd_local]},
-    Listener =
-        {ejabberd_listener,
-         {ejabberd_listener, start_link, []},
-         permanent,
-         infinity,
-         supervisor,
-         [ejabberd_listener]},
-    ReceiverSupervisor =
-        {ejabberd_receiver_sup,
-         {ejabberd_tmp_sup, start_link,
-          [ejabberd_receiver_sup, ejabberd_receiver]},
-         permanent,
-         infinity,
-         supervisor,
-         [ejabberd_tmp_sup]},
+-spec init(noargs) -> {ok, {supervisor:sup_flags(), [supervisor:child_spec()]}}.
+init(noargs) ->
+    Hooks = worker_spec(gen_hook),
+    Instrument = worker_spec(mongoose_instrument),
+    Cleaner = worker_spec(mongoose_cleaner),
+    Router = worker_spec(ejabberd_router),
+    S2S = worker_spec(ejabberd_s2s),
+    Local = worker_spec(ejabberd_local),
+    MucIQ = worker_spec(mod_muc_iq),
+    StartIdServer = worker_spec(mongoose_start_node_id),
+    PG = worker_spec(pg, [mim_scope]),
+    SMBackendSupervisor = supervisor_spec(ejabberd_sm_backend_sup),
+    OutgoingPoolsSupervisor = supervisor_spec(mongoose_wpool_sup),
+    Listener = supervisor_spec(mongoose_listener_sup),
+    ShaperSup = mongoose_shaper:child_spec(),
+    DomainSup = supervisor_spec(mongoose_domain_sup),
+    S2SReceiverSupervisor =
+        template_supervisor_spec(mongoose_s2s_socket_out_sup, mongoose_s2s_socket_out),
     C2SSupervisor =
-        {ejabberd_c2s_sup,
-         {ejabberd_tmp_sup, start_link, [ejabberd_c2s_sup, ejabberd_c2s]},
-         permanent,
-         infinity,
-         supervisor,
-         [ejabberd_tmp_sup]},
-    S2SInSupervisor =
-        {ejabberd_s2s_in_sup,
-         {ejabberd_tmp_sup, start_link,
-          [ejabberd_s2s_in_sup, ejabberd_s2s_in]},
-         permanent,
-         infinity,
-         supervisor,
-         [ejabberd_tmp_sup]},
+        template_supervisor_spec(mongoose_c2s_sup, mongoose_c2s),
     S2SOutSupervisor =
-        {ejabberd_s2s_out_sup,
-         {ejabberd_tmp_sup, start_link,
-          [ejabberd_s2s_out_sup, ejabberd_s2s_out]},
-         permanent,
-         infinity,
-         supervisor,
-         [ejabberd_tmp_sup]},
-    ServiceSupervisor =
-        {ejabberd_service_sup,
-         {ejabberd_tmp_sup, start_link,
-          [ejabberd_service_sup, ejabberd_service]},
-         permanent,
-         infinity,
-         supervisor,
-         [ejabberd_tmp_sup]},
-    OutgoingPoolsSupervisor =
-        {mongoose_wpool_sup,
-         {mongoose_wpool_sup, start_link, []},
-         permanent, infinity,
-         supervisor, [mongoose_wpool_sup]},
+        template_supervisor_spec(mongoose_s2s_out_sup, mongoose_s2s_out),
     IQSupervisor =
-        {ejabberd_iq_sup,
-         {ejabberd_tmp_sup, start_link,
-          [ejabberd_iq_sup, gen_iq_handler]},
-         permanent,
-         infinity,
-         supervisor,
-         [ejabberd_tmp_sup]},
-    SMBackendSupervisor =
-        {ejabberd_sm_backend_sup,
-         {ejabberd_sm_backend_sup, start_link, []},
-         permanent,
-         infinity,
-         supervisor,
-         [ejabberd_sm_backend_sup]},
-    MucIQ =
-        {mod_muc_iq,
-         {mod_muc_iq, start_link, []},
-         permanent,
-         brutal_kill,
-         worker,
-         [mod_muc_iq]},
-    MAM =
-        {mod_mam_sup,
-         {mod_mam_sup, start_link, []},
-         permanent, infinity, supervisor, [mod_mam_sup]},
-    ShaperSup =
-        {ejabberd_shaper_sup,
-          {ejabberd_shaper_sup, start_link, []},
-          permanent, infinity, supervisor, [ejabberd_shaper_sup]},
+        template_supervisor_spec(ejabberd_iq_sup, mongoose_iq_worker),
     {ok, {{one_for_one, 10, 1},
-          [Hooks,
+          [StartIdServer,
+           PG,
+           Hooks,
+           Instrument,
            Cleaner,
            SMBackendSupervisor,
+           OutgoingPoolsSupervisor
+           ] ++ mongoose_cets_discovery:supervisor_specs() ++ [
            Router,
            S2S,
-           Local,
-           ReceiverSupervisor,
-           C2SSupervisor,
-           S2SInSupervisor,
+           S2SReceiverSupervisor,
            S2SOutSupervisor,
-           ServiceSupervisor,
-           OutgoingPoolsSupervisor,
+           Local,
+           C2SSupervisor,
            IQSupervisor,
            Listener,
            MucIQ,
-           MAM,
-           ShaperSup]}}.
+           ShaperSup,
+           DomainSup]}}.
 
 start_child(ChildSpec) ->
-    case supervisor:start_child(ejabberd_sup, ChildSpec) of
+    start_child(ejabberd_sup, ChildSpec).
+
+%% This function handles error results from supervisor:start_child
+%% It does some logging
+start_child(SupName, ChildSpec) ->
+    case supervisor:start_child(SupName, ChildSpec) of
         {ok, Pid} ->
             {ok, Pid};
         Other ->
             Stacktrace = element(2, erlang:process_info(self(), current_stacktrace)),
-            ?ERROR_MSG("event=start_child_failed, reason=~1000p spec=~1000p stacktrace=~1000p",
-                       [Other, ChildSpec, Stacktrace]),
+            ?LOG_ERROR(#{what => start_child_failed, spec => ChildSpec,
+                         supervisor_name => SupName,
+                         reason => Other, stacktrace => Stacktrace}),
             erlang:error({start_child_failed, Other, ChildSpec})
     end.
 
@@ -187,3 +107,60 @@ stop_child(Proc) ->
     supervisor:terminate_child(ejabberd_sup, Proc),
     supervisor:delete_child(ejabberd_sup, Proc),
     ok.
+
+-spec template_supervisor_spec(atom(), module()) -> supervisor:child_spec().
+template_supervisor_spec(Name, Module) ->
+    #{
+        id => Name,
+        start => {mongoose_template_sup, start_link, [Name, Module]},
+        restart => permanent,
+        shutdown => infinity,
+        type => supervisor,
+        modules => [mongoose_template_sup]
+    }.
+
+supervisor_spec(Mod) ->
+    {Mod, {Mod, start_link, []}, permanent, infinity, supervisor, [Mod]}.
+
+worker_spec(Mod) ->
+    worker_spec(Mod, []).
+
+worker_spec(Mod, Args) ->
+    %% We use `start_linked_child' wrapper to log delays
+    %% in the slow init worker functions.
+    MFA = {?MODULE, start_linked_child, [Mod, Args]},
+    {Mod, MFA, permanent, timer:seconds(5), worker, [Mod]}.
+
+%% In case one of the workers takes long time to start
+%% we want the logging progress (to know which child got stuck).
+%% This could happend on CI during the node restarts.
+start_linked_child(Mod, Args) ->
+    F = fun() -> erlang:apply(Mod, start_link, Args) end,
+    mongoose_task:run_tracked(#{task => start_linked_child, child_module => Mod}, F).
+
+-spec create_ets_table(atom(), list()) -> ok.
+create_ets_table(TableName, TableOpts) ->
+    case does_table_exist(TableName) of
+        true -> ok;
+        false ->
+            Opts = maybe_add_heir(whereis(?MODULE), self(), TableOpts),
+            ets:new(TableName, Opts),
+            ok
+    end.
+
+does_table_exist(TableName) ->
+    undefined =/= ets:info(TableName, name).
+
+%% In tests or when module is started in run-time, we need to set heir to the
+%% ETS table, otherwise it will be destroyed when the creator's process finishes.
+%% When started normally during node start up, self() =:= EjdSupPid and there
+%% is no need for setting heir
+maybe_add_heir(EjdSupPid, EjdSupPid, BaseOpts) when is_pid(EjdSupPid) ->
+    BaseOpts;
+maybe_add_heir(EjdSupPid, _Self, BaseOpts) when is_pid(EjdSupPid) ->
+    case lists:keymember(heir, 1, BaseOpts) of
+        true -> BaseOpts;
+        false -> [{heir, EjdSupPid, testing} | BaseOpts]
+    end;
+maybe_add_heir(_, _, BaseOpts) ->
+    BaseOpts.

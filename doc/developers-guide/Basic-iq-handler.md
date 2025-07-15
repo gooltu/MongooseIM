@@ -12,12 +12,10 @@ handler to MongooseIM.
 `gen_iq_handler` module provides functionality for registering IQ
 handlers for specific namespaces.
 
-
 ## Clone & build
 
-See [How-to-build](../../user-guide/How-to-build) for details on building MongooseIM
+See [How-to-build](../tutorials/How-to-build.md) for details on building MongooseIM
 from source code.
-
 
 ## Create a module & add a basic IQ handler
 
@@ -49,33 +47,17 @@ detailed information on the topic.
 %% IQ handlers
 -export([process_iq/4]).
 
-start(Host, _Opts) ->
-    gen_iq_handler:add_iq_handler(ejabberd_sm, Host, <<"erlang-solutions.com:example">>,
-                                  ?MODULE, process_iq, no_queue).
-stop(Host) ->
-    gen_iq_handler:remove_iq_handler(ejabberd_sm, Host, <<"erlang-solutions.com:example">>).
+start(HostType, _Opts) ->
+    gen_iq_handler:add_iq_handler_for_domain(HostType, <<"erlang-solutions.com:example">>,
+                                  ejabberd_sm, process_iq, #{}, no_queue).
+stop(HostType) ->
+    gen_iq_handler:remove_iq_handler_for_domain(HostType, <<"erlang-solutions.com:example">>, ejabberd_sm).
 
 process_iq(_From, _To, Acc, IQ) ->
     IQRes = IQ#iq{type = result},
-    ?INFO_MSG("event=example_handler request=~w response=~w", 
-                [IQ, IQRes]),
+    ?LOG_INFO(#{what => example_handler, acc => Acc, iq_result => IQRes}),
     {Acc, IQRes}.
 ```
-
-
-### IQ processing policies
-
-The server may use one of the following strategies to handle incoming stanzas:
-
-* `no_queue` registers a new IQ  handler, which will be called in the
-  context of a process serving the connection on which the IQ arrives 
-* `one_queue` spawns a new process by which the incoming IQ stanzas will
-  be handled
-* `{queues, N}` spawns **N** processes. Every incoming stanza will be then
-  handled by one of those processes
-* `parallel` registers the handler without spawning a new process, a new process
-  will be spawned for each incoming stanza
-
 
 ## Test your handler
 
@@ -198,17 +180,16 @@ should_return_error(Config) ->
     end).
 ```
 
-
 ## Run it
 
 Compile & generate releases for testing purposes according to
-[How-to-build](../../user-guide/How-to-build/#building-the-testing-target-and-running-tests).
+[How-to-build](../tutorials/How-to-build.md#building-the-testing-target-and-running-tests).
 Go to `$REPO/_build/mim1/rel/mongooseim` and start one MongooseIM node.
 
 ```bash
-$ bin/mongooseim live
+bin/mongooseim live
 ```
-Open up a new terminal window, go to `$REPO` and use the [test runner](Testing-MongooseIM).
+Open up a new terminal window, go to `$REPO` and use the [test runner](Testing-MongooseIM.md).
 Run single suite with the already started `mim1` node.
 
 ```bash

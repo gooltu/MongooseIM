@@ -1,15 +1,20 @@
-### Module Description
+## Module Description
 
 This module enables support for communicating the local time of an entity. 
 It reports time in UTC according to the entity as well as the offset from UTC. 
 Protocol is described under [XEP-0202: Entity Time](http://www.xmpp.org/extensions/xep-0202.html).
 
-### Options
+## Options
 
-* `iqdisc` (default: `one_queue`)
+### `modules.mod_time.iqdisc.type`
+* **Syntax:** string, one of `"one_queue"`, `"no_queue"`, `"queues"`, `"parallel"`
+* **Default:** `"one_queue"`
 
-### Example Configuration
+Strategy to handle incoming stanzas. For details, please refer to
+[IQ processing policies](../configuration/Modules.md#iq-processing-policies).
 
-```
-  {mod_time, []},
+## Example Configuration
+
+```toml
+[modules.mod_time]
 ```

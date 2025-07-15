@@ -26,7 +26,7 @@
 %%==============================================================================
 
 -module(vcard_SUITE).
--compile(export_all).
+-compile([export_all, nowarn_export_all]).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("escalus/include/escalus_xmlns.hrl").
@@ -38,13 +38,17 @@
 -define(EL_CD(Element, Name), exml_query:path(Element, [{element, Name}, cdata])).
 
 -define(PHOTO_BIN, <<130, 192, 33, 159, 204, 86, 12, 63, 132, 164>>).
--define(PHOTO_BASE_64, <<"gsAhn8xWDD+EpA==">>). %% jlib:encode_base64(?PHOTO_BIN)
+-define(PHOTO_BASE_64, <<"gsAhn8xWDD+EpA==">>). %% base64:encode(?PHOTO_BIN)
 
 -import(distributed_helper, [mim/0,
                              require_rpc_nodes/1,
+                             subhost_pattern/1,
                              rpc/4]).
 -import(ldap_helper, [get_ldap_base/1,
                       call_ldap/3]).
+-import(domain_helper, [host_type/0,
+                        host_types/0,
+                        domain/0]).
 
 %%--------------------------------------------------------------------
 %% Suite configuration
@@ -62,20 +66,19 @@ all() ->
 groups() ->
     %% setting test data before tests is proving awkward so might as well use the
     %% data set in the update tests to test the rest.
-    G = [{rw, [sequence], rw_tests()},
-         {ro_full, [], ro_full_search_tests()},
-         {ro_limited, [], ro_limited_search_tests()},
-         {params_limited_infinity, [], rw_tests()},
-         {ro_no, [sequence], ro_no_search_tests()},
-         {ldap_only, [], ldap_only_tests()}
-        ],
-    ct_helper:repeat_all_until_all_ok(G).
+    [{rw, [sequence], rw_tests()},
+     {ro_full, [], ro_full_search_tests()},
+     {ro_limited, [], ro_limited_search_tests()},
+     {params_limited_infinity, [], rw_tests()},
+     {ro_no, [sequence], ro_no_search_tests()},
+     {ldap_only, [], ldap_only_tests()}].
 
 rw_tests() ->
     [
      update_own_card,
      cant_update_own_card_with_invalid_field,
-     can_update_own_card_with_emoji_in_nickname
+     can_update_own_card_with_emoji_in_nickname,
+     can_update_own_card_with_unicode_in_address
     ].
 
 ro_full_search_tests() ->
@@ -95,7 +98,8 @@ ro_full_search_tests() ->
      search_rsm_count,
      search_rsm_forward,
      search_rsm_backward,
-     search_rsm_pages
+     search_rsm_pages,
+     search_errors
     ].
 
 ro_limited_search_tests() ->
@@ -122,16 +126,18 @@ suite() ->
 init_per_suite(Config) ->
     NewConfig = escalus:init_per_suite(Config),
     NewConfig1 = vcard_config(NewConfig),
-    NewConfig2 = stop_running_vcard_mod(NewConfig1),
+    NewConfig2 = prepare_vcard_module(NewConfig1),
     AliceAndBob = escalus_users:get_users([alice, bob]),
-    Domain = domain(),
+    Spec = escalus_users:get_userspec(Config, alice),
+    Addr = proplists:get_value(host, Spec, <<"localhost">>),
+    SecDomain = secondary_domain(),
     BisUsers = [{aliceb, [{username, <<"aliceb">>},
-                          {server, <<Domain/binary, ".bis">>},
-                          {host, Domain},
+                          {server, SecDomain},
+                          {host, Addr},
                           {password, <<"makota">>}]},
                 {bobb, [{username, <<"bobb">>},
-                        {server, <<Domain/binary, ".bis">>},
-                        {host, Domain},
+                        {server, SecDomain},
+                        {host, Addr},
                         {password, <<"makrolika">>}]}],
     NewUsers = AliceAndBob ++ BisUsers,
     escalus:create_users([{escalus_users, NewUsers} | NewConfig2], NewUsers).
@@ -144,26 +150,25 @@ vcard_config(Config) ->
     ] ++ Config.
 
 end_per_suite(Config) ->
-    start_running_vcard_mod(Config),
+    restore_vcard_module(Config),
     Who = ?config(escalus_users, Config),
     NewConfig = escalus:delete_users(Config, Who),
     escalus:end_per_suite(NewConfig).
 
 init_per_group(Group, Config) when Group == rw; Group == params_limited_infinity ->
     restart_vcard_mod(Config, Group),
-    case vcard_update:is_vcard_ldap() of
+    case vcard_helper:is_vcard_ldap() of
         true ->
             {skip, ldap_vcard_is_readonly};
         _ ->
             Config
     end;
 init_per_group(ldap_only, Config) ->
-    VCardConfig = ?config(mod_vcard, Config),
-    case proplists:get_value(backend, VCardConfig) of
+    VCardConfig = ?config(mod_vcard_opts, Config),
+    case maps:get(backend, VCardConfig) of
         ldap ->
             Config1 = restart_and_prepare_vcard(ldap_only, Config),
             insert_alice_photo(Config1);
-            %Config1;
         _ ->
             {skip, "this group is only for ldap vCard backend"}
     end;
@@ -230,6 +235,22 @@ can_update_own_card_with_emoji_in_nickname(Config) ->
                 Client1GetResultStanza
                     = escalus:send_and_wait(Client1, escalus_stanza:vcard_request()),
                 NickWithEmoji = stanza_get_vcard_field_cdata(Client1GetResultStanza, <<"NICKNAME">>)
+        end).
+
+can_update_own_card_with_unicode_in_address(Config) ->
+    escalus:story(
+        Config, [{alice, 1}],
+        fun(Client1) ->
+                Locality = get_utf8_city(),
+                Client1Fields = [{<<"ADDR">>, [{<<"LOCALITY">>, get_utf8_city()}]}],
+                Client1SetResultStanza
+                    = escalus:send_and_wait(Client1,
+                                            escalus_stanza:vcard_update(Client1Fields)),
+                escalus:assert(is_iq_result, Client1SetResultStanza),
+                Client1GetResultStanza
+                    = escalus:send_and_wait(Client1, escalus_stanza:vcard_request()),
+                Addr = stanza_get_vcard_field(Client1GetResultStanza, <<"ADDR">>),
+                Locality = ?EL_CD(Addr, <<"LOCALITY">>)
         end).
 
 retrieve_own_card(Config) ->
@@ -311,10 +332,10 @@ server_vcard(Config) ->
     escalus:story(
       Config, [{alice, 1}],
       fun(Client) ->
-              ServJID = ct:get_config({hosts, mim, domain}),
+              Domain = domain(),
               Res = escalus:send_and_wait(Client,
-                        escalus_stanza:vcard_request(ServJID)),
-              ServerVCardTups = get_server_vcard(ServJID, Config),
+                        escalus_stanza:vcard_request(Domain)),
+              ServerVCardTups = get_server_vcard(Domain, Config),
               check_vcard(ServerVCardTups, Res)
       end).
 
@@ -333,9 +354,9 @@ vcard_service_discovery(Config) ->
     escalus:story(
       Config, [{alice, 1}],
       fun(Client) ->
-          ServJID = ct:get_config({hosts, mim, domain}),
+          Domain = domain(),
               Res = escalus:send_and_wait(Client,
-                        escalus_stanza:disco_info(ServJID)),
+                        escalus_stanza:disco_info(Domain)),
               escalus:assert(is_iq_result, Res),
               escalus:assert(has_feature, [<<"vcard-temp">>], Res)
     end).
@@ -412,11 +433,13 @@ search_some(Config) ->
 
               %% Basically test that the right values exist
               %% and map to the right column headings
-              Domain = ct:get_config({hosts, mim, domain}),
+              Domain = domain(),
               AliceJID = <<"alice@", Domain/binary>>,
 
-              [{AliceJID, ItemTups}] = search_result_item_tuples(Res),
+              %% Extra check
+              _Result = escalus:send_and_wait(Client, escalus_stanza:vcard_request(AliceJID)),
 
+              [{AliceJID, ItemTups}] = search_result_item_tuples(Res),
               {_, _, <<"City">>, MoscowRUBin} = lists:keyfind(<<"City">>, 3, ItemTups)
       end).
 
@@ -437,7 +460,7 @@ search_wildcard(Config) ->
                 ExpectedItemTups = get_search_results(Config,
                                                       [<<"bobb@", Domain/binary>>,
                                                        <<"aliceb@", Domain/binary>>]),
-                case vcard_update:is_vcard_ldap() of
+                case vcard_helper:is_vcard_ldap() of
                     true ->
                         3 = length(ItemTups);
                     _ ->
@@ -460,9 +483,9 @@ search_rsm_pages(Config) ->
                 Iq2 = append_to_query(
                         Iq1,
                         #xmlel{name = <<"set">>,
-                               attrs = [{<<"xmlns">>, ?NS_RSM}],
+                               attrs = #{<<"xmlns">> => ?NS_RSM},
                                children =
-                                   [#xmlel{name = "max",
+                                   [#xmlel{name = <<"max">>,
                                            children =
                                                [#xmlcdata{content = <<"1">>}]
                                           }
@@ -473,7 +496,7 @@ search_rsm_pages(Config) ->
                 escalus:assert(is_iq_result, Res1),
 
                 RSMCount1 = get_rsm_count(Res1),
-                case vcard_update:is_vcard_ldap() of
+                case vcard_helper:is_vcard_ldap() of
                     true ->
                         <<"3">> = RSMCount1;
                     false ->
@@ -484,13 +507,13 @@ search_rsm_pages(Config) ->
                 Iq3 = append_to_query(
                         Iq1,
                         #xmlel{name = <<"set">>,
-                               attrs = [{<<"xmlns">>, ?NS_RSM}],
+                               attrs = #{<<"xmlns">> => ?NS_RSM},
                                children =
-                                   [#xmlel{name = "max",
+                                   [#xmlel{name = <<"max">>,
                                            children =
                                                [#xmlcdata{content = <<"1">>}]
                                           },
-                                    #xmlel{name = "index",
+                                    #xmlel{name = <<"index">>,
                                            children =
                                                [#xmlcdata{content = <<"1">>}]
                                           }
@@ -501,18 +524,19 @@ search_rsm_pages(Config) ->
                 escalus:assert(is_iq_result, Res2),
 
                 RSMCount2 = get_rsm_count(Res2),
-                case vcard_update:is_vcard_ldap() of
+                case vcard_helper:is_vcard_ldap() of
                     true ->
                         <<"3">> = RSMCount2;
                     false ->
                         <<"2">> = RSMCount2
                 end,
                 ItemTups2 = search_result_item_tuples(Res2),
+                SecDomain = secondary_domain(),
                 ExpectedItemTups = get_search_results(
                                      Config,
-                                     [<<"bobb@localhost.bis">>,
-                                      <<"aliceb@localhost.bis">>]),
-                case vcard_update:is_vcard_ldap() of
+                                     [<<"bobb@", SecDomain/binary>>,
+                                      <<"aliceb@", SecDomain/binary>>]),
+                case vcard_helper:is_vcard_ldap() of
                     true ->
                         ignore;
                     _ ->
@@ -536,9 +560,9 @@ search_rsm_forward(Config) ->
                 Iq2 = append_to_query(
                         Iq1,
                         #xmlel{name = <<"set">>,
-                               attrs = [{<<"xmlns">>, ?NS_RSM}],
+                               attrs = #{<<"xmlns">> => ?NS_RSM},
                                children =
-                                   [#xmlel{name = "max",
+                                   [#xmlel{name = <<"max">>,
                                            children =
                                                [#xmlcdata{content = <<"1">>}]
                                           }
@@ -549,7 +573,7 @@ search_rsm_forward(Config) ->
                 escalus:assert(is_iq_result, Res1),
 
                 RSMCount1 = get_rsm_count(Res1),
-                case vcard_update:is_vcard_ldap() of
+                case vcard_helper:is_vcard_ldap() of
                     true ->
                         <<"3">> = RSMCount1;
                     false ->
@@ -561,13 +585,13 @@ search_rsm_forward(Config) ->
                 Iq3 = append_to_query(
                         Iq1,
                         #xmlel{name = <<"set">>,
-                               attrs = [{<<"xmlns">>, ?NS_RSM}],
+                               attrs = #{<<"xmlns">> => ?NS_RSM},
                                children =
-                                   [#xmlel{name = "max",
+                                   [#xmlel{name = <<"max">>,
                                            children =
                                                [#xmlcdata{content = <<"1">>}]
                                           },
-                                    #xmlel{name = "after",
+                                    #xmlel{name = <<"after">>,
                                            children =
                                                [#xmlcdata{content = RSMLast1}]
                                           }
@@ -578,7 +602,7 @@ search_rsm_forward(Config) ->
                 escalus:assert(is_iq_result, Res2),
 
                 RSMCount2 = get_rsm_count(Res2),
-                case vcard_update:is_vcard_ldap() of
+                case vcard_helper:is_vcard_ldap() of
                     true ->
                         <<"3">> = RSMCount2;
                     false ->
@@ -586,11 +610,12 @@ search_rsm_forward(Config) ->
                 end,
                 RSMLast2 = get_rsm_last(Res2),
                 ItemTups2 = search_result_item_tuples(Res2),
+                SecDomain = secondary_domain(),
                 ExpectedItemTups = get_search_results(
                                      Config,
-                                     [<<"bobb@localhost.bis">>,
-                                      <<"aliceb@localhost.bis">>]),
-                case vcard_update:is_vcard_ldap() of
+                                     [<<"bobb@", SecDomain/binary>>,
+                                      <<"aliceb@", SecDomain/binary>>]),
+                case vcard_helper:is_vcard_ldap() of
                     true ->
                         ignore;
                     _ ->
@@ -601,13 +626,13 @@ search_rsm_forward(Config) ->
                 Iq4 = append_to_query(
                         Iq1,
                         #xmlel{name = <<"set">>,
-                               attrs = [{<<"xmlns">>, ?NS_RSM}],
+                               attrs = #{<<"xmlns">> => ?NS_RSM},
                                children =
-                                   [#xmlel{name = "max",
+                                   [#xmlel{name = <<"max">>,
                                            children =
                                                [#xmlcdata{content = <<"1">>}]
                                           },
-                                    #xmlel{name = "after",
+                                    #xmlel{name = <<"after">>,
                                            children =
                                                [#xmlcdata{content = RSMLast2}]
                                           }
@@ -618,7 +643,7 @@ search_rsm_forward(Config) ->
                 escalus:assert(is_iq_result, Res3),
 
                 RSMCount2 = get_rsm_count(Res3),
-                case vcard_update:is_vcard_ldap() of
+                case vcard_helper:is_vcard_ldap() of
                     true ->
                         <<"3">> = RSMCount2,
                         [_] = search_result_item_tuples(Res3);
@@ -643,13 +668,13 @@ search_rsm_backward(Config) ->
                 Iq2 = append_to_query(
                         Iq1,
                         #xmlel{name = <<"set">>,
-                               attrs = [{<<"xmlns">>, ?NS_RSM}],
+                               attrs = #{<<"xmlns">> => ?NS_RSM},
                                children =
-                                   [#xmlel{name = "max",
+                                   [#xmlel{name = <<"max">>,
                                            children =
                                                [#xmlcdata{content = <<"1">>}]
                                           },
-                                    #xmlel{name = "before"}
+                                    #xmlel{name = <<"before">>}
                                    ]}
                        ),
 
@@ -657,7 +682,7 @@ search_rsm_backward(Config) ->
                 escalus:assert(is_iq_result, Res1),
 
                 RSMCount1 = get_rsm_count(Res1),
-                case vcard_update:is_vcard_ldap() of
+                case vcard_helper:is_vcard_ldap() of
                     true ->
                         <<"3">> = RSMCount1;
                     false ->
@@ -669,13 +694,13 @@ search_rsm_backward(Config) ->
                 Iq3 = append_to_query(
                         Iq1,
                         #xmlel{name = <<"set">>,
-                               attrs = [{<<"xmlns">>, ?NS_RSM}],
+                               attrs = #{<<"xmlns">> => ?NS_RSM},
                                children =
-                                   [#xmlel{name = "max",
+                                   [#xmlel{name = <<"max">>,
                                            children =
                                                [#xmlcdata{content = <<"1">>}]
                                           },
-                                    #xmlel{name = "before",
+                                    #xmlel{name = <<"before">>,
                                            children =
                                                [#xmlcdata{content = RSMFirst1}]
                                           }
@@ -686,7 +711,7 @@ search_rsm_backward(Config) ->
                 escalus:assert(is_iq_result, Res2),
 
                 RSMCount2 = get_rsm_count(Res2),
-                case vcard_update:is_vcard_ldap() of
+                case vcard_helper:is_vcard_ldap() of
                     true ->
                         <<"3">> = RSMCount2;
                     false ->
@@ -694,11 +719,12 @@ search_rsm_backward(Config) ->
                 end,
                 RSMFirst2 = get_rsm_first(Res2),
                 ItemTups2 = search_result_item_tuples(Res2),
+                SecDomain = secondary_domain(),
                 ExpectedItemTups = get_search_results(
                                      Config,
-                                     [<<"bobb@localhost.bis">>,
-                                      <<"aliceb@localhost.bis">>]),
-                case vcard_update:is_vcard_ldap() of
+                                     [<<"bobb@", SecDomain/binary>>,
+                                      <<"aliceb@", SecDomain/binary>>]),
+                case vcard_helper:is_vcard_ldap() of
                     true ->
                         ignore;
                     _ ->
@@ -709,13 +735,13 @@ search_rsm_backward(Config) ->
                 Iq4 = append_to_query(
                         Iq1,
                         #xmlel{name = <<"set">>,
-                               attrs = [{<<"xmlns">>, ?NS_RSM}],
+                               attrs = #{<<"xmlns">> => ?NS_RSM},
                                children =
-                                   [#xmlel{name = "max",
+                                   [#xmlel{name = <<"max">>,
                                            children =
                                                [#xmlcdata{content = <<"1">>}]
                                           },
-                                    #xmlel{name = "before",
+                                    #xmlel{name = <<"before">>,
                                            children =
                                                [#xmlcdata{content = RSMFirst2}]
                                           }
@@ -726,7 +752,7 @@ search_rsm_backward(Config) ->
                 escalus:assert(is_iq_result, Res3),
 
                 RSMCount2 = get_rsm_count(Res3),
-                case vcard_update:is_vcard_ldap() of
+                case vcard_helper:is_vcard_ldap() of
                     true ->
                         <<"3">> = RSMCount2,
                         [_] = search_result_item_tuples(Res3);
@@ -751,9 +777,9 @@ search_rsm_count(Config) ->
                 Iq2 = append_to_query(
                         Iq1,
                         #xmlel{name = <<"set">>,
-                               attrs = [{<<"xmlns">>, ?NS_RSM}],
+                               attrs = #{<<"xmlns">> => ?NS_RSM},
                                children =
-                                   [#xmlel{name = "max",
+                                   [#xmlel{name = <<"max">>,
                                            children =
                                                [#xmlcdata{content = <<"0">>}]
                                           }
@@ -767,13 +793,29 @@ search_rsm_count(Config) ->
                 0 = length(ItemTups),
 
                 RSMCount = get_rsm_count(Res),
-                case vcard_update:is_vcard_ldap() of
+                case vcard_helper:is_vcard_ldap() of
                     true ->
                         <<"3">> = RSMCount;
                     false ->
                         <<"2">> = RSMCount
                 end
         end).
+
+search_errors(Config) ->
+    escalus:story(
+      Config, [{alice, 1}],
+      fun(Client) ->
+              DirJID = ?config(directory_jid, Config),
+              Fields = [#xmlel{ name = <<"field">> }],
+              Req = escalus_stanza:search_iq(DirJID, Fields),
+
+              escalus:assert(is_error, [<<"modify">>, <<"bad-request">>],
+                             escalus:send_and_wait(Client, form_helper:remove_form_types(Req))),
+              escalus:assert(is_error, [<<"modify">>, <<"bad-request">>],
+                             escalus:send_and_wait(Client, form_helper:remove_form_ns(Req))),
+              escalus:assert(is_error, [<<"modify">>, <<"bad-request">>],
+                             escalus:send_and_wait(Client, form_helper:remove_forms(Req)))
+      end).
 
 get_rsm_count(El) ->
     exml_query:path(El, [{element, <<"query">>},
@@ -870,14 +912,13 @@ search_open_limited(Config) ->
     escalus:story(
       Config, [{alice, 1}],
       fun(Client) ->
-              Server = ct:get_config({hosts, mim, domain}),
-              DirJID = <<"directory.", Server/binary>>,
+              Domain = domain(),
+              DirJID = <<"directory.", Domain/binary>>,
               Fields = [null],
               Res = escalus:send_and_wait(Client,
                            escalus_stanza:search_iq(DirJID,
                                escalus_stanza:search_fields(Fields))),
               escalus:assert(is_iq_result, Res),
-              %% {allow_return_all, false}
               [] = search_result_item_tuples(Res)
       end).
 
@@ -887,7 +928,6 @@ search_some_limited(Config) ->
       fun(Client) ->
               Domain = ct:get_config({hosts, mim, secondary_domain}),
               DirJID = <<"directory.", Domain/binary>>,
-              Server = escalus_client:server(Client),
               Fields = [{get_last_name_search_field(), <<"Doe">>}],
               Res = escalus:send_and_wait(Client,
                         escalus_stanza:search_iq(DirJID,
@@ -896,7 +936,8 @@ search_some_limited(Config) ->
               ItemTups = search_result_item_tuples(Res),
               %% exactly one result returned and its JID domain is correct
               [{SomeJID, _JIDsFields}] = ItemTups,
-              {_Start, _Length} = binary:match(SomeJID, <<"@", Server/binary>>)
+              true = lists:member(SomeJID, [<<"aliceb@", Domain/binary>>,
+                                            <<"bobb@", Domain/binary>>])
       end).
 
 
@@ -908,12 +949,12 @@ search_in_service_discovery(Config) ->
     escalus:story(
       Config, [{alice, 1}],
       fun(Client) ->
-              ServJID = ct:get_config({hosts, mim, domain}),
-              DirJID = <<"directory.", ServJID/binary>>,
+              Domain = domain(),
+              DirJID = <<"directory.", Domain/binary>>,
 
               %% Item
               ItemsRes = escalus:send_and_wait(Client,
-                                escalus_stanza:disco_items(ServJID)),
+                                escalus_stanza:disco_items(Domain)),
               escalus:assert(is_iq_result, ItemsRes),
               escalus:assert(has_item, [DirJID], ItemsRes),
 
@@ -940,8 +981,12 @@ search_not_allowed(Config) ->
               Res = escalus:send_and_wait(Client,
                            escalus_stanza:search_iq(DirJID,
                                escalus_stanza:search_fields(Fields))),
-              escalus:assert(is_error, [<<"cancel">>,
-                                        <<"service-unavailable">>], Res)
+              escalus:assert(fun(Packet) ->
+                                     escalus_pred:is_error(<<"cancel">>, <<"service-unavailable">>, Packet)
+                                     orelse
+                                     %% A case for dynamic domains
+                                     escalus_pred:is_error(<<"cancel">>, <<"remote-server-not-found">>, Packet)
+                             end, [], Res)
       end).
 
 %% disco#items to no.search.domain doesn't say vjud.no.search.domain exists
@@ -949,11 +994,10 @@ search_not_in_service_discovery(Config) ->
     escalus:story(
       Config, [{alice, 1}],
       fun(Client) ->
-              ServJID = ct:get_config({hosts, mim, domain}),
               DirJID = ?config(directory_jid, Config),
               %% Item
               ItemsRes = escalus:send_and_wait(Client,
-                            escalus_stanza:disco_items(ServJID)),
+                            escalus_stanza:disco_items(domain())),
               escalus:assert(is_iq_result, ItemsRes),
               escalus:assert(has_no_such_item, [DirJID], ItemsRes)
       end).
@@ -970,12 +1014,7 @@ expected_search_results(Key, Config) ->
 
 prepare_vcards(Config) ->
     AllVCards = ?config(all_vcards, Config),
-    ModVcardBackend = case lists:keyfind(backend, 1, ?config(mod_vcard, Config)) of
-                          {backend, Backend} ->
-                              Backend;
-                          _ ->
-                              mnesia
-                      end,
+    ModVcardBackend = get_backend(Config),
     lists:foreach(
         fun({JID, Fields}) ->
                 case binary:match(JID, <<"@">>) of
@@ -985,8 +1024,10 @@ prepare_vcards(Config) ->
                         prepare_vcard(ModVcardBackend, JID, Fields)
                 end
         end, AllVCards),
-    timer:sleep(timer:seconds(3)), %give some time to Yokozuna to index vcards
     Config.
+
+get_backend(Config) ->
+    maps:get(backend, ?config(mod_vcard_opts, Config), mnesia).
 
 prepare_vcard(ldap, JID, Fields) ->
     [User, Server] = binary:split(JID, <<"@">>),
@@ -1035,12 +1076,12 @@ prepare_vcard(_, JID, Fields) ->
 
 insert_alice_photo(Config) ->
     User = <<"alice">>,
-    Server = domain(),
-    Base = get_ldap_base(Server),
+    Domain = domain(),
+    Base = get_ldap_base(Domain),
     Photo = ?PHOTO_BIN,
     Modificators = [eldap:mod_replace("jpegPhoto", [binary_to_list(Photo)])],
     Dn = <<"cn=", User/binary, ",", Base/binary>>,
-    ok = call_ldap(Server, modify, [binary_to_list(Dn), Modificators]),
+    ok = call_ldap(Domain, modify, [binary_to_list(Dn), Modificators]),
     Config.
 
 
@@ -1084,10 +1125,20 @@ delete_vcards(Config) ->
 
 get_jid_record(JID) ->
     [User, Server] = binary:split(JID, <<"@">>),
-    {jid, User, Server, <<"">>, User, Server, <<"">>}.
+    jid:make_bare(User, Server).
 
 vcard_rpc(JID, Stanza) ->
-    rpc(mim(), ejabberd_sm, route, [JID, JID, Stanza]).
+    Res = rpc(mim(), ejabberd_router, route, [JID, JID, Stanza]),
+    case Res of
+        #{stanza := #{type := <<"set">>}} ->
+            ok;
+        _ ->
+            %% Something is wrong with the IQ handler
+            %% Let's print enough info
+            ct:pal("jid=~p~n stanza=~p~n result=~p~n", [JID, Stanza, Res]),
+            mongoose_helper:print_debug_info_for_module(mod_vcard),
+            ct:fail(vcard_rpc_failed)
+    end.
 
 restart_vcard_mod(Config, ro_limited) ->
     restart_mod(params_limited(Config));
@@ -1100,67 +1151,69 @@ restart_vcard_mod(Config, ldap_only) ->
 restart_vcard_mod(Config, _GN) ->
     restart_mod(params_all(Config)).
 
-start_running_vcard_mod(Config) ->
-    Domain = ct:get_config({hosts, mim, domain}),
-    OriginalVcardConfig = ?config(mod_vcard, Config),
-    dynamic_modules:start(Domain, mod_vcard, OriginalVcardConfig).
-stop_running_vcard_mod(Config) ->
-    Domain = ct:get_config({hosts, mim, domain}),
-    CurrentConfigs = rpc(mim(), gen_mod, loaded_modules_with_opts, [Domain]),
-    {mod_vcard, CurrentVcardConfig} = lists:keyfind(mod_vcard, 1, CurrentConfigs),
-    dynamic_modules:stop(Domain, mod_vcard),
-    [{mod_vcard, CurrentVcardConfig} | Config].
+restart_mod(Params) ->
+    [restart_mod(HostType, Params) || HostType <- host_types()],
+    ok.
+
+restart_mod(HostType, Params) ->
+    dynamic_modules:restart(HostType, mod_vcard, Params).
+
+prepare_vcard_module(Config) ->
+    %% Keep the old config, so we can undo our changes, once finished testing
+    Config1 = dynamic_modules:save_modules(host_types(), Config),
+    %% Get a list of options, we can use as a prototype to start new modules
+    VCardOpts = dynamic_modules:get_saved_config(host_type(), mod_vcard, Config1),
+    [{mod_vcard_opts, VCardOpts} | Config1].
+
+restore_vcard_module(Config) ->
+    dynamic_modules:restore_modules(Config).
 
 stop_vcard_mod(_Config) ->
-    Domain = ct:get_config({hosts, mim, domain}),
-    dynamic_modules:stop(Domain, mod_vcard).
+    [dynamic_modules:stop(HostType, mod_vcard) || HostType <- host_types()],
+    ok.
 
 params_all(Config) ->
-    add_backend_param([], ?config(mod_vcard, Config)).
+    add_backend_param(#{}, ?config(mod_vcard_opts, Config)).
 
 params_limited(Config) ->
-    add_backend_param([{matches, 1},
-                       {host, "directory.@HOST@"}], ?config(mod_vcard, Config)).
+    add_backend_param(#{matches => 1,
+                        host => subhost_pattern("directory.@HOST@")},
+                      ?config(mod_vcard_opts, Config)).
 
 params_limited_infinity(Config) ->
-    add_backend_param([{matches, infinity},
-                       {host, "directory.@HOST@"}], ?config(mod_vcard, Config)).
+    add_backend_param(#{matches => infinity,
+                        host => subhost_pattern("directory.@HOST@")},
+                      ?config(mod_vcard_opts, Config)).
 
 params_no(Config) ->
-    add_backend_param([{search, false}], ?config(mod_vcard, Config)).
+    add_backend_param(#{search => false,
+                        host => subhost_pattern("vjud.@HOST@")},
+                      ?config(mod_vcard_opts, Config)).
 
 params_ldap_only(Config) ->
     Reported = [{<<"Full Name">>, <<"FN">>},
-   {<<"Given Name">>, <<"FIRST">>},
-   {<<"Middle Name">>, <<"MIDDLE">>},
-   {<<"Family Name">>, <<"LAST">>},
-   {<<"Nickname">>, <<"NICK">>},
-   {<<"Birthday">>, <<"BDAY">>},
-   {<<"Country">>, <<"CTRY">>},
-   {<<"City">>, <<"LOCALITY">>},
-   {<<"Email">>, <<"EMAIL">>},
-   {<<"Organization Name">>, <<"ORGNAME">>},
-   {<<"Organization Unit">>, <<"ORGUNIT">>},
-     {<<"Photo">>, <<"PHOTO">>}],
-    add_backend_param([{ldap_search_operator, 'or'},
-                       {ldap_binary_search_fields, [<<"PHOTO">>]},
-                       {ldap_search_reported, Reported}],
-                      ?config(mod_vcard, Config)).
+                {<<"Given Name">>, <<"FIRST">>},
+                {<<"Middle Name">>, <<"MIDDLE">>},
+                {<<"Family Name">>, <<"LAST">>},
+                {<<"Nickname">>, <<"NICK">>},
+                {<<"Birthday">>, <<"BDAY">>},
+                {<<"Country">>, <<"CTRY">>},
+                {<<"City">>, <<"LOCALITY">>},
+                {<<"Email">>, <<"EMAIL">>},
+                {<<"Organization Name">>, <<"ORGNAME">>},
+                {<<"Organization Unit">>, <<"ORGUNIT">>},
+                {<<"Photo">>, <<"PHOTO">>}],
+    add_backend_param(#{ldap => #{search_operator => 'or',
+                                  binary_search_fields => [<<"PHOTO">>],
+                                  search_reported => Reported}},
+                      ?config(mod_vcard_opts, Config)).
 
+add_backend_param(Opts = #{ldap := LDAPOpts},
+                  CurrentVCardConfig = #{backend := ldap, ldap := CurrentLDAPOpts}) ->
+    NewLDAPOpts = maps:merge(CurrentLDAPOpts, LDAPOpts),
+    maps:merge(CurrentVCardConfig, Opts#{ldap => NewLDAPOpts});
 add_backend_param(Opts, CurrentVCardConfig) ->
-    F = fun({Key, _} = Item, Cfg) ->
-        lists:keystore(Key, 1, Cfg, Item)
-    end,
-    lists:foldl(F, CurrentVCardConfig, Opts).
-
-
-restart_mod(Params) ->
-    Domain = ct:get_config({hosts, mim, domain}),
-    SecDomain = ct:get_config({hosts, mim, secondary_domain}),
-    dynamic_modules:stop(Domain, mod_vcard),
-    dynamic_modules:stop(SecDomain, mod_vcard),
-    {ok, _Pid} = dynamic_modules:start(Domain, mod_vcard, Params),
-    {ok, _Pid2} = dynamic_modules:start(SecDomain, mod_vcard, Params).
+    maps:merge(CurrentVCardConfig, Opts).
 
 %%----------------------
 %% xmlel shortcuts
@@ -1181,11 +1234,9 @@ stanza_get_vcard_field_cdata(Stanza, FieldName) ->
 field_tuples([]) ->
     [];
 field_tuples([#xmlel{name = <<"field">>,
-                          attrs=Attrs,
+                          attrs = Attrs,
                           children=_Children} = El| Rest]) ->
-    {<<"type">>, Type} = lists:keyfind(<<"type">>, 1, Attrs),
-    {<<"var">>, Var} = lists:keyfind(<<"var">>, 1, Attrs),
-    {<<"label">>, Label} = lists:keyfind(<<"label">>, 1, Attrs),
+    #{<<"type">> := Type, <<"var">> := Var, <<"label">> := Label} = Attrs,
     case ?EL_CD(El, <<"value">>) of
         undefined ->
             [{Type, Var, Label}|field_tuples(Rest)];
@@ -1204,9 +1255,9 @@ item_field_tuples(_, []) ->
     [];
 item_field_tuples(ReportedFieldTups,
                   [#xmlel{name = <<"field">>,
-                               attrs=Attrs,
-                               children=_Children} = El| Rest]) ->
-    {<<"var">>, Var} = lists:keyfind(<<"var">>, 1, Attrs),
+                               attrs = Attrs,
+                               children = _Children} = El| Rest]) ->
+    Var = maps:get(<<"var">>, Attrs),
     {Type, Var, Label} = lists:keyfind(Var, 2, ReportedFieldTups),
     [{Type, Var, Label, ?EL_CD(El, <<"value">>)}
      | item_field_tuples(ReportedFieldTups, Rest)];
@@ -1297,14 +1348,14 @@ verify_tuples(Received, Expected) ->
 search_result_item_tuples(Stanza) ->
     Result = ?EL(Stanza, <<"query">>),
     XData = ?EL(Result, <<"x">>),
-    #xmlel{ attrs = _XAttrs,
-                 children = XChildren } = XData,
+    #xmlel{ children = XChildren } = XData,
     Reported = ?EL(XData, <<"reported">>),
     ReportedFieldTups = field_tuples(Reported#xmlel.children),
     _ItemTups = item_tuples(ReportedFieldTups, XChildren).
 
 get_all_vcards() ->
     Domain = domain(),
+    SecDomain = secondary_domain(),
     [{<<"alice@", Domain/binary>>,
       [{<<"NICKNAME">>, <<"alice">>},
        {<<"FN">>, <<"Wonderland, Alice">>},
@@ -1343,20 +1394,20 @@ get_all_vcards() ->
            208, 178, 208, 187, 209, 143, 208, 181, 209, 130, 209, 129, 209,
            143, 32, 208, 178, 209, 139>>}]}
       ] ++ maybe_add_jabberd_id(<<"bob@", Domain/binary>>)},
-     {<<"bobb@", Domain/binary, ".bis">>,
+     {<<"bobb@", SecDomain/binary>>,
       [{<<"NICKNAME">>, <<"bobb">>},
        {<<"FN">>, <<"Doe, Bob">>},
        {<<"N">>,
         [{<<"FAMILY">>, <<"Doe">>},
          {<<"GIVEN">>, <<"Bob">>}]}
-      ] ++ maybe_add_jabberd_id(<<"bobb@", Domain/binary, ".bis">>)},
-     {<<"aliceb@", Domain/binary, ".bis">>,
+      ] ++ maybe_add_jabberd_id(<<"bobb@", SecDomain/binary>>)},
+     {<<"aliceb@", SecDomain/binary>>,
       [{<<"NICKNAME">>, <<"aliceb">>},
        {<<"FN">>, <<"Doe, Alice">>},
        {<<"N">>,
         [{<<"FAMILY">>, <<"Doe">>},
          {<<"GIVEN">>, <<"Alice">>}]}
-      ] ++ maybe_add_jabberd_id(<<"aliceb@", Domain/binary, ".bis">>)}
+      ] ++ maybe_add_jabberd_id(<<"aliceb@", SecDomain/binary>>)}
     ].
 
 maybe_add_ctry() ->
@@ -1369,7 +1420,7 @@ maybe_add_jabberd_id(JabberId) ->
     maybe_add([{<<"JABBERID">>, JabberId}]).
 
 maybe_add(Elems) ->
-    case vcard_update:is_vcard_ldap() of
+    case vcard_helper:is_vcard_ldap() of
         true ->
             [];
         _ ->
@@ -1380,18 +1431,26 @@ get_server_vcards() ->
     [{domain(),
       [{<<"FN">>, <<"MongooseIM">>},
        {<<"DESC">>, <<"MongooseIM XMPP Server\nCopyright (c) Erlang Solutions Ltd.">>}]},
-     {<<"vjud.localhost">>,
+     {<<"vjud.", (domain())/binary>>,
       [{<<"FN">>, <<"MongooseIM/mod_vcard">>},
        {<<"DESC">>, <<"MongooseIM vCard module\nCopyright (c) Erlang Solutions Ltd.">>}]}].
 
 
 get_user_vcard(JID, Config) ->
-    {JID, ClientVCardTups} = lists:keyfind(JID, 1, ?config(all_vcards, Config)),
-    ClientVCardTups.
+    case lists:keyfind(JID, 1, ?config(all_vcards, Config)) of
+        {JID, ClientVCardTups} ->
+            ClientVCardTups;
+        _ ->
+            ct:fail({get_user_vcard_failed, JID})
+    end.
 
 get_server_vcard(ServerJid, Config) ->
-    {ServerJid, VCard} = lists:keyfind(ServerJid, 1, ?config(server_vcards, Config)),
-    VCard.
+    case lists:keyfind(ServerJid, 1, ?config(server_vcards, Config)) of
+        {ServerJid, VCard} ->
+            VCard;
+        _ ->
+            ct:fail({get_server_vcard_failed, ServerJid})
+    end.
 
 get_search_results(Config, Users) ->
     [{User, get_search_result(get_user_vcard(User, Config))} || User <- Users].
@@ -1415,7 +1474,7 @@ get_first_name_search_field() ->
     get_search_field(<<"first">>, <<"givenName">>).
 
 get_search_field(Default, LDAP) ->
-    case vcard_update:is_vcard_ldap() of
+    case vcard_helper:is_vcard_ldap() of
         true ->
             LDAP;
         _ ->
@@ -1464,7 +1523,7 @@ reported_fields() ->
     ] ++ maybe_add_jabberd_field().
 
 maybe_add_jabberd_field() ->
-    case vcard_update:is_vcard_ldap() of
+    case vcard_helper:is_vcard_ldap() of
         true ->
             [];
         _ ->
@@ -1490,5 +1549,5 @@ get_utf8_city() ->
     %% This is the UTF-8 of Москва
     <<208, 156, 208, 190, 209, 129, 208, 186, 208, 178, 208, 176>>.
 
-domain() ->
-    ct:get_config({hosts, mim, domain}).
+secondary_domain() ->
+    ct:get_config({hosts, mim, secondary_domain}).

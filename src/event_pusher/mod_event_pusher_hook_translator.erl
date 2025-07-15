@@ -17,86 +17,98 @@
 -module(mod_event_pusher_hook_translator).
 -author('konrad.zemek@erlang-solutions.com').
 
--behaviour(gen_mod).
--behaviour(mongoose_module_metrics).
-
 -include("jlib.hrl").
 -include("mod_event_pusher_events.hrl").
 
--export([start/2, stop/1]).
--export([user_send_packet/4,
-         filter_local_packet/1,
-         user_present/2,
-         user_not_present/5,
-         unacknowledged_message/2]).
+-export([add_hooks/1, delete_hooks/1]).
+
+-export([user_send_message/3,
+         filter_local_packet/3,
+         user_present/3,
+         user_not_present/3,
+         unacknowledged_message/3]).
 
 %%--------------------------------------------------------------------
 %% gen_mod API
 %%--------------------------------------------------------------------
 
--spec start(Host :: jid:server(), Opts :: proplists:proplist()) -> any().
-start(Host, _Opts) ->
-    ejabberd_hooks:add(hooks(Host)).
+-spec add_hooks(mongooseim:host_type()) -> ok.
+add_hooks(HostType) ->
+    gen_hook:add_handlers(hooks(HostType)).
 
--spec stop(Host :: jid:server()) -> ok.
-stop(Host) ->
-    ejabberd_hooks:delete(hooks(Host)).
+-spec delete_hooks(mongooseim:host_type()) -> ok.
+delete_hooks(HostType) ->
+    gen_hook:delete_handlers(hooks(HostType)).
 
 %%--------------------------------------------------------------------
 %% Hook callbacks
 %%--------------------------------------------------------------------
--type routing_data() :: {jid:jid(), jid:jid(), mongoose_acc:t(), exml:element()}.
--spec filter_local_packet(drop) -> drop;
-                         (routing_data()) -> routing_data().
-filter_local_packet(drop) ->
-    drop;
-filter_local_packet({From, To = #jid{lserver = Host}, Acc0, Packet}) ->
+-spec filter_local_packet(Acc, Args, Extra) -> {ok, Acc} when
+      Acc :: mongoose_hooks:filter_packet_acc(),
+      Args :: map(),
+      Extra :: gen_hook:extra().
+filter_local_packet({From, To, Acc0, Packet}, _, _) ->
     Acc = case chat_type(Acc0) of
               false -> Acc0;
-              Type ->
-                  Event = #chat_event{type = Type, direction = out,
-                                      from = From, to = To, packet = Packet},
-                  NewAcc = mod_event_pusher:push_event(Acc0, Host, Event),
-                  merge_acc(Acc0, NewAcc)
+              Type -> push_chat_event(Acc0, Type, {From, To, Packet}, out)
           end,
-    {From, To, Acc, Packet}.
+    {ok, {From, To, Acc, Packet}}.
 
--spec user_send_packet(mongoose_acc:t(), From :: jid:jid(), To :: jid:jid(),
-                       Packet :: exml:element()) -> mongoose_acc:t().
-user_send_packet(Acc, From, To, Packet = #xmlel{name = <<"message">>}) ->
-    case chat_type(Acc) of
-        false -> Acc;
-        Type ->
-            Event = #chat_event{type = Type, direction = in,
-                                from = From, to = To, packet = Packet},
-            NewAcc = mod_event_pusher:push_event(Acc, From#jid.lserver, Event),
-            merge_acc(Acc, NewAcc)
-    end;
-user_send_packet(Acc, _From, _To, _Packet) ->
-    Acc.
+-spec user_send_message(mongoose_acc:t(), mongoose_c2s_hooks:params(), gen_hook:extra()) ->
+    mongoose_c2s_hooks:result().
+user_send_message(Acc, _, _) ->
+    Packet = mongoose_acc:packet(Acc),
+    ChatType = chat_type(Acc),
+    ResultAcc = if
+        Packet == undefined -> Acc;
+        ChatType == false -> Acc;
+        true -> push_chat_event(Acc, ChatType, Packet, in)
+    end,
+    {ok, ResultAcc}.
 
--spec user_present(mongoose_acc:t(), UserJID :: jid:jid()) -> mongoose_acc:t().
-user_present(Acc, #jid{} = UserJID) ->
+-spec user_present(Acc, Args, Extra) -> {ok, Acc} when
+      Acc :: mongoose_acc:t(),
+      Args :: #{jid := jid:jid()},
+      Extra :: gen_hook:extra().
+user_present(Acc, #{jid := UserJID = #jid{}}, _) ->
     Event = #user_status_event{jid = UserJID, status = online},
-    NewAcc = mod_event_pusher:push_event(Acc, UserJID#jid.lserver, Event),
-    merge_acc(Acc, NewAcc).
+    NewAcc = mod_event_pusher:push_event(Acc, Event),
+    {ok, merge_acc(Acc, NewAcc)}.
 
--spec user_not_present(mongoose_acc:t(), User :: jid:luser(), Server :: jid:lserver(),
-                       Resource :: jid:lresource(), Status :: any()) -> mongoose_acc:t().
-user_not_present(Acc, LUser, LHost, LResource, _Status) ->
-    UserJID = jid:make_noprep(LUser, LHost, LResource),
+-spec user_not_present(Acc, Args, Extra) -> {ok, Acc} when
+      Acc :: mongoose_acc:t(),
+      Args :: #{jid := jid:jid()},
+      Extra :: gen_hook:extra().
+user_not_present(Acc, #{jid := UserJID}, _) ->
     Event = #user_status_event{jid = UserJID, status = offline},
-    NewAcc = mod_event_pusher:push_event(Acc, LHost, Event),
-    merge_acc(Acc, NewAcc).
+    NewAcc = mod_event_pusher:push_event(Acc, Event),
+    {ok, merge_acc(Acc, NewAcc)}.
 
-unacknowledged_message(Acc, #jid{lserver = Server} = Jid) ->
+-spec unacknowledged_message(Acc, Args, Extra) -> {ok, Acc} when
+      Acc :: mongoose_acc:t(),
+      Args :: #{jid := jid:jid()},
+      Extra :: gen_hook:extra().
+unacknowledged_message(Acc, #{jid := Jid}, _) ->
     Event = #unack_msg_event{to = Jid},
-    NewAcc = mod_event_pusher:push_event(Acc, Server, Event),
-    merge_acc(Acc, NewAcc).
+    NewAcc = mod_event_pusher:push_event(Acc, Event),
+    {ok, merge_acc(Acc, NewAcc)}.
 
 %%--------------------------------------------------------------------
 %% Helpers
 %%--------------------------------------------------------------------
+
+-spec push_chat_event(Acc, Type, {From, To, Packet}, Direction) -> Acc when
+      Acc :: mongoose_acc:t(),
+      Type :: chat | groupchat | headline | normal | false,
+      From :: jid:jid(),
+      To :: jid:jid(),
+      Packet :: exml:element(),
+      Direction :: in | out.
+push_chat_event(Acc, Type, {From, To, Packet}, Direction) ->
+    Event = #chat_event{type = Type, direction = Direction,
+                        from = From, to = To, packet = Packet},
+    NewAcc = mod_event_pusher:push_event(Acc, Event),
+    merge_acc(Acc, NewAcc).
 
 -spec chat_type(mongoose_acc:t()) -> chat | groupchat | headline | normal | false.
 chat_type(Acc) ->
@@ -114,13 +126,12 @@ merge_acc(Acc, EventPusherAcc) ->
     NS = mongoose_acc:get(event_pusher, EventPusherAcc),
     mongoose_acc:set_permanent(event_pusher, NS, Acc).
 
--spec hooks(Host :: jid:server()) -> [ejabberd_hooks:hook()].
-hooks(Host) ->
+-spec hooks(mongooseim:host_type()) -> [gen_hook:hook_tuple()].
+hooks(HostType) ->
     [
-        {filter_local_packet, Host, ?MODULE, filter_local_packet, 90},
-        {unset_presence_hook, Host, ?MODULE, user_not_present, 90},
-        {user_available_hook, Host, ?MODULE, user_present, 90},
-        {user_send_packet, Host, ?MODULE, user_send_packet, 90},
-        {rest_user_send_packet, Host, ?MODULE, user_send_packet, 90},
-        {unacknowledged_message, Host, ?MODULE, unacknowledged_message, 90}
+        {filter_local_packet, HostType, fun ?MODULE:filter_local_packet/3, #{}, 80},
+        {unset_presence, HostType, fun ?MODULE:user_not_present/3, #{}, 90},
+        {user_available, HostType, fun ?MODULE:user_present/3, #{}, 90},
+        {user_send_message, HostType, fun ?MODULE:user_send_message/3, #{}, 90},
+        {unacknowledged_message, HostType, fun ?MODULE:unacknowledged_message/3, #{}, 90}
     ].

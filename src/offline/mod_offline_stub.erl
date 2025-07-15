@@ -10,7 +10,7 @@
 %%%           if the message is not stored for delayed delivery
 %%%           (i.e. as an "offline message").
 %%%           If the recipient exists (i.e. auth module returns `true`
-%%%           from `is_user_exists`) mod_mam stores the message,
+%%%           from `does_user_exist`) mod_mam stores the message,
 %%%           but <service-unavailable/> is still returned,
 %%%           what is not compliant with the RFC.
 %%%
@@ -28,27 +28,30 @@
 
 %% gen_mod callbacks
 -export([start/2,
-         stop/1]).
+         stop/1,
+         hooks/1,
+         supported_features/0]).
 
 %% Hook handlers
--export([stop_hook_processing/4]).
+-export([stop_hook_processing/3]).
 
 -spec start(any(), any()) -> 'ok'.
-start(Host, _Opts) ->
-    [ejabberd_hooks:add(Hook, Host, M, F, Prio)
-     || {Hook, M, F, Prio} <- handlers()],
+start(_HostType, _Opts) ->
     ok.
 
 -spec stop(any()) -> 'ok'.
-stop(Host) ->
-    [ejabberd_hooks:delete(Hook, Host, M, F, Prio)
-     || {Hook, M, F, Prio} <- handlers()],
+stop(_HostType) ->
     ok.
 
-%% Don't repeat yourself.
-handlers() ->
-    [{offline_message_hook, ?MODULE, stop_hook_processing, 75}].
+supported_features() -> [dynamic_domains].
 
--spec stop_hook_processing(map(), any(), any(), any()) -> {stop, map()}.
-stop_hook_processing(Acc, _From, _To, _Packet) ->
+-spec hooks(mongooseim:host_type()) -> gen_hook:hook_list().
+hooks(HostType) ->
+    [{offline_message, HostType, fun ?MODULE:stop_hook_processing/3, #{}, 75}].
+
+-spec stop_hook_processing(Acc, Params, Extra) -> {stop, Acc} when
+    Acc :: mongoose_acc:t(),
+    Params :: map(),
+    Extra :: gen_hook:extra().
+stop_hook_processing(Acc, _Params, _Extra) ->
     {stop, Acc}.

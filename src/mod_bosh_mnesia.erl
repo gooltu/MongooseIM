@@ -1,9 +1,9 @@
 -module(mod_bosh_mnesia).
 
--behaviour(mod_bosh).
+-behaviour(mod_bosh_backend).
 
 %% mod_bosh_backend callbacks
--export([start/1,
+-export([start/0,
          create_session/1,
          delete_session/1,
          get_session/1,
@@ -12,12 +12,11 @@
 
 -include("mod_bosh.hrl").
 
--spec start(list()) -> any().
-start(_Opts) ->
-    mnesia:create_table(bosh_session,
-                        [{ram_copies, [node()]},
-                         {attributes, record_info(fields, bosh_session)}]),
-    mnesia:add_table_copy(bosh_session, node(), ram_copies).
+-spec start() -> any().
+start() ->
+    mongoose_mnesia:create_table(bosh_session,
+        [{ram_copies, [node()]},
+         {attributes, record_info(fields, bosh_session)}]).
 
 %% The choice of the operation context here (transaction vs dirty,
 %% see man on mnesia:activity/4 for description of contexts) and the deletion

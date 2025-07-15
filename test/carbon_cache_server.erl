@@ -1,24 +1,51 @@
 -module(carbon_cache_server).
 
--export([start/2]).
--export([server/2]).
--export([wait_for_accepting/0]).
+%% API for use in tests
+-export([start/1, stop/1, subscribe/1, get_metric/1]).
 
-start(Num,LPort) ->
-    case gen_tcp:listen(LPort,[{active, false},{packet,2}]) of
-        {ok, ListenSock} ->
-            start_servers(Num,ListenSock),
-            {ok, Port} = inet:port(ListenSock),
-            {Port, ListenSock};
-        {error,Reason} ->
-            {error,Reason}
+%% Internal API
+-export([server/2]).
+
+-include_lib("common_test/include/ct.hrl").
+
+%% API
+
+start(Config) ->
+    {Port, Socket} = start(),
+    PortServer = wait_for_accepting(),
+    gen_tcp:controlling_process(Socket, PortServer),
+    [{carbon_port, Port}, {carbon_server, PortServer}, {carbon_socket, Socket} | Config].
+
+stop(Config) ->
+    CarbonServer = ?config(carbon_server, Config),
+    erlang:exit(CarbonServer, kill),
+    CarbonSocket = ?config(carbon_socket, Config),
+    gen_tcp:close(CarbonSocket).
+
+subscribe(Config) ->
+    CarbonServer = ?config(carbon_server, Config),
+    CarbonServer ! {subscribe, self()}.
+
+get_metric(Metric) ->
+    receive
+        {packet, Metric, Value, TS} ->
+            ct:log("Received metric ~p with value ~p and timestamp ~p", [Metric, Value, TS]),
+            {Value, TS}
+    after 0 ->
+            no_metric
     end.
 
-start_servers(0,_) ->
-    ok;
-start_servers(Num,LS) ->
-    spawn(?MODULE,server,[LS, self()]),
-    start_servers(Num-1,LS).
+%% Internal functions
+
+start() ->
+    case gen_tcp:listen(0, [{active, false}, {packet, line}]) of
+        {ok, ListenSock} ->
+            spawn(?MODULE, server, [ListenSock, self()]),
+            {ok, Port} = inet:port(ListenSock),
+            {Port, ListenSock};
+        {error, Reason} ->
+            {error, Reason}
+    end.
 
 server(LS, Parent) ->
     Parent ! {accepting, self()},
@@ -26,26 +53,29 @@ server(LS, Parent) ->
 
 server(LS) ->
     case gen_tcp:accept(LS) of
-        {ok,S} ->
-            loop(S),
+        {ok, S} ->
+            loop(S, []),
             server(LS);
         Other ->
-            io:format("accept returned ~w - goodbye!~n",[Other]),
-            ok
+            ct:log("accept returned ~w - goodbye!~n", [Other])
     end.
 
-loop(S) ->
-    inet:setopts(S,[{active,once}]),
+loop(S, Pids) ->
+    inet:setopts(S, [{active, once}]),
     receive
-        {tcp,S,_Data} ->
-            %Answer = process(Data), % Not implemented in this example
-            %gen_tcp:send(S,Answer),
-            %ct:print("~s",[Data]),
-            exometer:update([carbon, packets], 1),
-            loop(S);
-        {tcp_closed,S} ->
-            io:format("Socket ~w closed [~w]~n",[S,self()]),
-            ok
+        {subscribe, Pid} ->
+            monitor(process, Pid),
+            loop(S, [Pid | Pids]);
+        {'DOWN', _Ref, process, Pid, _Reason} ->
+            loop(S, Pids -- [Pid]);
+        {tcp, S, Data} ->
+            ct:log("Carbon cache server received packet: ~p", [Data]),
+            [Metric, ValueStr, TimeStamp] = string:tokens(Data, " \n"),
+            Msg = {packet, Metric, list_to_integer(ValueStr), list_to_integer(TimeStamp)},
+            [Pid ! Msg || Pid <- Pids],
+            loop(S, Pids);
+        {tcp_closed, S} ->
+            ct:log("Socket ~w closed [~w]~n", [S, self()])
     end.
 
 wait_for_accepting() ->

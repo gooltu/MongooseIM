@@ -1,3 +1,1216 @@
+# [MongooseIM 6.4.0](https://github.com/esl/MongooseIM/releases/tag/6.4.0) - 2025-06-25
+
+## Highlights
+- Reworked S2S and component listeners
+- Added TLS 1.3 `tls-exporter` channel binding
+- Added 0-RTT, and channel binding in FAST authentication
+- Unified connection and TLS handling
+- Improved XMPP traffic shaper configuration with validation and clearer defaults
+- Cleanup of legacy modules and updated dependencies
+- Reworked application startup order (start applications only when needed)
+- Use system CA certificates if not provided in a file
+- Various enhancements and bug fixes
+
+## Added
+- Support dynamic domains for components (#4450)
+- TLS listeners for components (#4453)
+- TLS 0-RTT to `mod_fast_auth_token` (#4478)
+- Channel binding in FAST authentication (#4494)
+- Option to clear inbox after destroying MUC Light room (#4522)
+
+## Changed
+- Reworked listeners and TLS (#4452, #4509)
+  - Reworked component connection handling (#4442)
+  - Changed component listener naming scheme to match XMPP specification (#4451)
+  - Reworked S2S listeners (#4455)
+  - Unified listener TLS configuration via `fast_tls` removal and channel binding (#4458)
+  - Unified listener handling (#4460)
+  - Reworked adding dynamic domains to components (#4461)
+  - Improved consistency of `just_tls` filters (#4467)
+  - Reworked S2S incoming connections (#4470, #4513)
+  - Reworked S2S outgoing connections (#4479)
+  - System certificates are used if CA certs are not provided in a file (#4493)
+  - Reorganized S2S configuration options (#4515)
+  - Improved instrumentation consistency (#4517)
+  - Simplified and unified XMPP metrics (#4520)
+  - Minor optimizations and cleanups (#4480, #4512, #4514, #4516)
+- Increased rate for the default `normal` shaper (#4540)
+- Reworked application startup order and FIPS config (#4524, #4528, #4542)
+
+## Fixed
+- XMPP traffic shapers configuration and validation (#4527)
+- `max_file_size` option in `mod_http_upload` (#4531)
+- Fixed incorrect `xmlns` in presences sent by `mod_muc` (#4539)
+
+## Removed
+- Dead `max_fsm_queue` option (#4521)
+- Last mention of unused `EJABBERD_DIR` variable (#4533)
+
+## Other
+- Upgraded dependencies (#4500, #4519)
+- Updated `exometer_labels` converter function (#4507)
+- Changed base docker image to `ubuntu-noble` (#4537)
+- Documentation improvements (#4504, #4506, #4525)
+- Testing and CI improvements/fixes (#4523, #4529, #4532, #4534)
+- Replaced the `ubuntu-oracular` package with `ubuntu-plucky` (#4536)
+
+## Commits, merged PRs and closed issues
+- [List of merged PRs](https://github.com/esl/MongooseIM/pulls?q=is%3Apr+is%3Amerged+milestone%3A6.4.0)
+
+- [List of closed issues](https://github.com/esl/MongooseIM/issues?q=is%3Aissue+is%3Aclosed+closed%3A2024-12-30..2025-06-25)
+
+- [Repository history for this release](https://github.com/esl/MongooseIM/graphs/contributors?from=2024-12-30&to=2025-06-25&type=c)
+
+- [List of merged PRs based on merge date](https://github.com/esl/MongooseIM/pulls?q=is%3Apr+is%3Amerged+milestone%3A6.4.0+sort%3Aupdated-desc)
+
+# [MongooseIM 6.3.3](https://github.com/esl/MongooseIM/releases/tag/6.3.3) - 2025-04-10
+
+## Highlights
+- Fixed buffer duplication issue in stream management
+- Improved IQ handling for unknown ID formats
+- Restored package support for older systems
+- Various enhancements and bug fixes
+
+## Fixed
+- Duplication issue in stream management buffer (#4496, #4498)
+- Stream management stanza counting (#4501)
+- Improper response when receiving IQ with unknown ID format (#4503)
+- Bundled OpenSSL 3.x to restore package support on older systems (#4511)
+
+## Removed
+- Call to an unsupported MySQL option (#4508)
+
+## Other
+- Minor refactor of `mod_stream_management` (#4497)
+- Improved type specs for Sid (#4502)
+- Documentation improvements (#4495)
+- Testing improvements (#4505)
+
+## Commits, merged PRs and closed issues
+- [List of merged PRs](https://github.com/esl/MongooseIM/pulls?q=is%3Apr+is%3Amerged+milestone%3A6.3.3)
+
+- [List of closed issues](https://github.com/esl/MongooseIM/issues?q=is%3Aissue+is%3Aclosed+closed%3A2025-02-24..2025-04-09)
+
+- [Repository history for this release](https://github.com/esl/MongooseIM/graphs/contributors?from=2025-02-24&to=2025-04-09&type=c)
+
+- [List of merged PRs based on merge date](https://github.com/esl/MongooseIM/pulls?q=is%3Apr+is%3Amerged+milestone%3A6.3.3+sort%3Aupdated-desc)
+
+# [MongooseIM 6.3.2](https://github.com/esl/MongooseIM/releases/tag/6.3.2) - 2025-02-24
+
+## Highlights
+- Added support for XEP-0484: **Fast Authentication Streamlining Tokens**
+- Upgraded to **exml 4.1.1**
+- Deprecated `fast_tls`
+- Improved `just_tls` with distinct client and server options
+- Various enhancements and bug fixes
+
+## Added
+- Distinction between client and server options for `just_tls` (#4456)
+- XEP-0484: "Fast Authentication Streamlining Tokens" implementation (#4379)
+
+## Changed
+- Updated exml to 4.1.1 (#4465, #4471, #4473)
+- Update dependencies: `erl_cloud` and `base16` (#4469)
+- Deprecated `fast_tls` for C2S (#4468)
+- Behavior of PEP discovery to closely match the XEP specification (#4475)
+- Migrated GraphiQL to V3 (#4474)
+- Translations are now a service (#4481)
+- Cleaned up empty GraphQL queries (#4482)
+- Updated `elvis.config` to exclude modules that do not match linter standards (#4483)
+
+## Fixed
+- Description of log handler migration (#4454)
+- Compilation warnings (#4462)
+- Certificates generations for CockroarchDB (#4466)
+- `probe_failed` error (#4440)
+- Wrong namespace when removing IQ handlers in `mod_sic` (#4484)
+- SCRAM hashing issue by upgrading `fast_scram` library (#4491)
+
+## Other
+- Documentation improvements (#4476, #4487, #4488)
+- CI improvements (#4459)
+
+## Known issues and upgrade recommendations
+- If you are using MongooseIM 4.1.0 to 6.3.1 with SCRAM authentication and OpenSSL >=3.4.1, hashes for algorithms stronger than SHA-1 are calculated incorrectly.
+This issue is fixed in this release. See [SCRAM hashing issue](/doc/developers-guide/SCRAM-serialization.md#scram-hash-calculation-issue-in-mongooseim-410631) for details and required actions.
+- OpenSSL versions below 3.0 are no longer supported. If you are using OpenSSL 1.x or older, you must upgrade to OpenSSL 3.x before updating MongooseIM, as older versions will not work.
+
+## Commits, merged PRs and closed issues
+- [List of merged PRs](https://github.com/esl/MongooseIM/pulls?q=is%3Apr+is%3Amerged+milestone%3A6.3.2)
+
+- [List of closed issues](https://github.com/esl/MongooseIM/issues?q=is%3Aissue+is%3Aclosed+closed%3A2024-12-30..2025-02-24)
+
+- [Repository history for this release](https://github.com/esl/MongooseIM/graphs/contributors?from=2024-12-30&to=2025-02-24&type=c)
+
+- [List of merged PRs based on merge date](https://github.com/esl/MongooseIM/pulls?q=is%3Apr+is%3Amerged+milestone%3A6.3.2+sort%3Aupdated-desc)
+
+## Special thanks to our contributors
+- [@xvnds](https://github.com/xvnds) Migrated graphiql to v3 (#4474)
+
+# [MongooseIM 6.3.1](https://github.com/esl/MongooseIM/releases/tag/6.3.1) - 2024-12-30
+
+## Highlights
+- Better certificate validation
+- Improved CockroachDB support
+- Removed unnecessary components
+- Multiple owner support in MUC Light
+- Packages are now published on GitHub
+- Various improvements and fixes
+
+## Added
+- Checking of probe metrics types (#4390)
+- Multiple owner support in MUC Light (#4392)
+- Delays to SM buffer (#4407)
+- Better logging when something takes longer than expected (#4427, #4430)
+- Support `open_test_database_shell` for CockroachDB (#4438)
+
+## Changed
+- Enforced `fail_if_no_peer_cert` in `just_tls` for stricter client certificate validation (#4386)
+- Allowed config processor to be a list of functions (#4396)
+- `fast_tls` to validate CA certificate when `verify_mode` is set to `verify_peer` or `selfsigned_peer` (#4391)
+- Supervisor, listeners, components and types cleanup (#4441)
+- Optimized memory usage in `just_tls` (#4447)
+
+## Fixed
+- MUC room crash when handling old protocol stanza (#4387)
+- CockroachDB consistency (#4402)
+- Shutdown logic to prevent `event_not_registered` errors by stopping c2s processes before listeners (#4400)
+- Definition of the "protected" GraphQL directive (#4409)
+- GraphQL library is now used as a package (#4405)
+- Package related warning (#4410)
+- IO list handling in `jiffy:encode` (#4420)
+- Error on startup: "No such file or directory" (#4436)
+- MongooseIM is restarted as a permanent application rather than a temporary one (#4443)
+
+## Removed
+- Lager as a dependency (#4393)
+- Goldrush from `rebar.lock` (#4397)
+- Dead tools and code (#4411)
+- Native code from `mam_id` (#4412)
+- More complicated dead code (#4422)
+- Base16 library (#4415)
+
+## Other
+- Updated dependencies (#4428)
+- Documentation improvements (#4388)
+- CI improvements/fixes (#4403, #4416, #4417, #4435)
+- Streamlined package workflow (#4385, #4399, #4414, #4406, #4425, #4432, #4449)
+- Testing improvements/fixes (#4394, #4398, #4418,  #4419, #4401, #4426, #4431, #4423, #4424, #4433, #4437, #4434, #4444, #4445)
+
+## Commits, merged PRs and closed issues
+- [List of merged PRs](https://github.com/esl/MongooseIM/pulls?q=is%3Apr+is%3Amerged+milestone%3A6.3.1)
+
+- [List of closed issues](https://github.com/esl/MongooseIM/issues?q=is%3Aissue+is%3Aclosed+closed%3A2024-10-22..2024-12-30)
+
+- [Repository history for this release](https://github.com/esl/MongooseIM/graphs/contributors?from=2024-10-22&to=2024-12-30&type=c)
+
+- [List of merged PRs based on merge date](https://github.com/esl/MongooseIM/pulls?q=is%3Apr+is%3Amerged+milestone%3A6.3.1+sort%3Aupdated-desc)
+
+# [MongooseIM 6.3.0](https://github.com/esl/MongooseIM/releases/tag/6.3.0) - 2024-10-22
+
+## Highlights
+- Improved instrumentation with better configurability, Prometheus support and user-friendly features
+- Docker images are smaller and free of reported vulnerabilities
+- Improved WebSocket's stream management support
+- Erlang 27 compatibility
+- Added support for CockroachDB as a new RDBMS
+- Various improvements and fixes
+
+## Added
+- Instrumentation (#4223, #4226)
+  - Modules:
+    - `mod_mam` (#4224, #4253, #4265, #4352)
+    - `mod_muc` (#4268)
+    - `mod_bosh` (#4281)
+    - `mod_csi` (#4284)
+    - `mod_event_pusher` (#4285)
+    - `mod_ping` (#4288)
+    - `mod_global_distrib` (#4292)
+    - `mod_pubsub` (#4297)
+    - `mod_websoctkets` (#4299)
+  - Hooks (#4289):
+     - Privacy (#4298)
+     - Authentication (#4301)
+     - Session (#4305)
+     - C2S (#4310)
+     - Roster (#4295)
+     - Unified names (#4287)
+  - Tests:
+     - Unit (#4227)
+     - CETS (#4296)
+     - Prometheus endpoint (#4335)
+     - More specific assertions for events (#4312)
+  - `async_pools` (#4337)
+  - `mongoose_wpool` (#4306)
+  - `mongoose_backend` (#4282)
+  - `mongoose_user_cache` (#4323)
+  - Router, S2S and component (#4319)
+  - Probes (#4272)
+  - Logging support (#4238)
+  - Dynamic handlers (#4247)
+  - C2S TCP/TLS listener (#4304)
+  - Authentication events (#4311)
+  - Session management (#4313)
+  - Global probes and counters (#4317)
+  - Documentation (#4355, #4358, #4360, #4382)
+  - Misc (#4228, #4249, #4324, #4368)
+- Erlang doctor utilities (#4264)
+- Error text when message with given ID is not found (#4302)
+- Error IQ when SQL query fails in MAM (#4308)
+- Erlang 27 support (#4334, #4331, #4338, #4348, #4345)
+- CockroachDB support (#4378)
+
+## Changed
+- Upgraded CETS to the latest version (#4271)
+- Optimized node cleanup for `mod_last` (#4274)
+- Upgraded test dependencies (#4275)
+- Moved Exometer reporters config to `mongooseim.toml` (#4326)
+- Upgraded `fast_tls` (#4330)
+- Privacy IQs sent to users are treated as regular stanzas (#4361)
+- Renaming `c2s_state_timeout` option (#4363)
+- Moved docker repository to 'erlangsolutions' organization (#4372)
+- Docker image to the one based on Ubuntu 24.10 (#4375)
+
+## Fixed
+- Starting CETS for `persistent_cluster_id` (#4245)
+- Package building scripts (#4273)
+- S2S DNS discovery (#4278)
+- Timestamps for MUC legacy messages (#4294)
+- Improved stream management support for WebSockets (#4303)
+- GraphQL SSE crash with large stanza payloads (#4364)
+- Double message in MAM bug (#4374)
+- Building docker image locally (#4377)
+
+## Removed
+- CentOS support (#4314)
+- geas dependency of GraphQL (#4332)
+- Old `mongoose_metrics` module (#4353)
+
+## Other
+- Documentation improvements (#4266, #4277, #4327, #4341, #4354, #4356, #4376, #4383)
+- Testing improvements/fixes (#4267, #4270, #4279, #4286, #4307, #4315, #4321, #4339, #4342, #4351, #4357, #4362, #4373)
+- CI improvements/fixes (#4276, #4329, #4346, #4350, #4365, #4366, #4367, #4369, #4370)
+
+## Commits, merged PRs and closed issues
+- [List of merged PRs](https://github.com/esl/MongooseIM/pulls?q=is%3Apr+is%3Amerged+milestone%3A6.3.0)
+
+- [List of closed issues](https://github.com/esl/MongooseIM/issues?q=is%3Aissue+is%3Aclosed+closed%3A2024-04-12..2024-10-22)
+
+- [Repository history for this release](https://github.com/esl/MongooseIM/graphs/contributors?from=2024-04-12&to=2024-10-22&type=c)
+
+- [List of merged PRs based on merge date](https://github.com/esl/MongooseIM/pulls?q=is%3Apr+is%3Amerged+milestone%3A6.3.0+sort%3Aupdated-desc)
+
+# [MongooseIM 6.2.1](https://github.com/esl/MongooseIM/releases/tag/6.2.1) - 2024-04-12
+
+## Highlights
+
+- Enhanced CETS
+- Pools configuration
+- Traffic shapers update
+- Support for MAM v1.1.0
+- More reliable testing
+- Various improvements and fixes
+
+## All changes
+
+### Added
+- RDBMS backend for `mod_caps` (#4211)
+- Commit hash to GraphQL server status (#4221, #4262)
+- Erlang Doctor debugging tool (#4248)
+- Pools:
+  - By host type (#4229)
+  - By host config (#4235)
+  - Names to `mongoose_rdbms` (#4231)
+
+### Changed
+- Improved shapers (#4187, #4203, #4213)
+- Enhanced discovery requests handling (#4194)
+- User-friendly errors for internal databases in the GraphQL API (#4192)
+- Increase `idle_timeout` for SSE (#4196)
+- Presence management refactor (#4207)
+- MAM implementation update to version 1.1.0 (#4218, #4225)
+- Roster management refactor (#4209)
+
+### Fixed
+- CETS improvements:
+  - Pause on all nodes (#4204)
+  - Node cleanup (#4234, #4250, #4251)
+  - Unnecessary logs removal (#4205)
+  - Node discovery (#4255, #4256)
+- MAM lookup error handling (#4191)
+- MUC Light `id` definition for MariaDB (#4195)
+- `max_stanza_size` issue (#4197)
+- Duplicate migration files (#4230)
+- Invalid MAM IDs parsing and overflow (#4242)
+- Certificate options verification on HTTPS (#4236)
+- GitHub Actions status badge (#4261)
+
+### Other
+- Testing improvements/fixes (#4176, #4202, #4212, #4237, #4239, #4243, #4241, #4246, #4257, #4259, #4260)
+- Update migration guide (#4258)
+
+## Commits, merged PRs and closed issues
+- [List of merged PRs](https://github.com/esl/MongooseIM/pulls?q=is%3Apr+is%3Amerged+milestone%3A6.2.1)
+
+- [List of closed issues](https://github.com/esl/MongooseIM/issues?q=is%3Aissue+is%3Aclosed+closed%3A2023-12-13..2024-04-12)
+
+- [Repository history for this release](https://github.com/esl/MongooseIM/graphs/contributors?from=2023-12-13&to=2024-04-12&type=c)
+
+- [List of merged PRs based on merge date](https://github.com/esl/MongooseIM/pulls?q=is%3Apr+base%3Amaster+merged%3A%222023-12-13..2024-04-12%22+sort%3Acreated-asc+)
+
+# [MongooseIM 6.2.0](https://github.com/esl/MongooseIM/releases/tag/6.2.0) - 2023-12-13
+
+## Highlights
+
+- Introduced CETS as an alternative internal database to Mnesia
+- Updated many XEP implementations to the newest version
+- Implemented partial support for XEP-0386: Bind 2 and XEP-0388: Extensible SASL Profile
+- Support for Erlang 26
+- Removed support for Riak
+- Various improvements and fixes
+
+## Added
+
+- CETS
+  - CETS backend for session management and stream management (#3629, #4075, #4143)
+  - Add GraphQL handler for CETS info (#4015, #4116)
+  - RDBMS discovery backend for CETS (#4022, #4042, #4108, #4049, #4165, #4182)
+  - CETS backend for `mod_bosh` (#4050)
+  - CETS support for components (#4047)
+  - CETS support for S2S (#4046)
+  - CETS backend for `mod_muc` (#4066)
+  - CETS backend for `mod_jingle_sip` (#4076)
+  - CETS backend for `mongoose_cluster_id` (#4136)
+  - Add CETS backend for `mod_keystore` (#4140)
+  - Remove mnesia from `mod_register` (#4146)
+  - Anonymous auth supports mnesia and CETS backends (#4148)
+  - Custom EPMD module (#4179)
+- Unified XEP list for xmpp.org (#4021, #4024, #4025, #4123)
+- Reporting to Google Analytics 4 (#4040, #4061)
+- Add config option to limit the number of users per domain (#4059)
+- XEP-0386: Bind 2 and XEP-0388: Extensible SASL Profile
+  - Extensible SASL Profile (#4101, #4102)
+  - Bind 2 (#4113, #4114)
+- Log internal-server-errors in `mod_privacy` (#4139)
+
+## Changed
+
+- XEP updates
+  - Implement XEP-0004: Data Forms in a separate module (#4028, #4031)
+  - Update XEP-0016: Privacy Lists (#4038)
+  - Update XEP-0030: Service Discovery (#4039)
+  - Update XEP-0050: Ad-Hoc Commands (#4043, #4048)
+  - Update XEP-0363: HTTP File Upload(#4053)
+  - Update attributes for XEP-0178 and add for XEP-0220 (#4057)
+  - Update XEP-0045: Multi-User Chat (#4054)
+  - Update XEPs: XEP-0082, XEP-0115, XEP-0124, XEP-0157, XEP-0160, XEP-0163, XEP-0199, XEP-0248, XEP-0277 (#4060)
+  - Update XEP-0280 (#4083)
+  - Update XEP-0060: Publish-Subscribe (#4092)
+  - Update XEP-0215: External Service Discovery (#4120)
+  - Advertise support for XEP-0249: Direct MUC Invitations (#4168)
+- Upgrade segmented_cache library and its telemetry events (#4041)
+- Improved Metrics initialization (#4070)
+- Initialise domain workers in the supervision tree instead of manually (#4069)
+- Config in one persistent term (#4093)
+- C2S features optimisations (#4094)
+- Patch `ejabberd_sm` (#4096)
+- Use `jid:make_bare/2` instead of `jid:make/3` where appropiate (#4109)
+- Unify `auth_module` and `info` in `c2s_data` record (#4110)
+- Simplify specs for `ejabberd_sup` and let workers terminate (#4117)
+- Raise an error if `mnesia:create_table/2` fails (#4138)
+
+## Fixed
+
+- Fix `mod_event_pusher:push_event/3` (#3939)
+- Removing incorrect CORS headers (#4006)
+- Fix handling of the undefined host type for stream errors (#4052)
+- Put reporter init after app startup (#4085)
+- Fix slow getaddrs call in global distribution (#4086)
+- C2S fixes (#4095, #4129)
+- Fix invalid username in scram authentication (#4118)
+- Return a proper type from `mod_muc:node_cleanup_for_host_type/3` (#4122)
+- Correctly handle the case when TLS is disabled (#4150)
+- Fix error on ping timeout with stream management (#4153)
+- Update epgsql to fix an issue with Erlang/OTP 26 (#4169)
+- `mod_muc_light` config fix (#4178)
+- Change domain validation logic (#4184)
+- Require 'cacertfile' for just_tls when verify_mode = 'peer' (#4189)
+
+## Removed
+
+- Remove riak (#4035)
+- Remove legacy CLI commands (#4160)
+
+## Performance improvements
+
+- Cache router, filter, and process handlers into funs (#4068)
+- C2S features small optimisation (#4077)
+- Replace `erlang:apply` with explicit function calls for hooks (#4073)
+- Avoid calling `ejabberd_sm_backend:get_sessions/3` second time when routing presences (#4089)
+- Put hooks into persistent_term using batching (#3878)
+
+## Other
+
+- Tests improvements/fixes (#4064, #4072, #4079, #4098, #4099, #4100, #4104, #4103, #4107, #4115, #4137, #4142, #4147, #4155, #4164)
+- Documentation updates (#4030, #4034, #4055, #4087, #4130, #4133, #4181, #4190)
+- CI improvements/fixes (#4023, #4026, #4027, #4029, #4097, #4112, #4149, #4145, #4152, #4166, #4167, #4171)
+- Upgrade exometer_report_graphite (#4134)
+- Support for Erlang 26 (#4121)
+- Rename db and node to mongooseim (#4172)
+
+## Commits, merged PRs and closed issues
+- [List of merged PRs](https://github.com/esl/MongooseIM/pulls?q=is%3Apr+is%3Amerged+milestone%3A6.2.0)
+
+- [List of closed issues](https://github.com/esl/MongooseIM/issues?q=is%3Aissue+is%3Aclosed+closed%3A2023-05-11..2023-12-13)
+
+- [Repository history for this release](https://github.com/esl/MongooseIM/graphs/contributors?from=2023-05-11&to=2023-12-132023-12-13&type=c)
+
+- [List of merged PRs based on merge date](https://github.com/esl/MongooseIM/pulls?q=is%3Apr+base%3Amaster+merged%3A%222023-05-11..2023-12-13%22+sort%3Acreated-asc+)
+
+# [MongooseIM 6.1.0](https://github.com/esl/MongooseIM/releases/tag/6.1.0) - 2023-05-10
+
+## Highlights
+
+- Reworked C2S architecture
+- Docker image for arm64
+- Update of Universal Analytics to Google Analytics 4
+- Dialyzer types fix
+- Deprecation of Riak
+- More reliable test suites
+- Various improvements and fixes
+
+## All changes
+
+### Added
+- New C2S architecture (#3765)
+  - `presence` (#3746)
+  - `mod_last` (#3750)
+  - `mod_register` (#3751)
+  - `privacy` (#3747)
+  - `pubsub` (#3785)
+  - `ping` (#3748)
+  - `metrics` (#3800)
+  - `steam_management` (#3796)
+  - `mod_csi` (#3880)
+  - `sasl_external` (#3911)
+  - More granular hooks (#3852, #3857, #3955)
+  - Fixed `stream_management` timeouts (#3934)
+  - Stopped routing broadcast tuples (#3946)
+  - Unified metrics (#3967)
+  - C2S Migration guide (#3965)
+  - Fixed duplicated logout in `stream_management` (#3983)
+  - Adapted existing test suites (#3772, #3778, #3783, #3787, #3786,  #3845, #3882, #3909, #3925, #3927, #3932, #3931, #3940)
+  - Miscellaneous changes (#3729, #3797, #3790, #3816, #3858, #3888, #3904, #3908, #3917, #3919, #3935, #3950, #3957, #3959, #3972)
+- Added information about GraphQL (#3905)
+- Enable CircleCI tests insights (#3899)
+- Hooks improvement (#3913, #3912)
+- `mod_inbox` improvements (#3910, #3974, #4016)
+- Checking push form fields (#3916)
+- Checking for MUC domain when archiving messages (#3936)
+- Updated base Docker image (#3943)
+- Implemented `mod_pubsub_db` without dynamic modules (#3953)
+- Checking the `to` JID (#3971)
+- Auto registration/unregistration of hooks in `gen_mod` (#3954)
+- Added port and IP in the listener options for WebSockets and BOSH (#3977)
+- Improved MAM logging (#3984)
+- Added error reason to batch worker termination (#3985)
+- Docker image for arm64 (#3979, #3986, #3988, #4009)
+- Full support for TLS version 1.3 (#3989)
+- Restarting executes in transactions (#3973)
+- GraphQL server status now returns MongooseIM version (#3995)
+- Capability of measuring asynchronous SQL execute requests (#4002)
+- Enabled codecov with the new uploader (#4013)
+- `remove_domain` for `internal` auth (#4010)
+- Passing SID into `store_info` (#4007)
+
+### Changed
+- Unified status icons (#4000)
+- Reworked mongoose transport (#3982)
+- Updated dependencies (#3918, #3976, #4017)
+- Updated MySQL schema (#3944)
+- Set cookie to mongooseim (#3930)
+- Moved to Google Analytics 4 (#4011, #4019)
+
+### Fixed
+- Issues with GitHub actions (#3992, #4003)
+- Status badges (#3975)
+- Announcing session establishment (#3970)
+- Input for `mam` errors (#4008)
+- Issue with certificate verification for Google Analytics (#3978)
+- Incremental removal query (#3924)
+- Unknown types in Dialyzer (#3929)
+- Scram invalid xml response (#4020)
+
+### Removed
+- Legacy C2S implementation (#3805, #3860)
+- Some of the hooks with no handlers (#3990)
+- Incorrect CORS headers (#4005)
+- Riak is now deprecated (#3981)
+
+### Other
+- Test suites improvements (#3906, #3923, #3926, #3937, #3961, #3968, #3964, #3960, #3969, #3960, #3998, #3999)
+- Updated documentation (#3914, #3962, #3966, #4014)
+
+## Commits, merged PRs and closed issues
+- [List of merged PRs](https://github.com/esl/MongooseIM/pulls?q=is%3Apr+is%3Amerged+milestone%3A6.1.0)
+
+- [List of closed issues](https://github.com/esl/MongooseIM/issues?q=is%3Aissue+is%3Aclosed+closed%3A2022-12-20..2023-05-10)
+
+- [Repository history for this release](https://github.com/esl/MongooseIM/graphs/contributors?from=2022-12-20&to=2023-05-10&type=c)
+
+- [List of merged PRs based on merge date](https://github.com/esl/MongooseIM/pulls?q=is%3Apr+base%3Amaster+merged%3A%222022-12-19..2023-05-10%22+sort%3Acreated-asc+)
+
+## Special thanks to our contributors:
+- [@askarsyzdykov](https://github.com/askarsyzdykov) Fix typo in documentation (#3966)
+
+# [MongooseIM 6.0.0](https://github.com/esl/MongooseIM/releases/tag/6.0.0) - 2022-12-19
+
+## Highlights
+
+- GraphQL API and Command Line Interface (CLI) with many new commands
+- Unified and reworked REST API
+- Incremental and asynchronous dynamic domain deletion
+- Full pagination support with RSM for Inbox
+- Significant code refactoring
+- Various improvements and fixes
+
+## All changes
+
+### Added
+- GraphQL request handling and execution (#3354, #3442, #3454, #3515, #3633, #3642, #3646 #3648, #3689, #3719, #3803, #3822, #3830, #3894)
+- GraphQL API schema and types (#3448, #3506, #3731, #3856, #3862, #3767)
+- GraphQL API tests (#3745, #3474, #3709, #3718, #3720, #3730, #3736, #3740)
+- GraphQL command implementation for the following categories:
+  - account (#3503, #3824, #3895)
+  - domain (#3499, #3715, #3851)
+  - gdpr (#3711, #3855)
+  - httpUpload (#3674, #3868)
+  - inbox (#3694)
+  - last (#3651, #3850)
+  - metrics (#3665, #3861)
+  - mnesia (#3725, #3896)
+  - muc (#3615, #3627, #3799, #3875)
+  - muc_light (#3538, #3563, #3563, #3576, #3742, #3881)
+  - offline (#3688, #3864)
+  - private (#3652, #3891)
+  - roster (#3586, #3756, #3873)
+  - server (#3744, #3793, #3877)
+  - session (#3521, #3883)
+  - stanza (#3483, #3565, #3814)
+  - stat (#3700, #3715, #3870)
+  - token (#3713, #3863)
+  - vcard (#3639, #3890)
+- GraphQL CLI (Command Line Interface) (#3701, #3702, #3708, #3710, #3714, #3724, #3739)
+- GraphQL API documentation (#3704, #3773)
+- Incremental and asynchronous domain deletion (#3774, #3775, #3777, #3813, #3889)
+- Full pagination support for Inbox (#3827, #3843, #3844)
+
+### Removed
+- Legacy hooks module (#3892)
+- Legacy REST API command registry (#3697, #3759)
+
+### Changed
+- Replaced legacy hooks and handlers with `gen_hook` (#3758, #3760, #3762, #3763, #3769, #3782, #3784, #3789, #3792, #3798, #3802, #3807, #3808, #3811, #3815, #3817, #3818, #3821, #3825, #3826, #3828, #3829, #3831, #3832, #3833, #3834, #3835, #3836, #3837, #3838, #3839, #3840, #3841, #3842, #3846, #3847, #3848, #3849, #3853, #3854, #3865, #3866, #3867, #3871, #3874, #3876, #3879, #3884, #3886, #3887)
+- Reworked and unified REST API (#3741, #3753, #3768, #3771, #3776, #3780, #3801)
+- Performance improvements (#3682, #3687, #3726, #3738, #3761)
+- Added missing metrics (#3678)
+- Improved configurability (#3728, #3733)
+- MAM module names made more intuitive (#3684)
+- Improved DB request aggregation (#3755)
+- Improved logging (#3885)
+- Minor refactoring (#3732, #3764, #3809)
+
+### Fixed
+- Cassandra authentication issue (#3872)
+- Message sent to oneself was stored twice (#3859)
+- DB aggregator could stop working after an error (#3757)
+- Unexpected errors in logs (#3695, #3743)
+- Minor issues with MAM result paging (#3734)
+- Incorrect optimization flags passed to asynchronous workers (#3727)
+- Invalid format of the JWT secret (#3716)
+- Persistent rooms were not stored in the DB (#3707)
+- Issues with the anonymous login (#3706)
+
+### Other
+- Updated documentation (#3424, #3675, #3677, #3679, #3766, #3794, #3869, #3893, #3900, #3902, #3903)
+- Updated tools and scripts (#3698, #3723, #3737, #3897)
+- Updated dependencies and other third-party software (#3683, #3699, #3779, #3820, #3823, #3898)
+- Improved CI process (#3680, #3686, #3676)
+
+## Commits, merged PRs and closed issues
+- [List of merged PRs](https://github.com/esl/MongooseIM/pulls?q=is%3Apr+is%3Amerged+milestone%3A6.0.0)
+
+- [List of closed issues](https://github.com/esl/MongooseIM/issues?q=is%3Aissue+is%3Aclosed+closed%3A2022-06-09..2022-12-19)
+
+- [Repository history for this release](https://github.com/esl/MongooseIM/graphs/contributors?from=2022-06-08&to=2022-12-19&type=c)
+
+- [List of merged PRs based on merge date](https://github.com/esl/MongooseIM/pulls?q=is%3Apr+base%3Amaster+merged%3A%222022-06-08..2022-12-19%22+sort%3Acreated-asc+)
+
+## Special thanks to our contributors:
+- [@theowenyoung](https://github.com/theowenyoung) Add XEP-0333 Docs (#3424)
+
+# [MongooseIM 5.1.0](https://github.com/esl/MongooseIM/releases/tag/5.1.0) - 2022-06-08
+
+## Highlights
+
+- Internal configuration rework
+- Inbox functionality and performance improvements
+- Remove the dynamically compiled modules
+- The new OTP 25 support
+- Miscellaneous enhancements, optimizations & improvements
+
+## All changes
+
+### Added
+- Cache consistency. Use `segmented_cache` as a cache backend and have all caches use it (#3330)
+- Persistent term config. Replace `ejabberd_config` with new persistent terms `mongoose_config`(#3367, #3338, #3343, #3356)
+- Create async pools basing on the MAM async workers concept (#3433)
+- Add new `ensure_subscribed_metric/3` to mongoose metrics module (#3353)
+- Add some property based tests for MAM's `is_archivable_message/4` (#3450)
+- Create SECURITY.md (#3562)
+- Allow to use podman instead of docker (#3522, #3543)
+- Support the new OTP 25 (#3667)
+
+### Removed
+- Hook handler records don't need the `key` field (#3342)
+- Remove dead code (#3451)
+- Remove deprecated `mod_aws_sns` (#3607)
+- Remove deprecated `mod_revproxy` (#3617)
+- Remove custom `eldap.hrl` (#3647)
+- Removed in internal configuration rework
+   - Remove all calls to `gen_mod:set_module_opt` from modules, making the module config constant(#3389)
+   - Remove calls to `gen_mod:set_module_opt(s)` in big tests (#3398)
+   - Remove `gen_mod:set_module_opt(s)` (#3468)
+   - Remove the ETS table from `gen_mod` (#3484)
+   - Eliminate `gen_mod:get_opt_subhost` (#3626)
+- Remove dynamically compiled modules (#3394)
+   - POC module `mod_private` (#3323)
+   - Remove `ejabberd_rdbms` and `mongoose_rdbms_type` (#3392)
+   - Allow `global` to be passed into `mongoose_backend` as an arg (#3386)
+   - MAM cassandra backend without dynamically compiled modules (#3373)
+   - Use persistent terms to store `backend_module` in `ejabberd_sm` (#3379)
+   - Add `mongoose_backend:get_backend_name` (#3345)
+   - `mod_auth_token` (#3336)
+   - `mod_last` (#3339)
+   - `mod_event_pusher_push` (#3340, #3348)
+   - `mod_privacy` (#3347)
+   - `mod_muc` (#3349)
+   - `mod_inbox` (#3350, #3362, #3440)
+   - `mod_muc_light` (#3351, #3418)
+   - `mod_offline` (#3352, #3371)
+   - `mod_smart_markers` (#3357)
+   - `mod_vcard` (#3358)
+   - `mod_roster` (#3364)
+   - `mod_pubsub` (#3368)
+   - `mod_http_upload` (#3372)
+   - `mod_keystore` (#3375)
+   - `mongoose_rdbms` (#3390)
+   - `ejabberd_router`(#3381)
+   - `mod_global_distrib_mapping` (#3582)
+
+### Changed
+- Hook functions (#3331)
+- Extend `safely` module API (#3337, #3341)
+- Make `mongoose_commands` errors human-readable (#3346)
+- Add the accumulator to the `is_muc_room_owner` and `can_access_room` room hooks (#3417)
+- Worker pool cleanups (#3419)
+- Upgrade mongoose JID (#3525)
+- Add backend logic to `mod_stream_management` (#3556)
+- Don't use Mnesia for IQ response tracking (#3560)
+- Use dynamic aware check for global domains in ACL module (#3327, #3332)
+- Store ACL specs in the global config (#3335)
+- Allow skipping cover compilation for small tests (#3382)
+- REST `/commands` endpoint now lists commands with more detailed info (#3391)
+- Revert scope to `global` for all global distributed Redis presets (#3393)
+- Refactor some usage of stanza types in `ejabberd_sm` (#3396)
+- Simplify stream management suite (#3453)
+- Performance and metrics touch on async workers (#3502, #3514, #3529)
+- Use ETS backend in `mongoose_router` instead of Mnesia (#3505)
+- Refactor `can_change_ra` function in `mod_muc` (#3581)
+- Reconfigure supervision flags in pools (#3593)
+- Install a hook to filter messages being buffered (#3654)
+- Make RDBMS asynchronous
+   - Add RDBMS `execute_cast` to use when the return value is not needed (#3485)
+   - Add async RDBMS order (#3611)
+   - Add RDBMS transaction async requests (#3643)
+- Perf optimizations
+   - Pre-build metric prefixes and fetch-or-rebuild when needed (#3634, #3649)
+   - Pattern matches the map key for more efficiency (#3635)
+   - Skip pretty-printing of unused accumulator field (#3637)
+- Message Archive Management improvements
+   - Use `mongoose_acc` timestamp in MAM (#3320)
+   - Same stanza id for peers (#3376)
+   - Retract on stanza ids (#3377, #3384, #3385)
+   - Retraction events (#3497, #3498, #3513)
+   - Report wrong stanza id more friendly (#3591)
+   - Make MAM return timestamps in microseconds (#3595)
+   - Reorder MAM's `filter_local_packet` hook order (#3623)
+   - MAM shaper improvements (#3641)
+- Smart markers improvements (#3590)
+   - Implement all the automatic removals (e.g. `remove_domain`) for the smart markers (#3544)
+   - Prepare a documentation page for smart markers (#3535)
+   - Implement all configurations for the smart markers (#3546, #3592)
+   - Do not display a warning when processing a message with repeated markers (#3673)
+- Inbox improvements (#3359, #3596, #3604)
+   - Improve types for dialyzer and log errors when they happen (#3366)
+   - Simplify time-unit conversions (#3405)
+   - Fix inbox filter bug that puts unnecessary load on the auth backend (#3449)
+   - Refactor Inbox tests (#3452)
+   - Use async pools in inbox (#3462, #3500)
+   - Fix `queryid` (#3494)
+   - Extend queries (#3597)
+   - Implement boxes that allow the classifying of entries (#3608)
+   - Add async removes - make asynchronous inbox consistent (#3616, #3670)
+- Internal config rework
+   - Simplify MUC Light config (#3387)
+   - Unfold global options without the temporary functions (#3406)
+   - Prepare tests for config defaults (#3408)
+   - Introduce config defaults for the 'general' section (#3409)
+   - Replace `local_config` records with key-value pairs (#3410)
+   - Add an option to format a section/list as a map (#3420)
+   - Move auth config spec to auth backend modules (#3437)
+   - Introduce defaults in the auth section (#3439)
+   - Section-based auth config (#3446)
+   - Introduce default values for auth methods (#3458)
+   - Auth password section config rework (#3463)
+   - Store module config in a map and keep it updated (#3469, #3488)
+   - Use `dynamic_modules` in big tests (#3481)
+   - Store listener config in a map (#3495)
+   - Keep ACL conditions as maps (#3501, #3504)
+   - Test config parsing with post-processing (#3507)
+   - Move `domain_certfile` to the 'general' section (#3512)
+   - Keep s2s options: 'outgoing', 'dns', 'address' in maps (#3516)
+   - Put all s2s options in a map and allow specifying them globally or per host-type (#3523)
+   - Module config as a map (#3534)
+   - Allow customizing auth module list per listener (#3539)
+   - Migrate segmented cache to maps (#3572, #3594)
+   - Test config metrics (#3613)
+  -  Put `mod_adhoc` opts in a map with defaults (#3537)
+   - Put `mod_bosh` opts in a map with defaults (#3540)
+   - Put `outgoing_pools` opts in a map with defaults (#3541)
+   - Put `mod_inbox` opts in a map with defaults (#3547)
+   - Put `mod_private` opts in a map with defaults (#3549)
+   - Put `mod_disco` opts in a map with defaults (#3550)
+   - Put `mod_version` opts in a map with defaults (#3552)
+   - Put `mod_vcard` opts in a map with defaults (#3553)
+   - Put `mod_time` opts in a map with defaults (#3554)
+   - Put `gen_mod_deps` opts in a map with defaults (#3555)
+   - Put `mod_last` opts in a map with defaults (#3557)
+   - Put `mod_mam` opts in a map with defaults (#3559)
+   - Put `mod_shared_roster_ldap` opts in a map with defaults (#3558)
+   - Put `mod_privacy` opts in a map with defaults (#3567)
+   - Put `mod_sic` opts in a map with defaults (#3568)
+   - Put `mod_roster` opts in a map with defaults (#3569)
+   - Put `mod_stream_management` opts in a map with defaults (#3571)
+   - Put `mod_muc` opts in a map with defaults (#3575)
+   - Put `mod_push_service_mongoosepush` opts in a map with defaults (#3577)
+   - Put `mod_pubsub` opts in a map with defaults (#3578)
+   - Put `mod_ping` opts in a map with defaults (#3579)
+   - Put `mod_muc_light` opts in a map with defaults (#3580)
+   - Put `mod_global_distrib` opts in a map with defaults (#3587)
+   - Put `mod_offline` opts in a map with defaults (#3589)
+   - Put `mod_caps` opts in a map with defaults (#3598)
+   - Put `mod_keystore` opts in a map with defaults (#3599)
+   - Put `mod_jingle_sip` opts in a map with defaults (#3600)
+   - Put `mod_carboncopy` opts in a map with defaults (#3602)
+   - Put `mod_event_pusher` opts in a map with defaults (#3603)
+   - Put `mod_csi` opts in a map with defaults (#3605)
+   - Put `mod_register` opts in a map with defaults (#3606)
+   - Put `mod_offline_chatmarkers` opts in a map with defaults (#3609)
+   - Put `mod_http_upload` opts in a map with defaults (#3614)
+   - Rework service configuration and management (#3620)
+   - Store service options in maps with defaults (#3624)
+   - Service and module options only in maps (#3625)
+   - Listener configuration rework (#3628)
+   - Rework HTTP handler configuration (#3636)
+   - Use maps for `mongoose_wpool` options (#3645)
+   - TLS config rework (#3653)
+   - Use `format_items = map` by default for config sections (#3655)
+   - Access commands in maps (#3656)
+   - Final internal config cleanup (#3659)
+
+### Fixed
+- Edoc generation (#3333)
+- Rest admin API - return 404 when command not found instead of 500 (#3383)
+- Identify only stored users on offline routing (#3395)
+- Fix typos (#3475, #3621)
+- Fix certs (#3447, #3435, #3447, #3632, #3640)
+- Fix print-dots for Mac OS Monterey (#3480)
+- Add a newline after module options to improve config readability (#3402)
+- Correctly pass connection options to Fusco (#3426)
+- Fix Github Actions CI - run MSSQL as root again (#3456)
+- Fix `ejabberd_c2s` - don't drop the host type in `update_stanza` (#3464)
+- Adding `queryId` to archived inbox messages (#3482, #3492)
+- MAM - Avoid asking for user exist with a room (#3470)
+- Fix starting new caches (#3508, #3518)
+- Add `server_name_indication_host` config option (#3510)
+- Less MIM compiler warnings (#3524)
+- Add config flag to be able to set sni hostname matching (#3528)
+- Fix `is_configured` in async pools (#3566)
+- Do not call the obsolete backend API in CT hook (#3570)
+- Fix metrics for auth backend not being reported (#3585)
+- Fix `cowboy_static` options (#3618)
+- Fix `mod_ping` with `host_types` (#3638)
+- Fix a registration timeout cleanup (#3601, #3671)
+- Fix restart RabbitMQ connection (#3631, #3672)
+- Use metric probes instead of eval for slow calculated metrics (#3644)
+- Fix flaky tests and speed up CI:
+   - Gather list of failed test cases in a separate issue (#3361)
+   - Fix `rest_client_SUITE:muc:messages_can_be_paginated_in_room` (#3363)
+   - Fill the gaps in the event table for `service_domain_db` (#3365)
+   - Run muclight inbox tests one by one instead of parallel (#3374)
+   - Print preset in `tools/circle-publish-github-summary-comment.sh` (#3378)
+   - Enable `mod_last` only on its test suite (#3413)
+   - Enable DB modules in tests only when used (#3416)
+   - Retry insert MAM prefs on deadlock (#3421)
+   - Fix `domain_removal_SUITE:last_removal` (#3422)
+   - Remove wait from `unavailable_resources_dont_get_carbons` (#3431)
+   - Run tests in pubsub:basic in parallel (#3432)
+   - Use in-memory riak backend to speed-up IO (#3434)
+   - Fix `sm_SUITE` (#3436)
+   - Use `wait_for_archive_size` inside `send_rsm_messages` helper (#3443)
+   - Avoid a race condition in `sm_SUITE:resume_session_state_stop_c2s` (#3444)
+   - Fix `offline_SUITE:max_offline_messages_reached` (#3445)
+   - Reroute presences correctly on reconnect (SM fix) (#3459)
+   - Wait for async writers to flush messages in tests (#3466)
+   - Inbox flaky tests fixes (#3630)
+
+### Other
+- Faster, more stable CircleCI on docker with DB backends (#3401, #3519, #3530)
+- Use OTP 24.3.4 for CircleCI (#3661)
+- Updating dependencies and cleaning the rebar.lock file (#3425, #3430, #3465, #3490, #3520, #3531, #3533, #3573, #3657, #3669)
+- Document low-level MAM options (#3329)
+- Document MUC Light cache affiliations (#3509)
+- Minor documentation improvements (#3369, #3400, #3404, #3412, #3438, #3532, #3545, #3668)
+- Update CONTRIBUTING.md (#3622)
+
+## Commits, merged PRs and closed issues
+- [List of merged PRs](https://github.com/esl/MongooseIM/pulls?q=is%3Apr+is%3Amerged+milestone%3A5.1.0)
+
+- [List of closed issues](https://github.com/esl/MongooseIM/issues?q=is%3Aissue+is%3Aclosed+closed%3A2021-10-08..2022-06-08)
+
+- [Repository history for this release](https://github.com/esl/MongooseIM/graphs/contributors?from=2021-10-08&to=2022-06-08&type=c)
+
+- [List of merged PRs based on merge date](https://github.com/esl/MongooseIM/pulls?q=is%3Apr+base%3Amaster+merged%3A%222021-10-08..2022-06-08%22+sort%3Acreated-asc+)
+
+## Special thanks to our contributors:
+- [@kianmeng](https://github.com/kianmeng) Fix typos in doc (#3545)
+- [@amccormick93](https://github.com/amccormick93) Fix a registration timeout cleanup (#3601)
+- [@ColaCheng](https://github.com/ColaCheng) Fix restart RabbitMQ connection (#3631)
+
+# [MongooseIM 5.0.0](https://github.com/esl/MongooseIM/releases/tag/5.0.0) - 2021-10-07
+
+## Highlights
+
+- Support for dynamic domains
+- Documentation improvements and reorganization
+- Miscellaneous enhancements & improvements
+
+## All changes
+
+### Added
+- Support dynamic domains in (#3095, #3158, #3220, #3226, #3239, #3225, #3212)
+  - Config (#3053)
+  - Service for database domain management (#3052)
+  - REST and CLI API for domains (#3058)
+  - Init (#3061)
+  - Auth (#3063)
+  - PM (#3075)
+  - Hooks (#3089)
+  - IQ handlers (#3118)
+  - Tests (#3108, #3109, #3235)
+- Call remove domain hook from `mongoose_domain_api` (#3237)
+- Use `host_types` instead of host in modules and hooks (#3120, #3170, #3097)
+
+- Support for dynamic domains in modules:
+   - `mod_ping` (#3136)
+   - `ejabberd_users`(module renamed to `mongoose_users`) (#3135, #3161)
+   - `mod_inbox` (#3132, #3141, #3103, #3165, #3228)
+   - MAM/MUC (#3123, #3143, #3155, #3157, #3107, #3231, #3305, #3092, #3147)
+   - auth backends (#3106, #3295)
+   - `mod_http_upload` (#3267)
+   - `mod_sic` (#3258)
+   - `mod_auth_token` and `mod_keystore` (#3262)
+   - `mod_csi` (#3260)
+   - `mod_amp` (#3261)
+   - `mod_time` (#3255)
+   - `mod_version` (#3256)
+   - `mod_bosh` (#3253)
+   - `mod_adhoc` (#3252)
+   - `mod_register` (#3247)
+   - `mod_muc_commands` (#3248)
+   - `mod_smart_markers` (#3243)
+   - `mod_blocking` (#3196)
+   - `mod_vcard` (#3221, #3304)
+   - `mod_privacy` (#3189)
+   - `mod_last` (#3188, #3309)
+   - `mod_private` (#3175)
+   - `mod_roster` (#3159, #3291)
+   - `mod_caps` (#3156)
+   - `mod_offline` (#3164, #3263, #3299)
+   - `mod_stream_management` (#3149)
+   - `mod_carboncopy` (#3130, #3144)
+   - `mod_disco` (#3128, #3146, #3151)
+
+- Tests for dynamic domains:
+  - Enable mim2 node to allow running more tests for dynamic domains (#3264)
+  - Enable test suites for dynamic domains (#3268, #3269, #3271, #3272, #3275, #3285, #3276, #3277, #3278, #3279, #3280, #3281, #3283, #3284, #3287, #3142, #3302, #3241, #3246)
+  - Test mongooseimctl with dynamic domains (#3273, #3274)
+  - Test roster metrics with dynamic domains (#3286)
+  - Fix anonymous login and test it for dynamic domains (#3254)
+  - Test clustering and domain management with dynamic domains (#3266)
+
+- Other:
+   - Support OTP 24.X (#3186)
+   - GDPR get data takes host type as a parameter (#3140)
+   - Initial implementation of subdomains management subsystem (#3116)
+   - Support XEP-0201 in client api for message (#3236)
+   - Support PostgreSQL 14 (#3316, #3319)
+
+### Removed
+- Remove all occurences of ?MYNAME except stream errors and the initial value in `ejabberd_c2s` (#3039)
+- Remove `local_send_to_resource` hook (#3139)
+- Unused files/modules (#3121, #3122, #3207, #3214, #3310)
+- Unused dependencies (#3199, #3200, #3201)
+- Unused code fragments (#3311, #3313, #3322)
+- Support OTP 22 (#3289)
+
+### Changed
+- Prepare queries in `mongoose_cluster_id` (#3098)
+- Make vcard processing parallel (#3315)
+- Make `pool_name` configurable for `service_domain_db` (#3205)
+- Allow to add subelements to the mam iq-fin element (#3191, #3195)
+- Use map for `mod_mam:message_row()` (#3093)
+- Rework of the `gen_mod` module (#3104)
+- Change Room EventData type to map (#3111)
+- Format stacktrace args properly (#3124)
+- Make dummy auth delays configurable (#3131)
+- REST API better error reporting (#3137)
+- Use auth for `mongoose_domain_handler` from REST (#3160)
+- Reimplement `mod_cache_users` using persistent_terms (#3169)
+- Hooks framework rework (#3174)
+- Refactor async writer for `mod_mam` (#3216)
+- More consistent accumulator use (#3314, #3240, #3249, #3314)
+- Use more full jids and avoid to_lus conversions in `mod_muc_light` (#3250)
+- Tests improvements (#3133, #3134, #3181, #3208, #3213, #3217, #3218, #3219, #3227, #3230, #3232, #3127, #3238, #3257, #3297, #3312)
+- Minor changes (#3100, #3324, #3317)
+
+### Fixed
+- Start only used metrics (#3096)
+- Prevent infinite loop when domain isolation is on on both domains (#3110)
+- Prepared query in `mongoose_cluster_id` causes errors on startup (#3112)
+- Tag should be an atom in ldap types (#3178)
+- Missing or not working xref (#3179)
+- Occuring `mongoose_metric_hooks` error (#3184)
+- FTBFS on implicit declaration of function `erts_exit` (#3222)
+
+### Other
+- Docker images update (#3166)
+- Dependencies update (#3117, #3125, #3193, #3194, #3197, #3198, #3203, #3206, #3211, #3215, #3292)
+- CI improvements (#3173, #3176, #3183, #3190, #3307)
+- Document dynamic domains (#3242, #3245)
+- Restructure the documentation (#3259, #3288)
+- Update migration guide with dynamic domains changes (#3234)
+- Small documentation improvements (#3105, #3162, #3102, #3180, #3114, #3290, #3300, #3303, #3306, #3308, #3312)
+
+## Commits, merged PRs and closed issues
+- [List of merged PRs](https://github.com/esl/MongooseIM/pulls?q=is%3Apr+is%3Amerged+milestone%3A5.0.0)
+
+- [List of closed issues](https://github.com/esl/MongooseIM/issues?q=is%3Aissue+is%3Aclosed+closed%3A2021-04-21..2021-10-07)
+
+- [Repository history for this release](https://github.com/esl/MongooseIM/graphs/contributors?from=2021-04-21&to=2021-10-07&type=c)
+
+[List of merged PRs based on merge date]: # (https://github.com/esl/MongooseIM/pulls?q=is%3Apr+base%3Amaster+merged%3A%222021-04-21..2021-10-07%22+sort%3Acreated-asc+)
+
+## Special thanks to our contributors:
+- [@imcyee](https://github.com/imcyee) Add thread and thread parent to client api messages (#3236)
+
+# [MongooseIM 4.2.0](https://github.com/esl/MongooseIM/releases/tag/4.2.0) - 2021-04-20
+
+## Highlights
+
+- Prepared queries introduced
+- Inbox extensions
+- Miscellaneous enhancements & improvements
+
+## All changes
+
+### Added
+- Documentation for `mod_offline.store_groupchat_messages` option (#2992)
+- Support of MS SQL and MySQL in `mod_auth_token` (#3059)
+- Inbox extensions to set entries as archived, muted or read (#3067)
+- `mod_domain_isolation` module to limit message passing between domains (#3070)
+
+### Removed
+- Usage of deprecated `http_uri` in `ejabberd_auth_http` and `mod_muc_room` modules (#3026)
+- Config reload functionality with the flat config format (#3030)
+- Outdated and unsupported `azuresql.sql` file (#3086)
+
+### Changed
+- Usage of maps instead of lists in session management (#3018)
+- Improved timestamp logic (#3031)
+- Prepared queries for MS SQL, MySQL and PostgreSQL (#3039, #3050, #3055, #3059, #3060, #3066, #3074, #3078)
+- Improved pipeline for `mod_smart_markers` (#3068)
+- Unified checks for chat markers (#3080)
+
+### Fixed
+- Creation of `modMucMamFlushed` metric (#3023)
+- Starting backend containers for Mac OS X (#3033)
+- Minor issues with GitHub Actions (#3045)
+- Crash during session handover (#3056)
+- Type declaration in `mod_muc_light.hrl` (#3057)
+- Test summary is no longer printed when CT directory is not created (#3069)
+- Explicit `preset_not_found` error when running tests with nonexistent preset (#3072)
+- Set `mod_mam_meta.pm.archive_groupchats` to `false` by default (#3082)
+
+### Other
+- Dependencies update (#3036, #3077)
+- Minor documentation improvements (#3043, #3046, #3079, #3087)
+
+## Commits, merged PRs and closed issues
+- [List of merged PRs](https://github.com/esl/MongooseIM/pulls?q=is%3Apr+is%3Amerged+milestone%3A4.2.0)
+
+- [List of closed issues](https://github.com/esl/MongooseIM/issues?q=is%3Aissue+is%3Aclosed+closed%3A2021-02-04..2021-04-20+)
+
+- [Repository history for this release](https://github.com/esl/MongooseIM/graphs/contributors?from=2021-02-04&to=2021-04-20&type=c)
+
+[List of merged PRs based on merge date]: # (https://github.com/esl/MongooseIM/pulls?utf8=%E2%9C%93&q=is%3Apr%20base%3Amaster%20merged%3A%222021-02-04..2021-04-20%22%20sort%3Acreated-asc%20)
+
+## Special thanks to our contributors:
+- Inbox extensions are sponsored by [Beekeeper](https://www.beekeeper.io/)
+- [@antivista](https://github.com/antivista) For the documentation supplement (#2992)
+- [@imcyee](https://github.com/imcyee) For fixing handover crash (#3056)
+
+# [MongooseIM 4.1.0](https://github.com/esl/MongooseIM/releases/tag/4.1.0) - 2021-02-02
+
+## Highlights
+
+- Major configuration rework: the TOML format is now the only one supported
+- Documentation enhancements
+- Performance improvements
+
+## All changes
+
+### Added
+- Full support of TOML configuration format (#2929)
+- Prepared queries for `mod_vcard` (#2939)
+- [Humio](https://www.humio.com/) support (#2952)
+- GitHub actions for MongooseIM CI workflow (#2990, #2993)
+- Usage of `fast_scram` library (#3003)
+- Documentation for MongooseIM cluster's rolling upgrade (#3012)
+- PEP publish options (#3017)
+
+### Removed
+- Support of old `*.cfg` configuration format (#2929)
+- Support of HTTP File Upload 0.2.5 (#2989)
+- Unused `katt_helper` (#2999)
+
+### Changed
+- Moved documentation from readthedocs to gh-pages altogether with its face lifting (#2946, #2960, #2963, #2966, #2969)
+- Helper script in small tests uses python3 instead of python2 (#2957)
+- Use `tools/wait_for_service.sh` instead of `netcat` to ensure the main `minio` container is started (#2979)
+- Reduced stringprepping in roster hooks, privacy modules and `mod_offline` (#2997, #3005, #3009)
+
+### Fixed
+- The response of locked MUC room to `disco#info` (#2956)
+- `ct_mongoose_log_hook` initialization error (#2964)
+- Catching log formatter errors to avoid death spiral of logging (#2968, #2978)
+- The way big tests detect minio in CI (#2998)
+- Connection issues with Cassandra (#3006)
+
+### Other
+- Added `rebar3 clean` call to `Makefile` (#2932)
+- Minor docs improvements (#2945, #2981, #3000, #3013, #3020)
+- Parallel loading of `nksip` in tests (#2947)
+- CI improvements (#2949, #2972)
+- Usage of `integer_to_binary/1` instead of `list_to_integer(binary_to_list/1)` (#3008)
+- Removed `archive_groupchats` warning (#3016)
+
+## Commits, merged PRs and closed issues
+- [List of merged PRs](https://github.com/esl/MongooseIM/pulls?q=is%3Apr+is%3Amerged+milestone%3A4.1.0)
+
+- [List of closed issues](https://github.com/esl/MongooseIM/issues?q=is%3Aissue+is%3Aclosed+closed%3A2020-11-17..2021-02-03+)
+
+- [Repository history for this release](https://github.com/esl/MongooseIM/graphs/contributors?from=2020-11-17&to=2021-02-03&type=c)
+
+[List of merged PRs based on merge date]: # (https://github.com/esl/MongooseIM/pulls?utf8=%E2%9C%93&q=is%3Apr%20base%3Amaster%20merged%3A%222020-11-17..2021-02-03%22%20sort%3Acreated-asc%20)
+
+
+# [MongooseIM 4.0.1](https://github.com/esl/MongooseIM/releases/tag/4.0.1) - 2020-11-17
+
+## Highlights
+- A new metric now reports the type of configuration file that is being used. The aim is to determine the adoption of the new config file format.
+- Better error messages are reported from wrong TOML configuration files.
+
+## All changes
+
+### Added
+- User-friendly errors for the TOML configuration file (#2903)
+- Metric to report the type of config file used (#2918)
+
+### Removed
+- Removed deprecated `mod_http_notifications` #2912
+
+### Changed
+- TOML documentation improvements (#2896, #2898, #2899, #2901, #2905, #2942)
+- Some TOML configuration options have been reformatted (#2909)
+- More prepared queries to improve RDBMS performance (#2924, #2928)
+- Fixed Ubuntu 18.04 and OTP 23.1 for building docker images (#2926)
+- Moving from untyped binaries to proper `jid` structures (#2895, #2920, #2922)
+
+### Other
+- Dependencies update (#2914)
+- REST error handling cleanup (#2908)
+- `nksip` is started only when used (#2937)
+- RPM package improvements (#2906)
+- CI improvements (#2910, #2934)
+
+## Commits, merged PRs and closed issues
+- [List of merged PRs](https://github.com/esl/MongooseIM/pulls?q=is%3Apr+is%3Amerged+milestone%3A4.0.1)
+
+[List of merged PRs based on merge date]: # (https://github.com/esl/MongooseIM/pulls?utf8=%E2%9C%93&q=is%3Apr%20base%3Amaster%20merged%3A%222020-09-30..2020-11-13%22%20sort%3Acreated-asc%20)
+
+
+# [MongooseIM 4.0.0](https://github.com/esl/MongooseIM/releases/tag/4.0.0) - 2020-09-30
+## Overview
+MongooseIM 4.0 is all about putting a friendly face to MongooseIM’s amazing features.
+This includes the addition of an Erlang-agnostic configuration allowing a broader pool of developers to benefit from MongooseIM.
+Logging and Kubernetes improvements to be more DevOps-friendly and Manager-friendly with load testing enabling managers to see the benefits of MongooseIM easily.
+
+## All changes
+
+### Added
+* A new configuration file format: MongooseIM can now be configured with an entirely revamped [TOML](https://github.com/toml-lang/toml) configuration file (#2801)
+  * Pesky bugs have been fixed
+  * Implementation details have been abstracted away
+  * Documentation has been improved
+* Structured logging: the main idea of structured logging is that if we have properties of an event, let’s log them as they are, without losing their structure, and format it in a way that is most appropriate for the system we’re sending them to.
+  * Moved to [OTP logger](https://erlang.org/doc/man/logger.html) from [lager](https://github.com/erlang-lager/lager) (#2810)
+  * No more logging of man-made strings, we now log structured reports (#2816)
+  * `logfmt` formatter, a log format that's easy to read and write (#2848)
+  * `JSON` formatter, a fully structured format (#2851)
+* [XEP-0215](https://xmpp.org/extensions/xep-0215.html) External Service Discovery (#2870)
+* A REST endpoint for admin users which accepts any stanza, provided it has `from` and `to` attributes (#2858)
+* `erl_crash.dump` dumping directory can be explicitly set (#2793)
+
+### Changed
+* Archiving messages takes input as a map instead of as many parameters (#2749)
+* Base16 encoding uses a faster algorithm (#2839)
+
+### Other
+* OTP-23 compatible (#2840)
+* SCRAM password dumping into RDBMS escapes username correctly (#2842)
+
+## Commits, merged PRs and closed issues
+- [List of merged PRs](https://github.com/esl/MongooseIM/pulls?q=is%3Apr+is%3Amerged+milestone%3A4.0.0)
+- [List of closed issues](https://github.com/esl/MongooseIM/issues?q=is%3Aissue+is%3Aclosed+closed%3A2020-05-23..2020-09-30+)
+- [Repository history for this release](https://github.com/esl/MongooseIM/graphs/contributors?from=2020-05-23&to=2020-09-30&type=c)
+
+[List of merged PRs based on merge date]: # (https://github.com/esl/MongooseIM/pulls?utf8=%E2%9C%93&q=is%3Apr%20base%3Amaster%20merged%3A%222020-05-23..2020-09-30%22%20sort%3Acreated-asc%20)
+
+## Special thanks to our contributors:
+- [@balgillo](https://github.com/balgillo) For the small but many important fixes.
+
 # [MongooseIM 3.7.1](https://github.com/esl/MongooseIM/releases/tag/3.7.1) - 2020-07-13
 
 ## Highlights

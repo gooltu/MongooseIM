@@ -5,7 +5,7 @@
 %% @copyright 2014 Erlang Solutions, Ltd.
 %% This work was sponsored by Grindr.com
 
--compile([export_all]).
+-compile([export_all, nowarn_export_all]).
 -include_lib("common_test/include/ct.hrl").
 -include_lib("escalus/include/escalus.hrl").
 -include_lib("escalus/include/escalus_xmlns.hrl").
@@ -15,6 +15,7 @@
                              require_rpc_nodes/1,
                              rpc/4]).
 -import(muc_light_helper, [lbin/1]).
+-import(domain_helper, [host_type/0, domain/0]).
 
 suite() ->
     require_rpc_nodes([mim]) ++ escalus:suite().
@@ -23,9 +24,9 @@ all() ->
     [{group, G} || G <- main_group_names(), is_enabled(G)].
 
 groups() ->
-    ct_helper:repeat_all_until_all_ok(group_spec(main_group_names())).
+    group_spec(main_group_names()).
 
-is_enabled(mam) -> mongoose_helper:is_rdbms_enabled(domain());
+is_enabled(mam) -> mongoose_helper:is_rdbms_enabled(host_type());
 is_enabled(_) -> true.
 
 %% Group definitions
@@ -100,7 +101,7 @@ deliver_test_cases(notify) ->
      notify_deliver_to_offline_user_recipient_privacy_test,
      notify_deliver_to_online_user_broken_connection_test,
      notify_deliver_to_stranger_test,
-     notify_deliver_to_malformed_jid_test];
+     notify_deliver_to_unknown_domain_test];
 deliver_test_cases(error) ->
     [error_deliver_to_online_user_test,
      error_deliver_to_offline_user_test,
@@ -113,49 +114,44 @@ deliver_test_cases(drop) ->
 %% Setup and teardown
 
 init_per_suite(Config) ->
-    rpc(mim(), ejabberd_config, add_local_option, [{{s2s_host, <<"not a jid">>}, domain()}, deny]),
     ConfigWithHooks = [{ct_hooks, [{multiple_config_cth, fun tests_with_config/1}]} | Config],
-    {Mod, Code} = rpc(mim(), dynamic_compile, from_string, [amp_test_helper_code()]),
-    rpc(mim(), code, load_binary, [Mod, "amp_test_helper.erl", Code]),
+    {Module, Binary, Filename} = code:get_object_code(amp_test_helper) ,
+    rpc(mim(), code, load_binary, [Module, Filename, Binary]),
     setup_meck(suite),
+    instrument_helper:start(declared_events()),
     escalus:init_per_suite(ConfigWithHooks).
 
-amp_test_helper_code() ->
-    "-module(amp_test_helper).\n"
-    "-compile(export_all).\n"
-    "setup_meck() ->\n"
-    "  meck:expect(ejabberd_socket, send, fun ejabberd_socket_send/2).\n"
-    "ejabberd_socket_send(Socket, Data) ->\n"
-    "  case catch binary:match(Data, <<\"Recipient connection breaks\">>) of\n"
-    "    {N, _} when is_integer(N) -> {error, simulated};\n"
-    "    _ -> meck:passthrough([Socket, Data])\n"
-    "  end.\n".
+declared_events() ->
+    [ % tested by privacy helpers
+     {mod_privacy_set, #{host_type => host_type()}},
+     {mod_privacy_get, #{host_type => host_type()}}
+    ].
 
 end_per_suite(C) ->
-    rpc(mim(), ejabberd_config, del_local_option, [{{s2s_host, <<"not a jid">>}, domain()}]),
     teardown_meck(suite),
     escalus_fresh:clean(),
-    escalus:end_per_suite(C).
+    escalus:end_per_suite(C),
+    instrument_helper:stop().
 
 init_per_group(GroupName, Config) ->
     Config1 = case lists:member(GroupName, main_group_names()) of
-                            true ->
-                                ConfigWithModules = dynamic_modules:save_modules(domain(), Config),
-                                dynamic_modules:ensure_modules(domain(), required_modules(GroupName)),
-                                ConfigWithModules;
-                            false ->
-                                Config
+                  true ->
+                      ConfigWithModules = dynamic_modules:save_modules(host_type(), Config),
+                      dynamic_modules:ensure_modules(host_type(), required_modules(GroupName)),
+                      ConfigWithModules;
+                  false ->
+                      Config
               end,
     setup_meck(GroupName),
     save_offline_status(GroupName, Config1).
 
 setup_meck(suite) ->
-    ok = rpc(mim(), meck, new, [ejabberd_socket, [passthrough, no_link]]),
+    ok = rpc(mim(), meck, new, [ranch_tcp, [passthrough, no_link]]),
     ok = rpc(mim(), amp_test_helper, setup_meck, []);
 setup_meck(mam_failure) ->
-    ok = rpc(mim(), meck, expect, [mod_mam_rdbms_arch, archive_message, 10, {error, simulated}]);
+    ok = rpc(mim(), meck, expect, [mod_mam_rdbms_arch, archive_message, 3, {ok, {error, simulated}}]);
 setup_meck(offline_failure) ->
-    ok = rpc(mim(), meck, expect, [mod_offline_mnesia, write_messages, 3, {error, simulated}]);
+    ok = rpc(mim(), meck, expect, [mod_offline_backend_module(), write_messages, 4, {error, simulated}]);
 setup_meck(_) -> ok.
 
 save_offline_status(mam_success, Config) -> [{offline_storage, mam} | Config];
@@ -168,14 +164,14 @@ save_offline_status(_GN, Config) -> Config.
 end_per_group(GroupName, Config) ->
     teardown_meck(GroupName),
     case lists:member(GroupName, main_group_names()) of
-        true -> dynamic_modules:restore_modules(domain(), Config);
+        true -> dynamic_modules:restore_modules(Config);
         false -> ok
     end.
 
 teardown_meck(mam_failure) ->
     rpc(mim(), meck, unload, [mod_mam_rdbms_arch]);
 teardown_meck(offline_failure) ->
-    rpc(mim(), meck, unload, [mod_offline_mnesia]);
+    rpc(mim(), meck, unload, [mod_offline_backend_module()]);
 teardown_meck(suite) ->
     rpc(mim(), meck, unload, []);
 teardown_meck(_) -> ok.
@@ -303,7 +299,7 @@ notify_deliver_to_online_user_bare_jid_test(Config) ->
       end).
 
 notify_deliver_to_online_user_recipient_privacy_test(Config) ->
-    case is_module_loaded(mod_mam) of
+    case is_module_loaded(mod_mam_pm) of
         true -> {skip, "MAM does not support privacy lists"};
         false -> do_notify_deliver_to_online_user_recipient_privacy_test(Config)
     end.
@@ -341,7 +337,8 @@ notify_deliver_to_online_user_broken_connection_test(Config) ->
                                    _ -> none
                                end, notify},
               Rules = rules(Config, [Rule]),
-              %% This special message is matched by the ejabberd_socket mock
+              %% This special message is matched by the
+              %% amp_test_helper:ranch_tcp_send/2 mock,
               %% (see amp_test_helper_code/0)
               Msg = amp_message_to(Bob, Rules, <<"Recipient connection breaks">>),
 
@@ -399,7 +396,7 @@ is_offline_storage_working(Config) ->
     Status == mam orelse Status == offline.
 
 notify_deliver_to_offline_user_recipient_privacy_test(Config) ->
-    case is_module_loaded(mod_mam) of
+    case is_module_loaded(mod_mam_pm) of
         true -> {skip, "MAM does not support privacy lists"};
         false -> do_notify_deliver_to_offline_user_recipient_privacy_test(Config)
     end.
@@ -455,15 +452,15 @@ notify_deliver_to_stranger_test(Config) ->
               client_receives_nothing(Alice)
       end).
 
-notify_deliver_to_malformed_jid_test(Config) ->
+notify_deliver_to_unknown_domain_test(Config) ->
     escalus:fresh_story(
       Config, [{alice, 1}],
       fun(Alice) ->
               %% given
-              StrangerJid = <<"not a jid">>,
+              StrangerJid = <<"stranger@unknown.domain">>,
               Rule = {deliver, none, notify},
               Rules = rules(Config, [Rule]),
-              Msg = amp_message_to(StrangerJid, Rules, <<"Msg to malformed jid">>),
+              Msg = amp_message_to(StrangerJid, Rules, <<"Msg to unknown domain">>),
               %% when
               client_sends_message(Alice, Msg),
 
@@ -472,8 +469,8 @@ notify_deliver_to_malformed_jid_test(Config) ->
                   true -> client_receives_notification(Alice, StrangerJid, Rule);
                   false -> ok
               end,
-              % s2s does not allow routing to 'not a jid', so error 503 is expected
-              client_receives_generic_error(Alice, <<"503">>, <<"cancel">>),
+              % error 404: 'remote server not found' is expected
+              client_receives_generic_error(Alice, <<"404">>, <<"cancel">>),
               client_receives_nothing(Alice)
       end).
 
@@ -728,7 +725,7 @@ wait_until_no_session(FreshConfig, User) ->
     U = escalus_users:get_username(FreshConfig, User),
     S = escalus_users:get_server(FreshConfig, User),
     JID = jid:make(U, S, <<>>),
-    mongoose_helper:wait_until(
+    wait_helper:wait_until(
       fun() -> rpc(mim(), ejabberd_sm, get_user_resources, [JID]) end, []).
 
 user_has_no_incoming_offline_messages(FreshConfig, UserName) ->
@@ -736,14 +733,14 @@ user_has_no_incoming_offline_messages(FreshConfig, UserName) ->
       FreshConfig, [{UserName, 1}],
       fun(User) ->
               client_receives_nothing(User),
-              case is_module_loaded(mod_mam) of
+              case is_module_loaded(mod_mam_pm) of
                   true -> client_has_no_mam_messages(User);
                   false -> ok
               end
       end).
 
 user_has_incoming_offline_message(FreshConfig, UserName, MsgText) ->
-    true = is_module_loaded(mod_mam) orelse is_module_loaded(mod_offline),
+    true = is_module_loaded(mod_mam_pm) orelse is_module_loaded(mod_offline),
     {ok, Client} = escalus_client:start(FreshConfig, UserName, <<"new-session">>),
     escalus:send(Client, escalus_stanza:presence(<<"available">>)),
     case is_module_loaded(mod_offline) of
@@ -752,7 +749,7 @@ user_has_incoming_offline_message(FreshConfig, UserName, MsgText) ->
     end,
     Presence = escalus:wait_for_stanza(Client),
     escalus:assert(is_presence, Presence),
-    case is_module_loaded(mod_mam) of
+    case is_module_loaded(mod_mam_pm) of
         true -> client_has_mam_message(Client);
         false -> ok
     end,
@@ -877,15 +874,15 @@ amp_el([]) ->
     throw("cannot build <amp> with no rules!");
 amp_el(Rules) ->
     #xmlel{name = <<"amp">>,
-           attrs = [{<<"xmlns">>, ns_amp()}],
+           attrs = #{<<"xmlns">> => ns_amp()},
            children = [ rule_el(R) || R <- Rules ]}.
 
 rule_el({Condition, Value, Action}) ->
     check_rules(Condition, Value, Action),
     #xmlel{name = <<"rule">>
-          , attrs = [{<<"condition">>, a2b(Condition)}
-                    , {<<"value">>, a2b(Value)}
-                    , {<<"action">>, a2b(Action)}]}.
+          , attrs = #{<<"condition">> => a2b(Condition)
+                    , <<"value">> => a2b(Value)
+                    , <<"action">> => a2b(Action)}}.
 
 %% @TODO: Move me out to escalus_pred %%%%%%%%%%%%
 %%%%%%%%% XML predicates %%%%% %%%%%%%%%%%%%%%%%%%
@@ -977,30 +974,44 @@ amp_error_container(<<"unsupported-conditions">>) -> <<"unsupported-conditions">
 amp_error_container(<<"undefined-condition">>) -> <<"failed-rules">>.
 
 is_module_loaded(Mod) ->
-    rpc(mim(), gen_mod, is_loaded, [domain(), Mod]).
+    rpc(mim(), gen_mod, is_loaded, [host_type(), Mod]).
 
 required_modules(basic) ->
-    mam_modules(off) ++ offline_modules(off);
+    mam_modules(off) ++ offline_modules(off) ++ privacy_modules(on);
 required_modules(mam) ->
-    mam_modules(on) ++ offline_modules(off);
+    mam_modules(on) ++ offline_modules(off) ++ privacy_modules(off);
 required_modules(offline) ->
-    mam_modules(off) ++ offline_modules(on);
+    mam_modules(off) ++ offline_modules(on) ++ privacy_modules(on);
 required_modules(_) ->
     [].
 
 mam_modules(on) ->
-    [{mod_mam_rdbms_user, [pm]},
-     {mod_mam_rdbms_prefs, [pm]},
-     {mod_mam_rdbms_arch, []},
-     {mod_mam, []}];
+    [{mod_mam, mam_helper:config_opts(#{pm => #{}, async_writer => #{enabled => false}})}];
 mam_modules(off) ->
     [{mod_mam, stopped}].
 
 offline_modules(on) ->
-    [{mod_offline, [{access_max_user_messages, max_user_offline_messages}]}];
+    Backend = mongoose_helper:mnesia_or_rdbms_backend(),
+    [{mod_offline, config_parser_helper:mod_config(mod_offline,
+        #{backend => Backend,
+          access_max_user_messages => max_user_offline_messages})}];
 offline_modules(off) ->
     [{mod_offline, stopped},
      {mod_offline_stub, []}].
 
-domain() ->
-    ct:get_config({hosts, mim, domain}).
+privacy_modules(on) ->
+    Backend = mongoose_helper:mnesia_or_rdbms_backend(),
+    [{mod_privacy, config_parser_helper:mod_config(mod_privacy, #{backend => Backend})},
+     {mod_blocking, config_parser_helper:mod_config(mod_blocking, #{backend => Backend})}];
+privacy_modules(off) ->
+    [{mod_privacy, stopped},
+     {mod_blocking, stopped}].
+
+mod_offline_backend_module() ->
+    Backend = mongoose_helper:mnesia_or_rdbms_backend(),
+    case Backend of
+        mnesia ->
+            mod_offline_mnesia;
+        rdbms ->
+            mod_offline_rdbms
+    end.

@@ -1,143 +1,123 @@
 -module(s2s_helper).
--export([suite/1]).
--export([init_s2s/1]).
--export([end_s2s/1]).
--export([configure_s2s/2]).
 
--import(distributed_helper, [fed/0,
-                             mim/0,
-                             require_rpc_nodes/1,
-                             rpc/4]).
+-export([init_s2s/1, end_s2s/1, configure_s2s/2, has_inet_errors/2, has_xmpp_server/3,
+         reset_s2s_connections/0]).
 
--include_lib("escalus/include/escalus.hrl").
--include_lib("common_test/include/ct.hrl").
-
--record(s2s_opts, {
-          node1_s2s_certfile = undefined,
-          node1_s2s_use_starttls = undefined,
-          node1_s2s_listener = [],
-          node2_s2s_certfile = undefined,
-          node2_s2s_use_starttls = undefined,
-          node2_s2s_listener = []
-         }).
-
-suite(Config) ->
-    require_rpc_nodes([mim, fed]) ++ Config.
+-import(distributed_helper, [rpc_spec/1, rpc/4]).
+-import(domain_helper, [host_type/1]).
 
 init_s2s(Config) ->
-    Node1S2SCertfile = rpc(mim(), ejabberd_config, get_local_option, [s2s_certfile]),
-    Node1S2SUseStartTLS = rpc(mim(), ejabberd_config, get_local_option, [s2s_use_starttls]),
-    Node1S2SPort = ct:get_config({hosts, mim, incoming_s2s_port}),
-    [Node1S2SListener] = get_listener_opts(mim(), Node1S2SPort),
-
-    Node2S2SCertfile = rpc(fed(), ejabberd_config, get_local_option, [s2s_certfile]),
-    Node2S2SUseStartTLS = rpc(fed(), ejabberd_config, get_local_option, [s2s_use_starttls]),
-    Node2S2SPort = ct:get_config({hosts, fed, incoming_s2s_port}),
-    [Node2S2SListener] = get_listener_opts(fed(), Node2S2SPort),
-    S2S = #s2s_opts{node1_s2s_certfile = Node1S2SCertfile,
-                    node1_s2s_use_starttls = Node1S2SUseStartTLS,
-                    node1_s2s_listener = Node1S2SListener,
-                    node2_s2s_certfile = Node2S2SCertfile,
-                    node2_s2s_use_starttls = Node2S2SUseStartTLS,
-                    node2_s2s_listener = Node2S2SListener},
-
-    [{s2s_opts, S2S},
-     {escalus_user_db, xmpp} | Config].
+    [{{s2s, NodeKey}, get_s2s_opts(NodeKey)} || NodeKey <- node_keys()] ++
+    [{escalus_user_db, xmpp} | Config].
 
 end_s2s(Config) ->
-    S2SOrig = ?config(s2s_opts, Config),
-    configure_s2s(S2SOrig),
+    [configure_and_restart_s2s(NodeKey, S2SOrig) || {{s2s, NodeKey}, S2SOrig} <- Config],
     ok.
 
-configure_s2s(both_plain, Config) ->
-    S2S = ?config(s2s_opts, Config),
-    configure_s2s(S2S#s2s_opts{node1_s2s_certfile = undefined,
-                               node1_s2s_use_starttls = undefined,
-                               node2_s2s_certfile = undefined,
-                               node2_s2s_use_starttls = undefined}),
-    Config;
-configure_s2s(both_tls_optional, Config) ->
-    S2S = ?config(s2s_opts, Config), %The initial config assumes that both nodes are configured to use encrypted s2s
-    configure_s2s(S2S),
-    Config;
-configure_s2s(both_tls_required, Config) ->
-    S2S = ?config(s2s_opts, Config),
-    configure_s2s(S2S#s2s_opts{node1_s2s_use_starttls = required,
-                               node2_s2s_use_starttls = required}),
-    Config;
-configure_s2s(node1_tls_optional_node2_tls_required, Config) ->
-    S2S = ?config(s2s_opts, Config),
-    configure_s2s(S2S#s2s_opts{node2_s2s_use_starttls = required}),
-    Config;
-configure_s2s(node1_tls_required_node2_tls_optional, Config) ->
-    S2S = ?config(s2s_opts, Config),
-    configure_s2s(S2S#s2s_opts{node1_s2s_use_starttls = required}),
-    Config;
-configure_s2s(node1_tls_required_trusted_node2_tls_optional, Config) ->
-    S2S = ?config(s2s_opts, Config),
-    configure_s2s(S2S#s2s_opts{node1_s2s_use_starttls = required_trusted}),
-    Config;
-configure_s2s(node1_tls_false_node2_tls_optional, Config) ->
-    S2S = ?config(s2s_opts, Config),
-    configure_s2s(S2S#s2s_opts{node1_s2s_use_starttls = false}),
-    Config;
-configure_s2s(node1_tls_optional_node2_tls_false, Config) ->
-    S2S = ?config(s2s_opts, Config),
-    configure_s2s(S2S#s2s_opts{node2_s2s_use_starttls = false}),
-    Config;
-configure_s2s(node1_tls_false_node2_tls_required, Config) ->
-    S2S = ?config(s2s_opts, Config),
-    configure_s2s(S2S#s2s_opts{node1_s2s_use_starttls = false,
-                               node2_s2s_use_starttls = required}),
-    Config;
-configure_s2s(node1_tls_required_node2_tls_false, Config) ->
-    S2S = ?config(s2s_opts, Config),
-    configure_s2s(S2S#s2s_opts{node1_s2s_use_starttls = required,
-                               node2_s2s_use_starttls = false}),
-    Config;
-configure_s2s(node1_tls_optional_node2_tls_required_trusted_with_cachain, Config) ->
-    S2S = ?config(s2s_opts, Config),
-    {S2SPortIPProto, Mod, Opts} = S2S#s2s_opts.node2_s2s_listener,
-    CACertFile = filename:join([path_helper:repo_dir(Config),
-                                "tools", "ssl", "ca", "cacert.pem"]),
-    NewOpts = [{cafile, CACertFile} | Opts],
-    configure_s2s(S2S#s2s_opts{node2_s2s_use_starttls = required_trusted,
-                               node2_s2s_listener = {S2SPortIPProto, Mod, NewOpts}
-                               }),
+node_keys() ->
+    [mim, fed].
+
+configure_s2s(Group, Config) ->
+    TLSPreset = tls_preset(Group),
+    [configure_and_restart_s2s(NodeKey, s2s_config(maps:get(NodeKey, TLSPreset), S2SOrig, Config))
+     || {{s2s, NodeKey}, S2SOrig} <- Config],
     Config.
 
-configure_s2s(#s2s_opts{node1_s2s_certfile = Certfile1,
-                        node1_s2s_use_starttls = StartTLS1,
-                        node2_s2s_certfile = Certfile2,
-                        node2_s2s_use_starttls = StartTLS2} = S2SOpts) ->
-    configure_s2s(mim(), Certfile1, StartTLS1),
-    configure_s2s(fed(), Certfile2, StartTLS2),
-    restart_s2s(S2SOpts).
+has_inet_errors(History, Server) ->
+    Inet = lists:any(
+        fun({_, {inet_res, lookup, [Server1, in, a, _, _]}, []})
+            when Server1 =:= Server -> true;
+           (_) -> false
+        end, History),
+    Inet6 = lists:any(
+        fun({_, {inet_res, lookup, [Server1, in, aaaa, _, _]}, []})
+            when Server1 =:= Server -> true;
+           (_) -> false
+        end, History),
+    Inet andalso Inet6.
 
-configure_s2s(#{} = Spec, Certfile, StartTLS) ->
-    rpc(Spec, ejabberd_config, add_local_option, [s2s_certfile, Certfile]),
-    rpc(Spec, ejabberd_config, add_local_option, [s2s_use_starttls, StartTLS]).
+has_xmpp_server(History, Server, DnsRrType) ->
+    lists:any(
+        fun({_Pid, {inet_res, lookup, [Server1, in, DnsRrType1, _, _]}, [_|_]})
+            when Server1 =:= Server, DnsRrType1 =:= DnsRrType -> true;
+           (_) -> false
+        end, History).
 
-restart_s2s(#s2s_opts{node1_s2s_listener = Node1S2SListener,
-                      node2_s2s_listener = Node2S2SListener}) ->
-    restart_s2s(mim(), Node1S2SListener),
-    restart_s2s(fed(), Node2S2SListener).
+get_s2s_opts(NodeKey) ->
+    RPCSpec = rpc_spec(NodeKey),
+    S2SOpts = rpc(RPCSpec, mongoose_config, get_opt, [[{s2s, host_type(NodeKey)}, outgoing]]),
+    S2SPort = ct:get_config({hosts, NodeKey, incoming_s2s_port}),
+    [S2SListener] = mongoose_helper:get_listeners(RPCSpec, #{port => S2SPort,
+                                                             module => mongoose_s2s_listener}),
+    #{outgoing => S2SOpts, listener => S2SListener}.
+
+s2s_config(StartTLS, S2S = #{outgoing := Outgoing, listener := Listener}, Config) ->
+    NewOutgoing = tls_config(StartTLS, Outgoing, Config),
+    NewIncoming = tls_config(StartTLS, Listener, Config),
+    S2S#{outgoing := NewOutgoing, listener := NewIncoming}.
+
+tls_config(required_trusted_with_cachain, #{tls := TlsOpts} = Opts, Config) ->
+    CACertFile = filename:join([path_helper:repo_dir(Config), "tools", "ssl", "ca", "cacert.pem"]),
+    Opts#{tls => TlsOpts#{mode => starttls_required, cacertfile => CACertFile, verify_mode => peer}};
+tls_config(required_trusted, #{tls := TlsOpts} = Opts, _) ->
+    Opts#{tls => TlsOpts#{mode => starttls_required, verify_mode => selfsigned_peer}};
+tls_config(required, #{tls := TlsOpts} = Opts, _) ->
+    Opts#{tls => TlsOpts#{mode => starttls_required, verify_mode => none}};
+tls_config(enforced, #{tls := TlsOpts} = Opts, _) ->
+    Opts#{tls => TlsOpts#{mode => tls, verify_mode => none}};
+tls_config(optional, #{tls := TlsOpts} = Opts, _) ->
+    Opts#{tls => TlsOpts#{mode => starttls, verify_mode => none}};
+tls_config(plain, Opts, _) ->
+    maps:remove(tls, Opts).
+
+tls_preset(both_plain) ->
+    #{mim => plain, fed => plain};
+tls_preset(both_tls_optional) ->
+    #{mim => optional, fed => optional};
+tls_preset(both_tls_required) ->
+    #{mim => required, fed => required};
+tls_preset(both_tls_enforced) ->
+    #{mim => enforced, fed => enforced};
+tls_preset(node1_tls_optional_node2_tls_required) ->
+    #{mim => optional, fed => required};
+tls_preset(node1_tls_required_node2_tls_optional) ->
+    #{mim => required, fed => optional};
+tls_preset(node1_tls_required_trusted_node2_tls_optional) ->
+    #{mim => required_trusted, fed => optional};
+tls_preset(node1_tls_false_node2_tls_required) ->
+    #{mim => plain, fed => required};
+tls_preset(node1_tls_required_node2_tls_false) ->
+    #{mim => required, fed => plain};
+tls_preset(node1_tls_optional_node2_tls_required_trusted_with_cachain) ->
+    #{mim => optional, fed => required_trusted_with_cachain}.
+
+configure_and_restart_s2s(NodeKey, #{outgoing := Outgoing, listener := Listener}) ->
+    set_opt(rpc_spec(NodeKey), [{s2s, host_type(NodeKey)}, outgoing], Outgoing),
+    restart_s2s(rpc_spec(NodeKey), Listener).
+
+set_opt(Spec, Opt, Value) ->
+    rpc(Spec, mongoose_config, set_opt, [Opt, Value]).
 
 restart_s2s(#{} = Spec, S2SListener) ->
-    Children = rpc(Spec, supervisor, which_children, [ejabberd_s2s_out_sup]),
-    [rpc(Spec, ejabberd_s2s_out, stop_connection, [Pid]) ||
-     {_, Pid, _, _} <- Children],
+    reset_s2s_connections(Spec),
+    mongoose_helper:restart_listener(Spec, S2SListener).
 
-    ChildrenIn = rpc(Spec, supervisor, which_children, [ejabberd_s2s_in_sup]),
-    [rpc(Spec, erlang, exit, [Pid, kill]) ||
-     {_, Pid, _, _} <- ChildrenIn],
+reset_s2s_connections() ->
+    [reset_s2s_connections(rpc_spec(NodeKey)) || NodeKey <- node_keys()].
 
-    {PortIPProto, ejabberd_s2s_in, Opts} = S2SListener,
+reset_s2s_connections(Spec) ->
+    reset_outgoing_s2s(Spec),
+    reset_incoming_s2s(Spec).
 
-    rpc(Spec, ejabberd_listener, stop_listener, [PortIPProto, ejabberd_s2s_in]),
-    rpc(Spec, ejabberd_listener, start_listener, [PortIPProto, ejabberd_s2s_in, Opts]).
+reset_outgoing_s2s(Spec) ->
+    Children = rpc(Spec, supervisor, which_children, [mongoose_s2s_out_sup]),
+    [rpc(Spec, mongoose_s2s_out, stop_connection, [Pid, <<"closing connection">>]) ||
+     {_, Pid, _, _} <- Children].
 
-get_listener_opts(#{} = Spec, Port) ->
-    Listeners = rpc(Spec, ejabberd_config, get_local_option, [listen]),
+reset_incoming_s2s(Spec) ->
+    Children = rpc(Spec, supervisor, which_children, [mongoose_listener_sup]),
+    [reset_s2s_listener(Spec, Ref) || {Ref, _, _, [mongoose_s2s_listener | _]} <- Children].
 
-    [Item || {{ListenerPort, _, _}, _, _} = Item <- Listeners, ListenerPort =:= Port].
+reset_s2s_listener(Spec, Ref) ->
+    Procs = rpc(Spec, ranch, procs, [Ref, connections]),
+    [rpc(Spec, erlang, exit, [Pid, kill]) || {_, Pid, _, _} <- Procs].

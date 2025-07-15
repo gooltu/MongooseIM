@@ -17,9 +17,7 @@ export EJABBERD_PID_PATH="$EJABBERD_PID_PATH"
 EJABBERD_STATUS_PATH="{{mongooseim_status_dir}}/status"
 export EJABBERD_STATUS_PATH="$EJABBERD_STATUS_PATH"
 
-EJABBERD_SO_PATH=`ls -dt "$RUNNER_BASE_DIR"/lib/mongooseim-*/priv/lib | head -1`
-EJABBERD_CONFIG_PATH="$RUNNER_ETC_DIR"/mongooseim.cfg
-export EJABBERD_SO_PATH
+EJABBERD_CONFIG_PATH=${EJABBERD_CONFIG_PATH:-$RUNNER_ETC_DIR/mongooseim.${MONGOOSEIM_CONFIG_FORMAT:-toml}}
 export EJABBERD_CONFIG_PATH
 
 # Make sure this script is running as the appropriate user
@@ -33,8 +31,11 @@ cd "$RUNNER_BASE_DIR"
 # Make sure log directory exists
 mkdir -p "$RUNNER_LOG_DIR"
 
+# Save possible erl_crash.dump in log directory
+export ERL_CRASH_DUMP="${RUNNER_LOG_DIR}/erl_crash.dump"
+
 # Extract the target node name from node.args
-NAME_ARG=`egrep -e '^-s?name' "$RUNNER_ETC_DIR"/vm.args`
+NAME_ARG=`grep -E '^-s?name' "$RUNNER_ETC_DIR"/vm.args`
 if [ -z "$NAME_ARG" ]; then
     echo "vm.args needs to have either -name or -sname parameter."
     exit 1
@@ -174,12 +175,12 @@ case "$1" in
         # however, for debugging, sometimes start_clean.boot is useful:
         FOREGROUNDOPTIONS=""
         case "$1" in
-            console|live)   BOOTFILE="$SCRIPT" ;;
+            console|live)   BOOTFILE="start" ;;
             console_clean)  BOOTFILE=start_clean ;;
             foreground)
                 # start up the release in the foreground for use
                 # by supervision services (e.g. systemd, upstart)
-                BOOTFILE="$SCRIPT"
+                BOOTFILE="start"
                 FOREGROUNDOPTIONS="-noshell -noinput +Bd"
                 ;;
         esac
@@ -238,8 +239,10 @@ case "$1" in
         # Log the startup
         logger -t "$SCRIPT[$$]" "Starting up"
 
+        export BINDIR
+
         # Start the VM
-        exec_echo "$BINDIR/erl" "$NAME" "debug-$id-$NODE" $COOKIE_ARG -remsh "$NODE" -hidden -args_file "$RUNNER_ETC_DIR/vm.dist.args"
+        exec_echo "$BINDIR/erlexec" -boot "$RUNNER_BASE_DIR/releases/$APP_VSN/start_clean" "$NAME" "debug-$id-$NODE" $COOKIE_ARG -remsh "$NODE" -hidden -args_file "$RUNNER_ETC_DIR/vm.dist.args"
         ;;
 
     version)

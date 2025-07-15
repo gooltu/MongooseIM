@@ -18,7 +18,7 @@
 %%==============================================================================
 
 -module(vcard_simple_SUITE).
--compile(export_all).
+-compile([export_all, nowarn_export_all]).
 
 -include_lib("escalus/include/escalus_xmlns.hrl").
 -include_lib("escalus/include/escalus.hrl").
@@ -29,11 +29,15 @@
 -define(EL(Element, Name), exml_query:path(Element, [{element, Name}])).
 -define(EL_CD(Element, Name), exml_query:path(Element, [{element, Name}, cdata])).
 
--import(vcard_update, [is_vcard_ldap/0]).
+-import(vcard_helper, [is_vcard_ldap/0]).
 
 -import(distributed_helper, [mim/0,
                              require_rpc_nodes/1,
+                             subhost_pattern/1,
                              rpc/4]).
+-import(domain_helper, [host_type/0,
+                        host_types/0,
+                        domain/0]).
 
 %%--------------------------------------------------------------------
 %% Suite configuration
@@ -69,23 +73,13 @@ suite() ->
 %%--------------------------------------------------------------------
 
 init_per_suite(Config) ->
-    NewConfig0 = escalus:init_per_suite(Config),
-    NewConfig = case is_vcard_ldap() of
-        true ->
-            configure_ldap_vcards(NewConfig0);
-        _ ->
-            NewConfig0
-    end,
-    escalus:create_users(NewConfig, escalus:get_users([alice, bob])).
+    Config1 = prepare_vcard_module(escalus:init_per_suite(Config)),
+    configure_mod_vcard(Config1),
+    escalus:create_users(Config1, escalus:get_users([alice, bob])).
 
 end_per_suite(Config) ->
     NewConfig = escalus:delete_users(Config, escalus:get_users([alice, bob])),
-    case is_vcard_ldap() of
-        true ->
-            restore_ldap_vcards_config(Config);
-        _ ->
-            ok
-    end,
+    restore_vcard_module(NewConfig),
     escalus:end_per_suite(NewConfig).
 
 init_per_group(_GN, Config) ->
@@ -149,7 +143,7 @@ user_doesnt_exist(Config) ->
     escalus:story(
       Config, [{alice, 1}],
       fun(Client) ->
-              Domain = ct:get_config({hosts, mim, domain}),
+              Domain = domain(),
               BadJID = <<"nonexistent@", Domain/binary>>,
               Res = escalus:send_and_wait(Client,
                         escalus_stanza:vcard_request(BadJID)),
@@ -218,7 +212,7 @@ request_search_fields(Config) ->
     escalus:story(
       Config, [{alice, 1}],
       fun(Client) ->
-              Domain = ct:get_config({hosts, mim, domain}),
+              Domain = domain(),
               DirJID = <<"vjud.", Domain/binary>>,
               Res = escalus:send_and_wait(Client,
                                       escalus_stanza:search_fields_iq(DirJID)),
@@ -241,7 +235,7 @@ search_empty(Config) ->
     escalus:story(
       Config, [{alice, 1}],
       fun(Client) ->
-              Domain = ct:get_config({hosts, mim, domain}),
+              Domain = domain(),
               DirJID = <<"vjud.", Domain/binary>>,
               Fields = [{get_field_name(fn), <<"nobody">>}],
               Res = escalus:send_and_wait(Client,
@@ -252,16 +246,12 @@ search_empty(Config) ->
       end).
 
 search_some(Config) ->
-
     escalus:story(
       Config, [{bob, 1}],
       fun(Client) ->
-              Domain = ct:get_config({hosts, mim, domain}),
+              Domain = domain(),
               DirJID = <<"vjud.", Domain/binary>>,
               Fields = [{get_field_name(fn), get_FN(Config)}],
-              timer:sleep(timer:seconds(1)), %% this is required by Riak 2.0
-                                             %% Search to be sure the vcard is
-                                             %% indexed
               Res = escalus:send_and_wait(Client,
                                 escalus_stanza:search_iq(DirJID,
                                     escalus_stanza:search_fields(Fields))),
@@ -277,7 +267,7 @@ search_wildcard(Config) ->
     escalus:story(
       Config, [{bob, 1}],
       fun(Client) ->
-              Domain = ct:get_config({hosts, mim, domain}),
+              Domain = domain(),
               DirJID = <<"vjud.", Domain/binary>>,
               Fields = [{get_field_name(fn), get_FN_wildcard()}],
               Res = escalus:send_and_wait(Client,
@@ -317,11 +307,9 @@ stanza_get_vcard_field_cdata(Stanza, FieldName) ->
 field_tuples([]) ->
     [];
 field_tuples([#xmlel{name = <<"field">>,
-                     attrs=Attrs,
-                     children=_Children} = El| Rest]) ->
-    {<<"type">>,Type} = lists:keyfind(<<"type">>, 1, Attrs),
-    {<<"var">>,Var} = lists:keyfind(<<"var">>, 1, Attrs),
-    {<<"label">>,Label} = lists:keyfind(<<"label">>, 1, Attrs),
+                     attrs = Attrs,
+                     children = _Children} = El| Rest]) ->
+    #{<<"type">> := Type, <<"var">> := Var, <<"label">> := Label} = Attrs,
     case ?EL_CD(El, <<"value">>) of
         undefined ->
             [{Type, Var, Label}|field_tuples(Rest)];
@@ -340,9 +328,9 @@ item_field_tuples(_, []) ->
     [];
 item_field_tuples(ReportedFieldTups,
                   [#xmlel{name = <<"field">>,
-                          attrs=Attrs,
-                          children=_Children} = El| Rest]) ->
-    {<<"var">>,Var} = lists:keyfind(<<"var">>, 1, Attrs),
+                          attrs = Attrs,
+                          children = _Children} = El| Rest]) ->
+    Var = maps:get(<<"var">>, Attrs),
     {Type, Var, Label} = lists:keyfind(Var, 2, ReportedFieldTups),
     [{Type, Var, Label, ?EL_CD(El, <<"value">>)}
      | item_field_tuples(ReportedFieldTups, Rest)];
@@ -420,8 +408,7 @@ list_unordered_key_match2(Keypos, [ExpctdTup|Rest], ActualTuples) ->
 search_result_item_tuples(Stanza) ->
     Result = ?EL(Stanza, <<"query">>),
     XData = ?EL(Result, <<"x">>),
-    #xmlel{ attrs = _XAttrs,
-            children = XChildren } = XData,
+    #xmlel{ children = XChildren } = XData,
     Reported = ?EL(XData, <<"reported">>),
     ReportedFieldTups = field_tuples(Reported#xmlel.children),
     _ItemTups = item_tuples(ReportedFieldTups, XChildren).
@@ -450,22 +437,34 @@ get_FN(Config) ->
             <<"Old Name">>
     end.
 
-configure_ldap_vcards(Config) ->
-    Domain = ct:get_config({hosts, mim, domain}),
-    CurrentConfigs = rpc(mim(), gen_mod, loaded_modules_with_opts, [Domain]),
-    {mod_vcard, CurrentVcardConfig} = lists:keyfind(mod_vcard, 1, CurrentConfigs),
-    dynamic_modules:stop(Domain, mod_vcard),
-    Cfg = [{backend,ldap}, {host, "vjud.@HOST@"},
-           {ldap_uids, [{<<"uid">>}]}, %% equivalent to {<<"uid">>, <<"%u">>}
-           {ldap_filter,"(objectClass=inetOrgPerson)"},
-           {ldap_base,"ou=Users,dc=esl,dc=com"},
-           {ldap_search_fields, [{"Full Name","cn"},{"User","uid"}]},
-           {ldap_vcard_map,[{"FN","%s",["cn"]}]}],
-    dynamic_modules:start(Domain, mod_vcard, Cfg),
-    [{mod_vcard, CurrentVcardConfig} | Config].
+configure_mod_vcard(Config) ->
+    HostType = ct:get_config({hosts, mim, host_type}),
+    case is_vcard_ldap() of
+        true ->
+            ensure_started(HostType, ldap_opts());
+        _ ->
+            ensure_started(HostType, ?config(mod_vcard_opts, Config))
+    end.
 
-restore_ldap_vcards_config(Config) ->
-    OriginalConfig = ?config(mod_vcard, Config),
-    Domain = ct:get_config({hosts, mim, domain}),
-    dynamic_modules:stop(Domain, mod_vcard),
-    dynamic_modules:start(Domain, mod_vcard, OriginalConfig).
+ldap_opts() ->
+    LDAPOpts = #{filter => <<"(objectClass=inetOrgPerson)">>,
+                 base => <<"ou=Users,dc=esl,dc=com">>,
+                 search_fields => [{<<"Full Name">>, <<"cn">>}, {<<"User">>, <<"uid">>}],
+                 vcard_map => [{<<"FN">>, <<"%s">>, [<<"cn">>]}]},
+    LDAPOptsWithDefaults = config_parser_helper:config([modules, mod_vcard, ldap], LDAPOpts),
+    config_parser_helper:mod_config(mod_vcard, #{backend => ldap, ldap => LDAPOptsWithDefaults}).
+
+ensure_started(HostType, Opts) ->
+    dynamic_modules:stop(HostType, mod_vcard),
+    dynamic_modules:start(HostType, mod_vcard, Opts).
+
+prepare_vcard_module(Config) ->
+    %% Keep the old config, so we can undo our changes, once finished testing
+    Config1 = dynamic_modules:save_modules(host_types(), Config),
+    %% Get a list of options, we can use as a prototype to start new modules
+    Backend = mongoose_helper:mnesia_or_rdbms_backend(),
+    VCardOpts = config_parser_helper:mod_config(mod_vcard, #{backend => Backend}),
+    [{mod_vcard_opts, VCardOpts} | Config1].
+
+restore_vcard_module(Config) ->
+    dynamic_modules:restore_modules(Config).

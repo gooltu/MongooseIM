@@ -28,6 +28,8 @@
 -xep([{xep, 175}, {version, "1.2"}]).
 -export([mechanism/0, mech_new/3, mech_step/2]).
 
+-ignore_xref([mech_new/3]).
+
 -behaviour(cyrsasl).
 
 -record(state, {creds}).
@@ -49,7 +51,8 @@ mech_step(#state{creds = Creds}, _ClientIn) ->
     User = <<(mongoose_bin:gen_from_crypto())/binary,
              (integer_to_binary(erlang:unique_integer([positive])))/binary>>,
     %% Checks that the username is available
-    case ejabberd_auth:is_user_exists(User, mongoose_credentials:lserver(Creds)) of
+    JID = jid:make_bare(User, mongoose_credentials:lserver(Creds)),
+    case ejabberd_auth:does_user_exist(JID) of
         true  -> {error, <<"not-authorized">>};
         false -> {ok, mongoose_credentials:extend(Creds, [{username, User},
                                                           {auth_module, ?MODULE}])}

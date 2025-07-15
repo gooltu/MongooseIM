@@ -1,26 +1,17 @@
 -module(mod_websockets_SUITE).
--compile([export_all]).
+-compile([export_all, nowarn_export_all]).
 -include_lib("eunit/include/eunit.hrl").
--define(HANDSHAKE_TIMEOUT, 3000).
+
 -define(eq(E, I), ?assertEqual(E, I)).
 -define(PORT, 5280).
 -define(IP, {127, 0, 0, 1}).
 -define(FAST_PING_RATE, 500).
--define(NEW_TIMEOUT, 1200).
-%The timeout is long enough to pass all test cases for ping interval settings
-%using NEW_TIMEOUT value. In these tests we wait for at most 2 pings.
-%The 300ms is just an additional overhead
--define(IDLE_TIMEOUT, ?NEW_TIMEOUT * 2 + 300).
+-define(IDLE_TIMEOUT, 1200 * 2 + 300).
 
+-import(config_parser_helper, [config/2, default_config/1]).
 
 all() ->
-    ping_tests() ++ subprotocol_header_tests() ++ timeout_tests().
-
-ping_tests() ->
-    [ping_test,
-     set_ping_test,
-     disable_ping_test,
-     disable_and_set].
+    [ping_test | subprotocol_header_tests() ++ timeout_tests()].
 
 subprotocol_header_tests() ->
     [agree_to_xmpp_subprotocol,
@@ -34,12 +25,11 @@ timeout_tests() ->
      client_ping_frame_resets_idle_timeout].
 
 init_per_suite(C) ->
-    setup(),
+    setup(C),
     C.
 
-end_per_suite(_) ->
-    teardown(),
-    ok.
+end_per_suite(C) ->
+    teardown(C).
 
 init_per_testcase(_, C) ->
     C.
@@ -47,39 +37,40 @@ init_per_testcase(_, C) ->
 end_per_testcase(_, C) ->
     C.
 
-setup() ->
+setup(Config) ->
     meck:unload(),
     application:ensure_all_started(cowboy),
     application:ensure_all_started(jid),
-    application:ensure_all_started(lager),
     meck:new(supervisor, [unstick, passthrough, no_link]),
-    meck:new(gen_mod,[unstick, passthrough, no_link]),
+    meck:new(gen_mod, [unstick, passthrough, no_link]),
     %% Set ping rate
-    meck:expect(gen_mod,get_opt, fun(ping_rate, _, none) -> ?FAST_PING_RATE;
-                                    (A, B, C) -> meck:passthrough([A, B, C]) end),
-    meck:expect(supervisor, start_child,
-                fun(ejabberd_listeners, {_, {_, start_link, [_]}, transient,
-                                         infinity, worker, [_]}) -> {ok, self()};
-                   (A,B) -> meck:passthrough([A,B])
-                end),
-    meck:expect(ejabberd_config, get_local_option, fun(_) -> undefined end),
+    meck:expect(gen_mod, get_opt, fun(ping_rate, _, none) -> ?FAST_PING_RATE;
+                                     (A, B, C) -> meck:passthrough([A, B, C]) end),
+    mongoose_config:set_opts(#{default_server_name => <<"localhost">>}),
     %% Start websocket cowboy listening
+    Handlers = [config([listen, http, handlers, mod_bosh],
+                       #{host => '_', path => "/http-bind"}),
+                config([listen, http, handlers, mod_websockets],
+                       #{host => '_', path => "/ws-xmpp",
+                         timeout => ?IDLE_TIMEOUT, ping_rate => ?FAST_PING_RATE})],
+    Opts = #{module => ejabberd_cowboy,
+             port => ?PORT,
+             ip_tuple => ?IP,
+             ip_address => "127.0.0.1",
+             ip_version => inet,
+             proto => tcp,
+             handlers => Handlers,
+             transport => default_config([listen, http, transport]),
+             protocol => default_config([listen, http, protocol])},
+    #{start := {M, F, A}} = ejabberd_cowboy:listener_spec(Opts),
+    async_helper:start(Config, M, F, A).
 
-    Opts = [{num_acceptors, 10},
-            {max_connections, 1024},
-            {modules, [{"_", "/http-bind", mod_bosh},
-                       {"_", "/ws-xmpp", mod_websockets,
-                        [{timeout, ?IDLE_TIMEOUT},
-                         {ping_rate, ?FAST_PING_RATE}]}]}],
-    ejabberd_cowboy:start_listener({?PORT, ?IP, tcp}, Opts).
-
-
-teardown() ->
+teardown(Config) ->
+    async_helper:stop_all(Config),
     meck:unload(),
     cowboy:stop_listener(ejabberd_cowboy:ref({?PORT, ?IP, tcp})),
+    mongoose_config:erase_opts(),
     application:stop(cowboy),
-    application:stop(lager),
-    %% Do not stop jid, Erlang 21 does not like to reload nifs
     ok.
 
 ping_test(_Config) ->
@@ -89,40 +80,6 @@ ping_test(_Config) ->
     Resp = wait_for_ping(Socket1, 0, 5000),
     %% then
     ?eq(Resp, ok).
-
-set_ping_test(_Config) ->
-    #{socket := Socket1, internal_socket := InternalSocket} = ws_handshake(),
-    %% When
-    mod_websockets:set_ping(InternalSocket, ?NEW_TIMEOUT),
-    WaitMargin = 300,
-    ok = wait_for_ping(Socket1, 0 , ?NEW_TIMEOUT + WaitMargin),
-    %% Im waiting too less time!
-    TooShort = 700,
-    ErrorTimeout = wait_for_ping(Socket1, 0, TooShort),
-    ?eq({error, timeout}, ErrorTimeout),
-    %% now I'm wait the remaining time (and some margin)
-    ok = wait_for_ping(Socket1, 0, ?NEW_TIMEOUT - TooShort + WaitMargin).
-
-disable_ping_test(_Config) ->
-    #{socket := Socket1, internal_socket := InternalSocket} = ws_handshake(),
-    %% When
-    mod_websockets:disable_ping(InternalSocket),
-    %% Should not receive any packets
-    ErrorTimeout = wait_for_ping(Socket1, 0, ?FAST_PING_RATE),
-    %% then
-    ?eq(ErrorTimeout, {error, timeout}).
-
-disable_and_set(_Config) ->
-    #{socket := Socket1, internal_socket := InternalSocket} = ws_handshake(),
-    %% When
-    mod_websockets:disable_ping(InternalSocket),
-    %% Should not receive any packets
-    ErrorTimeout = wait_for_ping(Socket1, 0, ?FAST_PING_RATE),
-    mod_websockets:set_ping(InternalSocket, ?NEW_TIMEOUT),
-    Resp1 = wait_for_ping(Socket1, 0, ?NEW_TIMEOUT + 100),
-    %% then
-    ?eq(ErrorTimeout, {error, timeout}),
-    ?eq(Resp1, ok).
 
 connection_is_closed_after_idle_timeout(_Config) ->
     #{socket := Socket} = ws_handshake(),
@@ -229,8 +186,9 @@ get_child_by_mod(Sup, Mod) ->
 
 get_ranch_connections() ->
     LSup = get_child_by_mod(ranch_sup, ranch_listener_sup),
-    CSup = get_child_by_mod(LSup, ranch_conns_sup),
-    [ {Mod, Pid} || {_, Pid, _, [Mod]} <- supervisor:which_children(CSup) ].
+    CSup = get_child_by_mod(LSup, ranch_conns_sup_sup),
+    [{Mod, Pid} || {_, Sup, _, [ranch_conns_sup]} <- supervisor:which_children(CSup),
+                   {_, Pid, _, [Mod]} <- supervisor:which_children(Sup)].
 
 wait_for_no_ranch_connections(Times) ->
     case get_ranch_connections() of

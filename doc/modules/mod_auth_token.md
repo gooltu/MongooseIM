@@ -1,4 +1,4 @@
-### Module Description
+## Module Description
 
 This module implements handling of tokens in an OAuth-like authentication scheme. 
 It provides services necessary to:
@@ -13,59 +13,35 @@ It provides services necessary to:
 The module itself does not implement protocol related details - these are implemented in `cyrsasl.erl`.
 Generation of keys necessary to sign binary tokens is delegated to module `mod_keystore.erl`.
 
-### Options
+## Options
 
-#### Validity periods
+### `modules.mod_auth_token.backend`
+* **Syntax:** non-empty string
+* **Default:** `"rdbms"`
+* **Example:** `backend = "rdbms"`
 
-Validity periods of access and refresh tokens can be defined independently.
+Token storage backend. Currently only `"rdbms"` is supported.
 
-Allowed units are:
+### `modules.mod_auth_token.iqdisc.type`
+* **Syntax:** string, one of `"one_queue"`, `"no_queue"`, `"queues"`, `"parallel"`
+* **Default:** `"no_queue"`
 
-* days
-* hours
-* minutes
-* seconds
+Strategy to handle incoming IQ stanzas. For details, please refer to
+[IQ processing policies](../configuration/Modules.md#iq-processing-policies).
 
-The default values for tokens are:
+### `modules.mod_auth_token.validity_period`
+* **Syntax:** TOML table. Each key is either `access` or `refresh`. Each value is a nested TOML table with the following mandatory keys: `value` (non-negative integer) and `unit` (`"days"`, `"hours"`, `"minutes"` or `"seconds"`).
+* **Default:** `{access = {value = 1, unit = "hours"}, refresh = {value = 25, unit = "days"}}`
+* **Example:** `validity_period.access = {value = 30, unit = "minutes"}`
 
-* 1 hour for an access token
-* 25 days for a refresh token
-
-Example configuration from `mongooseim.cfg`, inside `modules` section:
-
-```erlang
-{modules, [
-    {mod_auth_token, [{{validity_period, access}, {13, minutes}},
-                      {{validity_period, refresh}, {13, days}}]
-]}.
-```
-
+Validity periods of access and refresh tokens can be defined independently - specifying one of them does not change the default value for the other one.
 Validity period configuration for provision tokens happens outside the module since the server does not generate provision tokens - it only validates them.
 
-#### Required keys
+### Required keys
 
-Keys are used for signing binary tokens using an HMAC with SHA-2 family function SHA-384.
-Therefore, `mod_auth_token` requires `mod_keystore` to provide some predefined keys.
+To read more about the keys MongooseIM makes use of, please refer to [mod_keystore](mod_keystore.md) documentation, where you can find an example configuration when using `mod_auth_token`.
 
-The required keys are (example from `mongooseim.cfg`):
-
-```erlang
-{mod_keystore, [{keys, [{token_secret, ram},
-                        {provision_pre_shared, {file, "priv/provision_pre_shared.key"}}]}]}
-```
-
-`token_secret` is a RAM-only (i.e. generated on cluster startup, never written to disk) key used for signing and verifying access and refresh tokens.
-
-`provision_pre_shared` is a key read from a file.
-As its name suggests, it's shared with a service issuing provision tokens.
-Clients then use these provision tokens to authenticate with MongooseIM.
-
-While it's not enforced by the server and left completely to the operator, `provision_pre_shared` keys probably should not be shared between virtual XMPP domains hosted by the server.
-That is, make sure the module configuration specifying a `provision_pre_shared` key is specific to an XMPP domain.
-
-MongooseIM can't generate provision tokens on its own (neither can it distribute them to clients), so while configuring a `provision_pre_shared` key to be RAM-only is technically possible, it would in practice disable the provision token support (as no external service could generate a valid token with this particular RAM key).
-
-### Token types
+## Token types
 
 Three token types are supported:
 
@@ -73,21 +49,24 @@ Three token types are supported:
   Access tokens can be used as a payload for the X-OAUTH authentication mechanism and grant access to the system.
   Access tokens can't be revoked.
   An access token is valid only until its expiry date is reached.
+  In mod_keystore, the keyname for this token type is `token_secret`.
 
-- _refresh tokens_: These are longer lived tokens which are tracked by the server and therefore require persistent storage (as of now only PostgreSQL is supported).
+- _refresh tokens_: These are longer lived tokens which are tracked by the server and therefore require persistent storage in a relational database.
   Refresh tokens can be used as a payload for the X-OAUTH authentication mechanism and to grant access to the system.
   Also they can result in a new set of tokens being returned upon successful authentication.
   They can be revoked - if a refresh token hasn't been revoked, it is valid until it has expired.
   On revocation, it immediately becomes invalid.
   As the server stores information about granted tokens, it can also persistently mark them as revoked.
+  In mod_keystore, the keyname for this token type is `token_secret`.
 
 - _provision tokens_: These tokens are generated by a service external to the server. 
    They grant the owner a permission to create an account.
   A provision token may contain information which the server can use to provision the VCard for the newly created account.
   Using a provision token to create an account (and inject VCard data) is done similarly to other token types, i.e. by passing it as payload for the X-OAUTH mechanism.
   The XMPP server has no way of tracking and revoking provision tokens, as they come from an outside source.
+  In mod_keystore, the keyname for this token type is `provision_pre_shared`. The usage of this token type is optional.
 
-### Token serialization format
+## Token serialization format
 
 All tokens (access, refresh, provision) are to be exchanged as *Base64 encoded* binary data.
 Serialization format of the token before encoding with Base64 is dependent on its type:
@@ -123,7 +102,7 @@ For example (these tokens are randomly generated, hence field values don't make 
 
 To request access and refresh tokens for the first time a client should send an IQ stanza after they have successfully authenticated for the first time using some other method.
 
-### Token response format
+## Token response format
 
 Requested tokens are being returned by the server wrapped in IQ stanza with the following fields:
 
@@ -145,7 +124,7 @@ Example response (encoded tokens have been truncated in this example):
 
 Once a client has obtained a token, they may start authenticating using the `X-OAUTH` SASL mechanism when reaching the authentication phase of an XMPP connection initiation.
 
-### Login with access or refresh token
+## Login with access or refresh token
 
 In order to log into the XMPP server using a previously requested token, a client should send the following stanza:
 
@@ -168,7 +147,7 @@ cmVmcmVzaAGQ1Mzk1MmZlYzhkYjhlOTQzM2UxMw==
 
 The above response is to be expected unless the refresh token used is expired or there were some problems processing the key on the server side.
 
-### Token revocation using command line tool
+## Token revocation using command line tool
 
 Refresh tokens issued by the server can be used to:
 
@@ -178,7 +157,7 @@ Refresh tokens issued by the server can be used to:
 An administrator may *revoke* a refresh token:
 
 ```sh
-mongooseimctl revoke_token owner@xmpphost
+mongooseimctl token revokeToken --user owner@xmpphost
 ```
 
 A client can no longer use a revoked token either for authentication or requesting new access tokens.
@@ -190,12 +169,10 @@ Moreover, an access token still kept on a compromised device can be used to esta
 To alleviate rerequesting tokens by the user, an operator can use `mod_admin` extension allowing to terminate the user's connection.
 Access token validity can't be sidestepped right now.
 
+## Example configuration
 
-### Example configuration
-
-```erlang
-{modules, [
-    {mod_auth_token, [{{validity_period, access}, {13, minutes}},
-                      {{validity_period, refresh}, {13, days}}]
-]}.
+```toml
+[modules.mod_auth_token]
+  validity_period.access = {value = 13, unit = "minutes"}
+  validity_period.refresh = {value = 13, unit = "days"}
 ```

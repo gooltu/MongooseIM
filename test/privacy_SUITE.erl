@@ -8,7 +8,7 @@
 %%%-------------------------------------------------------------------
 -module(privacy_SUITE).
 -author("bartek").
--compile([export_all]).
+-compile([export_all, nowarn_export_all]).
 
 -include_lib("exml/include/exml.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -19,6 +19,11 @@
 -define(ALICE, jid:from_binary(<<"alice@localhost">>)).
 -define(BOB, jid:from_binary(<<"bob@localhost">>)).
 -define(JEFF, jid:from_binary(<<"jeff@localhost">>)).
+-define(ACC_PARAMS, #{location => ?LOCATION,
+                      lserver => (?ALICE)#jid.lserver,
+                      host_type => (?ALICE)#jid.lserver,
+                      from_jid => ?ALICE,
+                      to_jid => ?BOB}).
 
 all() ->
       [ check_with_allowed,
@@ -27,32 +32,39 @@ all() ->
         check_with_bob_blocked,
         check_with_changing_stanza].
 
-init_per_suite(C) ->
+init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(jid),
-    application:ensure_all_started(lager),
     ok = mnesia:create_schema([node()]),
     ok = mnesia:start(),
     {ok, _} = application:ensure_all_started(exometer_core),
-    C.
+    mongoose_config:set_opts(opts()),
+    async_helper:start(Config, mongoose_instrument, start_link, []).
 
-init_per_testcase(_, C) ->
-    catch ets:new(local_config, [named_table]),
-    ejabberd_hooks:start_link(),
-    mod_privacy:start(<<"localhost">>, []),
-    C.
-
-end_per_suite(_C) ->
+end_per_suite(Config) ->
+    async_helper:stop_all(Config),
+    mongoose_config:erase_opts(),
     mnesia:stop(),
     mnesia:delete_schema([node()]),
     application:stop(exometer_core),
     ok.
 
+init_per_testcase(_, C) ->
+    mongooseim_helper:start_link_loaded_hooks(),
+    mongoose_modules:start(),
+    C.
+
+end_per_testcase(_, _) ->
+    mongoose_modules:stop().
+
+opts() ->
+    #{hosts => [<<"localhost">>],
+      host_types => [],
+      {modules, <<"localhost">>} =>
+          #{mod_privacy => config_parser_helper:default_mod_config(mod_privacy)},
+      instrumentation => config_parser_helper:default_config([instrumentation])}.
+
 check_with_allowed(_C) ->
-    Acc = mongoose_acc:new(#{ location => ?LOCATION,
-                              lserver => (?ALICE)#jid.lserver,
-                              from_jid => ?ALICE,
-                              to_jid => ?BOB,
-                              element => message() }),
+    Acc = mongoose_acc:new(?ACC_PARAMS#{element => message()}),
     Acc1 = make_check(Acc, userlist(none), ?BOB, out, allow),
     Acc2 = make_check(Acc1, userlist(none), ?BOB, in, allow),
     Acc3 = make_check(Acc2, userlist(none), ?JEFF, out, allow),
@@ -61,21 +73,13 @@ check_with_allowed(_C) ->
 
 check_with_denied(_C) ->
     % message
-    Acc = mongoose_acc:new(#{ location => ?LOCATION,
-                              lserver => (?ALICE)#jid.lserver,
-                              from_jid => ?ALICE,
-                              to_jid => ?BOB,
-                              element => message() }),
+    Acc = mongoose_acc:new(?ACC_PARAMS#{element => message()}),
     Acc1 = make_check(Acc, userlist(deny_all_message), ?BOB, out, allow),
     Acc2 = make_check(Acc1, userlist(deny_all_message), ?BOB, in, deny),
     Acc3 = make_check(Acc2, userlist(deny_all_message), ?JEFF, out, allow),
     _Acc4 = make_check(Acc3, userlist(deny_all_message), ?JEFF, in, deny),
     % presence
-    NAcc = mongoose_acc:new(#{ location => ?LOCATION,
-                              lserver => (?ALICE)#jid.lserver,
-                              from_jid => ?ALICE,
-                              to_jid => ?BOB,
-                              element => presence() }),
+    NAcc = mongoose_acc:new(?ACC_PARAMS#{element => presence()}),
     NAcc1 = make_check(NAcc, userlist(deny_all_message), ?BOB, out, allow),
     NAcc2 = make_check(NAcc1, userlist(deny_all_message), ?BOB, in, allow),
     NAcc3 = make_check(NAcc2, userlist(deny_all_message), ?JEFF, out, allow),
@@ -83,11 +87,7 @@ check_with_denied(_C) ->
     ok.
 
 check_with_denied_bob(_C) ->
-    Acc = mongoose_acc:new(#{ location => ?LOCATION,
-                              lserver => (?ALICE)#jid.lserver,
-                              from_jid => ?ALICE,
-                              to_jid => ?BOB,
-                              element => message() }),
+    Acc = mongoose_acc:new(?ACC_PARAMS#{element => message()}),
     Acc1 = make_check(Acc, userlist(deny_all_message), ?BOB, out, allow),
     Acc2 = make_check(Acc1, userlist(deny_all_message), ?BOB, in, deny),
     Acc3 = make_check(Acc2, userlist(none), ?JEFF, out, allow),
@@ -95,21 +95,13 @@ check_with_denied_bob(_C) ->
     ok.
 
 check_with_bob_blocked(_C) ->
-    Acc = mongoose_acc:new(#{ location => ?LOCATION,
-                              lserver => (?ALICE)#jid.lserver,
-                              from_jid => ?ALICE,
-                              to_jid => ?BOB,
-                              element => message() }),
+    Acc = mongoose_acc:new(?ACC_PARAMS#{element => message()}),
     Acc1 = make_check(Acc, userlist(block_bob), ?BOB, out, block),
     Acc2 = make_check(Acc1, userlist(block_bob), ?BOB, in, allow),
     Acc3 = make_check(Acc2, userlist(none), ?JEFF, out, allow),
     _Acc4 = make_check(Acc3, userlist(none), ?JEFF, in, allow),
     % presence
-    NAcc = mongoose_acc:new(#{ location => ?LOCATION,
-                              lserver => (?ALICE)#jid.lserver,
-                              from_jid => ?ALICE,
-                              to_jid => ?BOB,
-                              element => presence() }),
+    NAcc = mongoose_acc:new(?ACC_PARAMS#{element => presence()}),
     NAcc1 = make_check(NAcc, userlist(block_bob), ?BOB, out, block),
     NAcc2 = make_check(NAcc1, userlist(block_bob), ?BOB, in, allow),
     NAcc3 = make_check(NAcc2, userlist(block_bob), ?JEFF, out, allow),
@@ -121,11 +113,7 @@ check_with_changing_stanza(_C) ->
     M = message(),
     P = presence(),
     Ul = userlist(deny_all_message),
-    Acc = mongoose_acc:new(#{ location => ?LOCATION,
-                              lserver => (?ALICE)#jid.lserver,
-                              from_jid => ?ALICE,
-                              to_jid => ?BOB,
-                              element => M }),
+    Acc = mongoose_acc:new(?ACC_PARAMS#{element => M}),
     Acc1 = make_check({Acc, M}, Ul, ?BOB, out, allow),
     Acc2 = make_check({Acc1, M}, Ul, ?BOB, in, deny),
     Acc3 = make_check({Acc2, M}, Ul, ?JEFF, out, allow),
@@ -144,8 +132,8 @@ check_with_changing_stanza(_C) ->
 make_check(Acc, PList, To, Dir, Exp) ->
     Server = <<"localhost">>,
     User = <<"alice">>,
-    {Acc1, Res} = mongoose_privacy:privacy_check_packet(Acc, Server, User,
-        PList, To, Dir),
+    {Res, Acc1} = mongoose_privacy:privacy_check_packet(Acc, jid:make(User, Server, <<>>),
+                                                        PList, To, Dir),
     ?assertEqual(Exp, Res),
     Acc1.
 
@@ -161,9 +149,12 @@ userlist(_) ->
 
 
 presence() ->
-    {xmlel, <<"presence">>, [{<<"xml:lang">>, <<"en">>}], []}.
+     #xmlel{name = <<"presence">>,
+            attrs = #{<<"xml:lang">> => <<"en">>},
+            children = []}.
 
 message() ->
-    {xmlel, <<"message">>,
-        [{<<"type">>, <<"chat">>}, {<<"to">>, <<"bob@localhost">>}],
-        [{xmlel, <<"body">>, [], [{xmlcdata, <<"roar!">>}]}]}.
+    #xmlel{name = <<"message">>,
+           attrs = #{<<"type">> => <<"chat">>, <<"to">> => <<"bob@localhost">>},
+           children = [#xmlel{name = <<"body">>,
+                              children = [#xmlcdata{content = <<"roar!">>}]}]}.

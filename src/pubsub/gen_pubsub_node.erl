@@ -52,7 +52,7 @@
                                          max_items => non_neg_integer(),
                                          item_ids => [itemId()],
                                          subscription_id => subId()}).
--type(get_item_options() :: #{rsm => none | jlib:rms_in(),
+-type(get_item_options() :: #{rsm => none | jlib:rsm_in(),
                               max_items => undefined | non_neg_integer(),
                               item_ids => undefined | [itemId()]}).
 
@@ -62,6 +62,8 @@
          features/1,
          node_to_path/2
         ]).
+
+-ignore_xref([behaviour_info/1, node_to_path/2]).
 
 -export_type([get_item_options/0]).
 

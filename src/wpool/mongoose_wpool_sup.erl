@@ -37,10 +37,9 @@
 %%
 %% @end
 %%--------------------------------------------------------------------
--spec(start_link() ->
-    {ok, Pid :: pid()} | ignore | {error, Reason :: term()}).
+-spec start_link() -> supervisor:startlink_ret().
 start_link() ->
-    supervisor:start_link({local, ?SERVER}, ?MODULE, []).
+    supervisor:start_link({local, ?SERVER}, ?MODULE, noargs).
 
 %%%===================================================================
 %%% Supervisor callbacks
@@ -56,9 +55,8 @@ start_link() ->
 %%
 %% @end
 %%--------------------------------------------------------------------
--spec init(Args :: term()) -> {ok, {#{strategy => one_for_one, intensity => 100, period => 5},
-                                    []}}.
-init([]) ->
+-spec init(noargs) -> {ok, {supervisor:sup_flags(), [supervisor:child_spec()]}}.
+init(noargs) ->
     SupFlags = #{strategy => one_for_one,
                  intensity => 100,
                  period => 5},
@@ -68,18 +66,18 @@ init([]) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
--spec child_spec(mongoose_wpool:type()) ->
-    #{id := mongoose_wpool:name(),
-      start := {mongoose_wpool_type_sup, start_link, [mongoose_wpool:type()]},
+-spec child_spec(mongoose_wpool:pool_type()) ->
+    #{id := mongoose_wpool:proc_name(),
+      start := {mongoose_wpool_type_sup, start_link, [mongoose_wpool:pool_type()]},
       restart => transient,
-      shutdown => brutal_kill,
+      shutdown => infinity,
       type => supervisor,
       modules => [module()]}.
 child_spec(Type) ->
     #{id => mongoose_wpool_type_sup:name(Type),
       start => {mongoose_wpool_type_sup, start_link, [Type]},
       restart => transient,
-      shutdown => brutal_kill,
+      shutdown => infinity,
       type => supervisor,
       modules => [mongoose_wpool_type_sup]
      }.

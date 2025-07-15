@@ -15,6 +15,7 @@
 -define(DEFAULT_MAX_OCCUPANTS, infinity).
 -define(DEFAULT_ROOMS_PER_PAGE, 10).
 -define(DEFAULT_ROOMS_IN_ROSTERS, false).
+-define(DEFAULT_ALLOW_MULTIPLE_OWNERS, false).
 
 -type aff() :: owner | member | none.
 -type aff_user() :: {jid:simple_bare_jid(), aff()}.
@@ -56,7 +57,7 @@
 
 -record(msg, {
           id = <<>> :: binary(),
-          children = [] :: [jlib:xmlch()]
+          children = [] :: [exml:child()]
          }).
 
 -record(config, {
@@ -119,6 +120,8 @@
                                   | {set, #create{}, UniqueRequested :: boolean()}
                                   | {set, #destroy{}, AffUsers :: aff_users()}
                                   | {set, #config{}, AffUsers :: aff_users()}
+                                  | {#msg{}, AffUsers :: aff_users()}
+                                  | muc_light_disco()
                                   | {error, bad_request}.
 
 -type msg() :: #msg{}.

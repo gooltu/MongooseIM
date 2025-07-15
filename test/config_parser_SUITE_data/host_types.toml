@@ -1,0 +1,47 @@
+[general]
+  host_types = [
+      "this is host type",
+      "some host type",
+      "another host type",
+      "yet another host type"
+    ]
+
+  hosts = ["localhost"]
+  default_server_domain = "localhost"
+
+[auth.external]
+  program = "/usr/bin/bash"
+
+[auth.http]
+
+[modules.mod_amp]
+
+[services.service_domain_db]
+  event_cleaning_interval = 1000
+  event_max_age = 5000
+
+[[host_config]]
+  host_type = "this is host type"
+  ## this resets the modules for this host
+  modules = {}
+  [host_config.auth.external]
+    program = "/usr/bin/bash"
+
+[[host_config]]
+  ## host is just synonym for host_type now
+  host = "some host type"
+  ## another syntax for reseting the modules for this host type
+  [host_config.modules]
+  [host_config.auth.http]
+
+[[host_config]]
+  host_type = "another host type"
+  ## reseting the modules for this host type
+  [host_config.modules.mod_offline]
+  [host_config.auth]
+
+[[host_config]]
+  host_type = "localhost"
+  ## reseting the modules for this host type
+  [host_config.modules.mod_vcard]
+  [host_config.auth.rdbms]

@@ -1,7 +1,7 @@
 #!/bin/sh
 
 PIDFILE=/tmp/print-dots.pid
-SLEEPTIME=10s
+SLEEPTIME=10
 
 loop () {
     while true; do
@@ -34,7 +34,13 @@ start_countdown)
     echo $! > $PIDFILE
     ;;
 stop)
-    [ -s $PIDFILE ] && (kill $(cat $PIDFILE) 2>/dev/null; rm $PIDFILE)
+    if [ -s $PIDFILE ]; then
+        PID="$(cat $PIDFILE)"
+        rm $PIDFILE
+        kill "$PID" 2>/dev/null
+        wait "$PID" 2>/dev/null
+        echo #just an line break after printed dots
+    fi
     ;;
 loop)
     loop

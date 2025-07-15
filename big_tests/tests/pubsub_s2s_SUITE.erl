@@ -22,11 +22,13 @@
          publish_without_node_attr_test/1
         ]).
 
--import(distributed_helper, [require_rpc_nodes/1]).
+-import(distributed_helper, [require_rpc_nodes/1,
+                             subhost_pattern/1]).
 -import(pubsub_tools, [
                        domain/0,
                        encode_group_name/2,
-                       decode_group_name/1]).
+                       decode_group_name/1,
+                       nodetree_to_mod/1]).
 
 %%--------------------------------------------------------------------
 %% Suite configuration
@@ -43,10 +45,7 @@ groups() ->
                                                                NodeTree <- [<<"dag">>, <<"tree">>]].
 
 base_groups() ->
-    G = [
-         {basic, [parallel], basic_tests()}
-        ],
-    ct_helper:repeat_all_until_all_ok(G).
+    [{basic, [parallel], basic_tests()}].
 
 basic_tests() ->
     [
@@ -75,14 +74,14 @@ init_per_group(ComplexName, Config) ->
     s2s_helper:configure_s2s(both_plain, Config2).
 
 extra_options_by_group_name(#{ node_tree := NodeTree }) ->
-    [{nodetree, NodeTree},
-     {plugins, [plugin_by_nodetree(NodeTree)]}].
+    #{nodetree => nodetree_to_mod(NodeTree),
+      plugins => [plugin_by_nodetree(NodeTree)]}.
 
 plugin_by_nodetree(<<"dag">>) -> <<"dag">>;
 plugin_by_nodetree(<<"tree">>) -> <<"flat">>.
 
 end_per_group(_GroupName, Config) ->
-    dynamic_modules:restore_modules(domain(), Config).
+    dynamic_modules:restore_modules(Config).
 
 init_per_testcase(_TestName, Config) ->
     escalus:init_per_testcase(_TestName, Config).
@@ -109,7 +108,7 @@ publish_test(Config) ->
               Node = pubsub_tools:pubsub_node(),
               pubsub_tools:create_node(Alice, Node, []),
               pubsub_tools:publish(Alice, <<"item1">>, Node, []),
-              pubsub_tools:publish(Alice2, <<"item2">>, Node, [{expected_error_type, <<"cancel">>}]),
+              pubsub_tools:publish(Alice2, <<"item2">>, Node, [{expected_error_type, <<"auth">>}]),
               pubsub_tools:delete_node(Alice, Node, [])
       end).
 
@@ -121,13 +120,12 @@ publish_without_node_attr_test(Config) ->
               Node = pubsub_tools:pubsub_node(),
               pubsub_tools:create_node(Alice, Node, []),
               pubsub_tools:publish(Alice, <<"item1">>, Node, []),
-              pubsub_tools:publish_without_node_attr(Alice2, <<"item2">>, Node, [{expected_error_type, <<"cancel">>}]),
+              pubsub_tools:publish_without_node_attr(Alice2, <<"item2">>, Node, [{expected_error_type, <<"modify">>}]),
               pubsub_tools:delete_node(Alice, Node, [])
       end).
 
 required_modules(ExtraOpts) ->
-    [{mod_pubsub, [
-                   {backend, mongoose_helper:mnesia_or_rdbms_backend()},
-                   {host, "pubsub.@HOST@"}
-                   | ExtraOpts
-                  ]}].
+    Opts = maps:merge(#{backend => mongoose_helper:mnesia_or_rdbms_backend(),
+                        host => subhost_pattern("pubsub.@HOST@")},
+                      ExtraOpts),
+    [{mod_pubsub, config_parser_helper:mod_config(mod_pubsub, Opts)}].

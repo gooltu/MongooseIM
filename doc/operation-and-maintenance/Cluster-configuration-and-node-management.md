@@ -15,7 +15,6 @@ To increase the limit the following entries should be added in `/etc/security/li
 
 ```
 mongooseim   soft   nofile   1000000
-
 mongooseim   hard   nofile   1000000
 ```
 
@@ -23,18 +22,20 @@ If you are using **Ubuntu**, all `/etc/pam.d/common-session*` files should inclu
 
 ### `vm.args` file
 
-This file contains erlang options used when starting the VM.
-It is located in `REL_ROOT/etc/vm.args` where `REL_ROOT` is the path to a MonoogseIM release
+This file contains Erlang options used when starting the VM.
+It is located in `REL_ROOT/etc/vm.args` where `REL_ROOT` is the path to a MongooseIM release
 (ie. `_build/prod/rel/mongooseim` if you build MongooseIM from source).
 
 When using an SSL/TLS connection we advise to increase `ERL_MAX_PORTS` to `350000`.
-This value specifies how many ports (files, drivers, sockets etc) can be used by Erlang VM.
+This value specifies how many ports (files, drivers, sockets etc) can be used by the Erlang VM.
 Be cautious - it preallocates some structures inside the VM and will have impact on the memory usage.
 We suggest 350000 for 100 k users when using an SSL/TLS connection or 250000 in other cases.
 
 To check how memory consumption changes depending on `ERL_MAX_PORTS`, use the following command:
 
-`env ERL_MAX_PORTS=[given value] erl -noinput -eval 'io:format("~p~n",[erlang:memory(system)]).' -s erlang halt`
+```bash
+env ERL_MAX_PORTS=[given value] erl -noinput -eval 'io:format("~p~n",[erlang:memory(system)]).' -s erlang halt
+```
 
 Another change you need to make when building a MongooseIM cluster is setting the `-sname`.
 To do it, just set the `-sname` option in `vm.args` with node's hostname,
@@ -46,12 +47,14 @@ To connect to other nodes, a freshly started node uses a port from the range `in
 
 To enable this, add the following line to the `vm.args` file:
 
-`-kernel inet_dist_listen_min 50000 inet_dist_listen_max 50010`
+```
+-kernel inet_dist_listen_min 50000 inet_dist_listen_max 50010
+```
 
 Make sure that the range you set provides enough ports for all the nodes in the cluster.
 
 Remember to keep an epmd port open (port 4369) if any firewall restrictions are required.
-Epmd keeps track of which erlang node is using which ports on the local machine.
+Epmd keeps track of which Erlang node is using which ports on the local machine.
 
 ## Connecting nodes
 
@@ -61,94 +64,186 @@ Checklist:
 - the same cookie across all nodes (`vm.args` `-setcookie` parameter)
 - each node should be able to ping other nodes using its sname
    (ex. `net_adm:ping('mongoose@localhost')`)
+- RDBMS backend is configured, so CETS could discover nodes
 
 ### Initial node
 
-There is no action required on the initial node.
+=== "CETS"
 
-Just start MongooseIM using `mongooseim start` or `mongooseim live`.
+    Clustering is automatic. There is no difference between nodes.
+
+=== "Mnesia"
+
+    There is no action required on the initial node.
+
+     Just start MongooseIM using `mongooseim start` or `mongooseim live`.
 
 ### New node - joining cluster
 
+=== "CETS"
 
-```bash
-mongooseimctl start
-mongooseimctl started #waits until MongooseIM starts
-mongooseimctl join_cluster ClusterMember
-```
+    Clustering is automatic.
 
-`ClusterMember` is the name of a running node set in `vm.args` file, for example `mongooseim@localhost`.
-This node has to be part of the cluster we'd like to join.
+=== "Mnesia"
 
-First MongooseIM will display a warning and a question if the operation should proceed:
+    ```bash
+    mongooseimctl start
+    mongooseimctl started #waits until MongooseIM starts
+    mongooseimctl join_cluster ClusterMember
+    ```
 
-```
-Warning. This will drop all current connections and will discard all persistent data from Mnesia. Do you want to continue? (yes/no)
-```
+    `ClusterMember` is the name of a running node set in `vm.args` file, for example `mongooseim@localhost`.
+    This node has to be part of the cluster we'd like to join.
 
-If you type `yes` MongooseIM will start joining the cluster.
-Successful output may look like the following:
+    First, MongooseIM will display a warning and a question if the operation should proceed:
 
-```
-You have successfully joined the node mongooseim2@localhost to the cluster with node member mongooseim@localhost
-```
+    ```text
+    Warning. This will drop all current connections and will discard all persistent data from Mnesia. Do you want to continue? (yes/no)
+    ```
 
-In order to skip the question you can add option `-f` which will perform the action
-without displaying the warning and waiting for the confirmation.
+    If you type `yes` MongooseIM will start joining the cluster.
+    Successful output may look like the following:
+
+    ```text
+    You have successfully joined the node mongooseim2@localhost to the cluster with node member mongooseim@localhost
+    ```
+
+    In order to skip the question you can add option `-f` which will perform the action
+    without displaying the warning and waiting for the confirmation.
 
 ### Leaving cluster
 
-To leave a running node from the cluster, call:
+=== "CETS"
 
-```bash
-mongooseimctl leave_cluster
-```
+    Stopping the node is enough to leave the cluster.
+    If you want to avoid the node joining the cluster again, you have to specify a different `cluster_name`
+    option in the CETS backend configuration. A different Erlang cookie is a good idea too.
 
-It only makes sense to use it if the node is the part of a cluster, e.g `join_cluster` was called from that node before.
+=== "Mnesia"
 
-Similarly to `join_cluster` a warning and a question will be displayed unless the option `-f` is added to the command.
+    To leave a running node from the cluster, call:
 
-The successful output from the above command may look like the following:
+    ```bash
+    mongooseimctl leave_cluster
+    ```
 
-`You have successfully left the node mongooseim2@localhost from the cluster`.
+    It only makes sense to use it if the node is part of a cluster, e.g `join_cluster` was called on that node before.
+
+    Similarly to `join_cluster` a warning and a question will be displayed unless the option `-f` is added to the command.
+
+    The successful output from the above command may look like the following:
+
+    ```text
+    The node mongooseim2@localhost has successfully left the cluster
+    ```
 
 ### Removing a node from the cluster
 
-To remove another node from the cluster, call the following command from one of the cluster members:
+=== "CETS"
 
-```bash
-mongooseimctl remove_from_cluster RemoteNodeName
-```
+    A stopped node would be automatically removed from the node discovery table in RDBMS database after some time.
+    It is needed so other nodes would not try to connect to the stopped node.
 
-where `RemoteNodeName` is a name of the node that we'd like to remove from our cluster.
-This command could be useful when the node is dead and not responding and we'd like to remove it remotely.
-The successful output from the above command may look like the following:
+=== "Mnesia"
 
-`The node mongooseim2@localhost has been removed from the cluster`
+    To remove another node from the cluster, call the following command from one of the cluster members:
+
+    ```bash
+    mongooseimctl remove_from_cluster RemoteNodeName
+    ```
+
+    where `RemoteNodeName` is the name of the node that we'd like to remove from our cluster.
+    This command could be useful when the node is dead and not responding and we'd like to remove it remotely.
+    The successful output from the above command may look like the following:
+
+    ```text
+    The node mongooseim2@localhost has been removed from the cluster
+    ```
 
 ### Cluster status
 
-You can use the following commands on any of the running nodes to examine the cluster
-or to see if a newly added node is properly clustered:
+=== "CETS"
 
-```bash
-mongooseimctl mnesia info | grep "running db nodes"
-```
+    Run the command:
 
-This command shows all running nodes.
-A healthy cluster should contain all nodes here.
-For example:
+    ```bash
+    mongooseimctl cets systemInfo
+    ```
 
-    running db nodes   = [mongooseim@node1, mongooseim@node2]
+    `joinedNodes` should contain a list of properly joined nodes:
 
-To see stopped or misbehaving nodes following command can be useful:
+    ```json
+    "joinedNodes" : [
+      "mongooseim@node1",
+      "mongooseim@node2"
+    ]
+    ```
 
-```bash
-mongooseimctl mnesia info | grep "stopped db nodes"
-```
+    It should generally be equal to the list of `discoveredNodes`.
 
-This command shows which nodes are considered stopped.
-This does not necessarily indicate that they are down but might be a symptom of a communication problem.
+    If it is not equal, you could have some configuration or networking issues.
+    You can check the `unavailableNodes`, `remoteNodesWithUnknownTables`,
+    and `remoteNodesWithMissingTables` lists for more information (generally, these lists should be empty).
+    You can read the description for other fields of `systemInfo` in the
+    [GraphQL API reference](../graphql-api/admin-graphql-doc.html#definition-CETSSystemInfo).
+
+    For a properly configured 2 nodes cluster the metrics would show something like that:
+
+    ```json
+    mongooseimctl metric getMetrics --name '["global", "cets", "system"]'
+    {
+      "data" : {
+        "metric" : {
+          "getMetrics" : [
+            {
+              "unavailable_nodes" : 0,
+              "type" : "cets_system",
+              "remote_unknown_tables" : 0,
+              "remote_nodes_without_disco" : 0,
+              "remote_nodes_with_unknown_tables" : 0,
+              "remote_nodes_with_missing_tables" : 0,
+              "remote_missing_tables" : 0,
+              "name" : [
+                "global",
+                "cets",
+                "system"
+              ],
+              "joined_nodes" : 2,
+              "discovery_works" : 1,
+              "discovered_nodes" : 2,
+              "conflict_tables" : 0,
+              "conflict_nodes" : 0,
+              "available_nodes" : 2
+            }
+          ]
+        }
+      }
+    }
+    ```
+
+=== "Mnesia"
+
+    You can use the following commands on any of the running nodes to examine the cluster
+    or to see if a newly added node is properly clustered:
+
+    ```bash
+    mongooseimctl mnesia info | grep "running db nodes"
+    ```
+
+    This command shows all running nodes.
+    A healthy cluster should contain all nodes here.
+    For example:
+    ```bash
+    running db nodes = [mongooseim@node1, mongooseim@node2]
+    ```
+    To see stopped or misbehaving nodes the following command can be useful:
+
+    ```bash
+    mongooseimctl mnesia info | grep "stopped db nodes"
+    ```
+
+    This command shows which nodes are considered stopped.
+    This does not necessarily indicate that they are down but might be a symptom of a communication problem.
 
 ## Load Balancing
 
@@ -167,11 +262,8 @@ Load balancing can be performed on a DNS level.
 A DNS response can have a number of IP addresses that can be returned to the client side in a random order.
 
 On the AWS stack this type of balancing is provided by Route53.
-The description of their service can be found at:
-
-http://docs.aws.amazon.com/Route53/latest/DeveloperGuide/WeightedResourceRecordSets.html
+The description of their service can be found in the [Route53 Developer's Guide](http://docs.aws.amazon.com/Route53/latest/DeveloperGuide/WeightedResourceRecordSets.html).
 
 ### Other
 
 The approaches described above can be mixed - we can use DNS load balancing to pick a software load balancer which will select one of the nodes.
-

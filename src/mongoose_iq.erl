@@ -17,36 +17,19 @@
 %%==============================================================================
 %%
 -module(mongoose_iq).
--export([try_to_handle_iq/4,
-         iq_to_sub_el/1,
+-export([iq_to_sub_el/1,
          empty_result_iq/1]).
 -export([update_acc_info/1]).
 -export([info/1, xmlns/1, command/1]).
 
--include("mongoose_logger.hrl").
+-ignore_xref([command/1, empty_result_iq/1, iq_to_sub_el/1, update_acc_info/1]).
+-ignore_xref([xmlns/1]).
+
 -include("jlib.hrl").
 
 %% ---------------------------------------------------------
 %% API
 %% ---------------------------------------------------------
-
-%% @doc Generic error handling code for IQ.
-%% Use this function, instead of `try ... catch _:_ -> ok end'.
--spec try_to_handle_iq(jid:jid(), jid:jid(), jlib:iq(), HandlerF) -> jlib:iq()
-  when
-    HandlerF :: fun((jid:jid(), jid:jid(), jlib:iq()) -> jlib:iq()).
-try_to_handle_iq(From, To, IQ = #iq{sub_el = SubEl}, HandlerF) ->
-    try
-        HandlerF(From, To, IQ)
-    catch Class:Reason:StackTrace ->
-        ?ERROR_MSG("event=handing_iq_failed "
-                   "from=~ts to=~ts iq=~1000p "
-                   "reason=~p:~p stacktrace=~1000p",
-                   [jid:to_binary(From), jid:to_binary(To), IQ,
-                    Class, Reason, StackTrace]),
-        IQ#iq{type = error,
-              sub_el = [SubEl, mongoose_xmpp_errors:internal_server_error()]}
-    end.
 
 iq_to_sub_el(#iq{sub_el = SubEl}) ->
     SubEl.
@@ -67,16 +50,14 @@ update_acc_info(Acc0) ->
         CurrentRef ->
             El = mongoose_acc:element(Acc0),
             IQ = jlib:iq_query_or_response_info(El),
-            Acc1 = mongoose_acc:set(iq, record, IQ, Acc0),
             {XMLNS, Command} = case IQ of
                                    #iq{ xmlns = XMLNS0, sub_el = SubEl } ->
                                        {XMLNS0, sub_el_to_command(SubEl)};
                                    _ ->
                                        {undefined, undefined}
                                end,
-            Acc2 = mongoose_acc:set(iq, xmlns, XMLNS, Acc1),
-            Acc3 = mongoose_acc:set(iq, command, Command, Acc2),
-            mongoose_acc:set(iq, ref, CurrentRef, Acc3)
+            IqData = [{record, IQ}, {xmlns, XMLNS}, {command, Command}, {ref, CurrentRef}],
+            mongoose_acc:set(iq, IqData, Acc0)
     end.
 
 %% update_and_get updates only when it is actually necessary
@@ -107,4 +88,3 @@ sub_el_to_command(#xmlel{ name = Name }) -> Name.
 update_and_get(Field, Acc0) ->
     Acc1 = update_acc_info(Acc0),
     {mongoose_acc:get(iq, Field, Acc1), Acc1}.
-

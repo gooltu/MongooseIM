@@ -16,10 +16,11 @@
 -module(mam_helper).
 
 -include("mam_helper.hrl").
--include_lib("escalus/include/escalus.hrl").
 -include_lib("escalus/include/escalus_xmlns.hrl").
 -include_lib("common_test/include/ct.hrl").
 -include_lib("exml/include/exml_stream.hrl").
+
+-compile([export_all, nowarn_export_all]).
 
 -import(distributed_helper, [mim/0,
                              rpc/4]).
@@ -31,83 +32,21 @@
          stanza_to_room/2,
          start_room/5]).
 
-%% TODO: Split into modules like mam_stanza, mam_pred etc.
--export([
-         backend/0,
-         rpc_apply/3,
-         get_prop/2,
-         is_riak_enabled/1,
-         is_cassandra_enabled/0,
-         is_cassandra_enabled/1,
-         is_elasticsearch_enabled/1,
-         is_mam_possible/1,
-         respond_iq/1,
-         print_configuration_not_supported/2,
-         start_alice_room/1,
-         destroy_room/1,
-         send_muc_rsm_messages/1,
-         send_rsm_messages/1,
-         clean_archives/1,
-         mam04_props/0,
-         mam06_props/0,
-         bootstrap_archive/1,
-         muc_bootstrap_archive/1,
-         start_alice_protected_room/1,
-         start_alice_anonymous_room/1,
-         maybe_wait_for_archive/1,
-         stanza_archive_request/2,
-         stanza_text_search_archive_request/3,
-         stanza_date_range_archive_request_not_empty/3,
-         wait_archive_respond/1,
-         wait_for_complete_archive_response/3,
-         assert_respond_size/2,
-         assert_respond_query_id/3,
-         parse_result_iq/1,
-         nick_to_jid/2,
-         stanza_filtered_by_jid_request/2,
-         nick/1,
-         respond_messages/1,
-         parse_forwarded_message/1,
-         login_send_presence/2,
-         assert_only_one_of_many_is_equal/2,
-         add_nostore_hint/1,
-         assert_not_stored/2,
-         has_x_user_element/1,
-         stanza_date_range_archive_request/1,
-         make_iso_time/1,
-         stanza_retrieve_form_fields/2,
-         stanza_limit_archive_request/1,
-         rsm_send/3,
-         stanza_page_archive_request/3,
-         wait_empty_rset/2,
-         wait_message_range/3,
-         message_id/2,
-         wait_message_range/5,
-         stanza_prefs_set_request/4,
-         stanza_prefs_get_request/1,
-         stanza_query_get_request/1,
-         parse_prefs_result_iq/1,
-         namespaces/0,
-         mam_ns_binary/0,
-         mam_ns_binary_v04/0,
-         mam_ns_binary_v06/0,
-         retract_ns/0,
-         retract_tombstone_ns/0,
-         make_alice_and_bob_friends/2,
-         run_prefs_case/6,
-         prefs_cases2/0,
-         default_policy/1,
-         get_all_messages/2,
-         parse_messages/1,
-         run_set_and_get_prefs_case/4,
-         muc_light_host/0,
-         host/0,
-         wait_for_archive_size/2,
-         verify_archived_muc_light_aff_msg/3,
-         wait_for_room_archive_size/3,
-         generate_msg_for_date_user/3,
-         generate_msg_for_date_user/4
-        ]).
+-import(config_parser_helper, [config/2, mod_config/2]).
+
+config_opts(ExtraOpts) ->
+    lists:foldl(fun set_opts/2, ExtraOpts, [defaults, backend, pm, muc, async_writer]).
+
+set_opts(defaults, Opts) ->
+    mod_config(mod_mam, Opts);
+set_opts(pm, #{pm := PMExtra} = Opts) ->
+    Opts#{pm := config([modules, mod_mam, pm], PMExtra)};
+set_opts(muc, #{muc := MUCExtra} = Opts) ->
+    Opts#{muc := config([modules, mod_mam, muc], MUCExtra)};
+set_opts(async_writer, #{async_writer := AsyncExtra} = Opts) ->
+    Opts#{async_writer := config([modules, mod_mam, async_writer], AsyncExtra)};
+set_opts(_, Opts) ->
+    Opts.
 
 rpc_apply(M, F, Args) ->
     case rpc_call(M, F, Args) of
@@ -190,7 +129,7 @@ wait_for_complete_archive_response(P, Alice, ExpectedCompleteValue)
                         #{mam_props => P, parsed_iq => ParsedIQ}).
 
 make_iso_time(Micro) ->
-    calendar:system_time_to_rfc3339(usec:to_sec(Micro), [{offset, "Z"}]).
+    calendar:system_time_to_rfc3339(Micro, [{offset, "Z"}, {unit, microsecond}]).
 
 generate_message_text(N) when is_integer(N) ->
     <<"Message #", (list_to_binary(integer_to_list(N)))/binary>>.
@@ -224,25 +163,36 @@ nick(User) ->
 namespaces() ->
     [mam_ns_binary_v04(),
      mam_ns_binary_v06(),
+     mam_ns_binary_extended(),
      retract_ns(),
+     retract_esl_ns(),
      retract_tombstone_ns()].
 
 mam_ns_binary() -> mam_ns_binary_v04().
 mam_ns_binary_v04() -> <<"urn:xmpp:mam:1">>.
 mam_ns_binary_v06() -> <<"urn:xmpp:mam:2">>.
+mam_ns_binary_extended() -> <<"urn:xmpp:mam:2#extended">>.
 retract_ns() -> <<"urn:xmpp:message-retract:0">>.
+retract_esl_ns() -> <<"urn:esl:message-retract-by-stanza-id:0">>.
 retract_tombstone_ns() -> <<"urn:xmpp:message-retract:0#tombstone">>.
+groupchat_field_ns() -> <<"urn:xmpp:mam:2#groupchat-field">>.
+groupchat_available_ns() -> <<"urn:xmpp:mam:2#groupchat-available">>.
+data_validate_ns() -> <<"http://jabber.org/protocol/xdata-validate">>.
+stanzas_ns() -> <<"urn:ietf:params:xml:ns:xmpp-stanzas">>.
 
 skip_undefined(Xs) ->
     [X || X <- Xs, X =/= undefined].
 
-maybe_attr(_, undefined) ->
-    [];
 maybe_attr(K, V) ->
-    [{K, V}].
+    maybe_attr(K, V, #{}).
+
+maybe_attr(_, undefined, Attrs) ->
+    Attrs;
+maybe_attr(K, V, Attrs) ->
+    Attrs#{K => V}.
 
 mam_ns_attr(P) ->
-    [{<<"xmlns">>, get_prop(mam_ns, P)}].
+    #{<<"xmlns">> => get_prop(mam_ns, P)}.
 
 maybe_with_elem(undefined) ->
     undefined;
@@ -251,82 +201,136 @@ maybe_with_elem(BWithJID) ->
         name = <<"with">>,
         children = [#xmlcdata{content = BWithJID}]}.
 
+stanza_metadata_request() ->
+    escalus_stanza:iq(<<"get">>,
+                      [#xmlel{name = <<"metadata">>,
+                              attrs = #{<<"xmlns">> => mam_ns_binary_v06()}}]).
+
 %% An optional 'queryid' attribute allows the client to match results to
 %% a certain query.
 stanza_archive_request(P, QueryId) ->
-    stanza_lookup_messages_iq(P, QueryId,
-                              undefined, undefined,
-                              undefined, undefined, undefined).
+    Params = #{query_id => QueryId},
+    stanza_lookup_messages_iq(P, Params).
 
 stanza_date_range_archive_request(P) ->
-    stanza_lookup_messages_iq(P, undefined,
-                              "2010-06-07T00:00:00Z", "2010-07-07T13:23:54Z",
-                              undefined, undefined, undefined).
+    Params = #{
+        start => <<"2010-06-07T00:00:00Z">>,
+        stop => <<"2010-07-07T13:23:54Z">>
+    },
+    stanza_lookup_messages_iq(P, Params).
 
 stanza_date_range_archive_request_not_empty(P, Start, Stop) ->
-    stanza_lookup_messages_iq(P, undefined,
-                              Start, Stop,
-                              undefined, undefined, undefined).
+    Params = #{
+        start => list_to_binary(Start),
+        stop => list_to_binary(Stop)
+    },
+    stanza_lookup_messages_iq(P, Params).
 
 stanza_limit_archive_request(P) ->
-    stanza_lookup_messages_iq(P, undefined, "2010-08-07T00:00:00Z",
-                              undefined, undefined, #rsm_in{max=10}, undefined).
+    Params = #{
+        start => <<"2010-08-07T00:00:00Z">>,
+        rsm => #rsm_in{max=10}
+    },
+    stanza_lookup_messages_iq(P, Params).
 
 stanza_page_archive_request(P, QueryId, RSM) ->
-    stanza_lookup_messages_iq(P, QueryId, undefined, undefined, undefined, RSM, undefined).
+    Params = #{
+        query_id => QueryId,
+        rsm => RSM
+    },
+    stanza_lookup_messages_iq(P, Params).
+
+stanza_flip_page_archive_request(P, QueryId, RSM) ->
+    Params = #{
+        query_id => QueryId,
+        rsm => RSM,
+        flip_page => true
+    },
+    stanza_lookup_messages_iq(P, Params).
 
 stanza_filtered_by_jid_request(P, BWithJID) ->
-    stanza_lookup_messages_iq(P, undefined, undefined,
-                              undefined, BWithJID, undefined, undefined).
+    Params = #{with_jid => BWithJID},
+    stanza_lookup_messages_iq(P, Params).
 
 stanza_text_search_archive_request(P, QueryId, TextSearch) ->
-    stanza_lookup_messages_iq(P, QueryId,
-                              undefined, undefined,
-                              undefined, undefined, TextSearch).
+    Params = #{
+        query_id => QueryId,
+        text_search => TextSearch
+    },
+    stanza_lookup_messages_iq(P, Params).
 
-stanza_lookup_messages_iq(P, QueryId, BStart, BEnd, BWithJID, RSM, TextSearch) ->
+stanza_include_groupchat_request(P, QueryId, IncludeGroupChat) ->
+    Params = #{
+        query_id => QueryId,
+        include_group_chat => IncludeGroupChat
+    },
+    stanza_lookup_messages_iq(P, Params).
+
+stanza_fetch_by_id_request(P, QueryId, IDs) ->
+    stanza_fetch_by_id_request(P, QueryId, IDs, undefined).
+
+stanza_fetch_by_id_request(P, QueryId, IDs, RSM) ->
+    Params = #{
+        query_id => QueryId,
+        messages_ids => IDs,
+        rsm => RSM
+    },
+    stanza_lookup_messages_iq(P, Params).
+
+stanza_lookup_messages_iq(P, Params) ->
+    QueryId = maps:get(query_id, Params, undefined),
+    BStart = maps:get(start, Params, undefined),
+    BEnd = maps:get(stop, Params, undefined),
+    BWithJID = maps:get(with_jid, Params, undefined),
+    RSM = maps:get(rsm, Params, undefined),
+    TextSearch = maps:get(text_search, Params, undefined),
+    FlipPage = maps:get(flip_page, Params, undefined),
+    IncludeGroupChat = maps:get(include_group_chat, Params, undefined),
+    MessagesIDs = maps:get(messages_ids, Params, undefined),
+
+    Attrs = mam_ns_attr(P),
     escalus_stanza:iq(<<"set">>, [#xmlel{
        name = <<"query">>,
-       attrs = mam_ns_attr(P)
-            ++ maybe_attr(<<"queryid">>, QueryId),
+       attrs = maybe_attr(<<"queryid">>, QueryId, Attrs),
        children = skip_undefined([
-           form_x(BStart, BEnd, BWithJID, RSM, TextSearch),
-           maybe_rsm_elem(RSM)])
+           form_x(BStart, BEnd, BWithJID, RSM, TextSearch, IncludeGroupChat, MessagesIDs),
+           maybe_rsm_elem(RSM),
+           maybe_flip_page(FlipPage)])
     }]).
 
-
-form_x(BStart, BEnd, BWithJID, RSM, TextSearch) ->
-    #xmlel{name = <<"x">>,
-           attrs = [{<<"xmlns">>, <<"jabber:x:data">>}],
-           children = skip_undefined([
-                form_field(<<"start">>, BStart),
-                form_field(<<"end">>, BEnd),
-                form_field(<<"with">>, BWithJID),
-                form_field(<<"full-text-search">>, TextSearch)]
-                ++ form_extra_fields(RSM)
-                ++ form_border_fields(RSM))}.
+form_x(undefined, undefined, undefined, undefined, undefined, undefined, undefined) ->
+    undefined;
+form_x(BStart, BEnd, BWithJID, RSM, TextSearch, IncludeGroupChat, MessagesIDs) ->
+    Fields = skip_undefined([form_field(<<"start">>, BStart),
+                             form_field(<<"end">>, BEnd),
+                             form_field(<<"with">>, BWithJID),
+                             form_field(<<"full-text-search">>, TextSearch),
+                             form_field(<<"include-groupchat">>, IncludeGroupChat),
+                             form_field(<<"ids">>, MessagesIDs)]
+                            ++ form_extra_fields(RSM)
+                            ++ form_border_fields(RSM)),
+    form_helper:form(#{fields => Fields}).
 
 form_extra_fields(undefined) ->
     [];
-form_extra_fields(#rsm_in{simple=Simple, opt_count=OptCount}) ->
-    [form_bool_field(<<"simple">>, Simple),
-     form_bool_field(<<"opt_count">>, OptCount)].
+form_extra_fields(#rsm_in{simple = Simple}) ->
+    [form_bool_field(<<"simple">>, Simple)].
 
 form_border_fields(undefined) ->
     [];
 form_border_fields(#rsm_in{
         before_id=BeforeId, after_id=AfterId, from_id=FromId, to_id=ToId}) ->
-    [form_field(<<"before_id">>, BeforeId),
-     form_field(<<"after_id">>, AfterId),
-     form_field(<<"from_id">>, FromId),
-     form_field(<<"to_id">>, ToId)].
+    [form_field(<<"before-id">>, BeforeId),
+     form_field(<<"after-id">>, AfterId),
+     form_field(<<"from-id">>, FromId),
+     form_field(<<"to-id">>, ToId)].
 
 form_field(_VarName, undefined) ->
     undefined;
+form_field(VarName, VarValues) when is_list(VarValues) ->
+    #{var => VarName, values => VarValues};
 form_field(VarName, VarValue) ->
-    #xmlel{name = <<"field">>, attrs = [{<<"var">>, VarName}],
-           children = [#xmlel{name = <<"value">>,
-                              children = [#xmlcdata{content = VarValue}]}]}.
+    #{var => VarName, values => [VarValue]}.
 
 form_bool_field(Name, true) ->
     form_field(Name, <<"true">>);
@@ -334,10 +338,10 @@ form_bool_field(_Name, _) ->
     undefined.
 
 stanza_retrieve_form_fields(QueryId, NS) ->
+    Attrs = #{<<"xmlns">> => NS},
     escalus_stanza:iq(<<"get">>, [#xmlel{
         name = <<"query">>,
-        attrs =     [{<<"xmlns">>, NS}]
-        ++ maybe_attr(<<"queryid">>, QueryId),
+        attrs = maybe_attr(<<"queryid">>, QueryId, Attrs),
         children = []
     }]).
 
@@ -349,6 +353,11 @@ maybe_rsm_elem(#rsm_in{max=Max, direction=Direction, id=Id, index=Index}) ->
                 maybe_rsm_max(Max),
                 maybe_rsm_index(Index),
                 maybe_rsm_direction(Direction, Id)])}.
+
+maybe_flip_page(undefined) ->
+    undefined;
+maybe_flip_page(_) ->
+    #xmlel{name = <<"flip-page">>}.
 
 rsm_id_children(undefined) -> [];
 rsm_id_children(Id) -> [#xmlcdata{content = Id}].
@@ -408,6 +417,16 @@ verify_archived_muc_light_aff_msg(Msg, AffUsersChanges, IsCreate) ->
     Items = exml_query:subelements(X, <<"user">>),
     muc_light_helper:verify_aff_users(Items, BinAffUsersChanges).
 
+verify_id_error_text_msg(Condition, Stanza) ->
+    Text = exml_query:path(Stanza, [{element, <<"error">>},
+                                    {element_with_ns, <<"text">>, stanzas_ns()}, cdata]),
+    case Condition of
+        [<<"modify">>, <<"not-acceptable">>] ->
+            ?assert_equal(<<"Invalid stanza ID provided">>, Text);
+        [<<"cancel">>, <<"item-not-found">>] ->
+            ?assert_equal(<<"Message with specified ID is not found">>, Text)
+    end.
+
 %% ----------------------------------------------------------------------
 %% PREFERENCE QUERIES
 
@@ -416,31 +435,31 @@ stanza_prefs_set_request(DefaultMode, AlwaysJIDs, NeverJIDs, Namespace) ->
                       children = encode_jids(AlwaysJIDs)},
     NeverEl  = #xmlel{name = <<"never">>,
                       children = encode_jids(NeverJIDs)},
+    Attrs = #{<<"xmlns">> => Namespace},
     escalus_stanza:iq(<<"set">>, [#xmlel{
        name = <<"prefs">>,
-       attrs = [{<<"xmlns">>, Namespace}]
-               ++ [{<<"default">>, DefaultMode} || is_def(DefaultMode)],
+       attrs = maybe_attr(<<"default">>, DefaultMode, Attrs),
        children = [AlwaysEl, NeverEl]
     }]).
 
 stanza_prefs_get_request(Namespace) ->
     escalus_stanza:iq(<<"get">>, [#xmlel{
        name = <<"prefs">>,
-       attrs = [{<<"xmlns">>, Namespace}]
+       attrs = #{<<"xmlns">> => Namespace}
     }]).
 
 stanza_query_get_request(Namespace) ->
     escalus_stanza:iq(<<"get">>, [#xmlel{
         name = <<"query">>,
-        attrs = [{<<"xmlns">>, Namespace}]
+        attrs = #{<<"xmlns">> => Namespace}
     }]).
 
 %% Allows to cdata to be put as it is
 encode_jids(JIDs) ->
     [encode_jid_or_cdata(JID) || JID <- JIDs].
 
-encode_jid_or_cdata({xmlcdata, Text}) ->
-    {xmlcdata, Text};
+encode_jid_or_cdata(#xmlcdata{content = Text}) ->
+    #xmlcdata{content = Text};
 encode_jid_or_cdata(JID) ->
     #xmlel{name = <<"jid">>,
            children = [#xmlcdata{content = JID}]}.
@@ -451,8 +470,8 @@ encode_jid_or_cdata(JID) ->
 parse_forwarded_message(#xmlel{name = <<"message">>,
                                attrs = Attrs, children = Children}) ->
     M = #forwarded_message{
-        from = proplists:get_value(<<"from">>, Attrs),
-        to   = proplists:get_value(<<"to">>, Attrs),
+        from = get_attr(<<"from">>, Attrs),
+        to   = get_attr(<<"to">>, Attrs),
         has_x_user_element = false},
     lists:foldl(fun parse_children_message/2, M, Children).
 
@@ -460,8 +479,8 @@ parse_children_message(#xmlel{name = <<"result">>,
                               attrs = Attrs,
                               children = Children}, M) ->
     M1 = M#forwarded_message{
-        result_queryid = proplists:get_value(<<"queryid">>, Attrs),
-        result_id      = proplists:get_value(<<"id">>, Attrs)},
+        result_queryid = get_attr(<<"queryid">>, Attrs),
+        result_id      = get_attr(<<"id">>, Attrs)},
     lists:foldl(fun parse_children_message_result/2, M1, Children).
 
 parse_children_message_result(#xmlel{name = <<"forwarded">>,
@@ -472,24 +491,24 @@ parse_children_message_result(#xmlel{name = <<"forwarded">>,
 parse_children_message_result_forwarded(#xmlel{name = <<"delay">>,
                                                attrs = Attrs}, M) ->
     M#forwarded_message{
-        delay_from  = proplists:get_value(<<"from">>, Attrs),
-        delay_stamp = proplists:get_value(<<"stamp">>, Attrs)};
+        delay_from  = get_attr(<<"from">>, Attrs),
+        delay_stamp = get_attr(<<"stamp">>, Attrs)};
 parse_children_message_result_forwarded(#xmlel{name = <<"message">>,
                                                attrs = Attrs,
                                                children = Children}, M) ->
     M1 = M#forwarded_message{
-        message_to   = proplists:get_value(<<"to">>, Attrs),
-        message_from = proplists:get_value(<<"from">>, Attrs),
-        message_type = proplists:get_value(<<"type">>, Attrs)},
+        message_to   = get_attr(<<"to">>, Attrs),
+        message_from = get_attr(<<"from">>, Attrs),
+        message_type = get_attr(<<"type">>, Attrs)},
     lists:foldl(fun parse_children_message_result_forwarded_message/2,
                 M1, Children).
 
 parse_children_message_result_forwarded_message(#xmlel{name = <<"body">>,
-                                                       children = [{xmlcdata, Body}]}, M) ->
+                                                       children = [#xmlcdata{content =  Body}]}, M) ->
     M#forwarded_message{message_body = Body};
 parse_children_message_result_forwarded_message(#xmlel{name = <<"x">>,
                                                        attrs = Attrs} = XEl, M) ->
-    IsUser = lists:member({<<"xmlns">>, <<"http://jabber.org/protocol/muc#user">>}, Attrs),
+    IsUser = get_attr(<<"xmlns">>, Attrs) =:= <<"http://jabber.org/protocol/muc#user">>,
     M#forwarded_message{has_x_user_element = IsUser,
                         message_xs = [XEl | M#forwarded_message.message_xs]};
 %% Parse `<archived />' or chat markers.
@@ -508,30 +527,20 @@ message_id(Num, Config) ->
     #forwarded_message{result_id=Id} = lists:nth(Num, AllMessages),
     Id.
 
-%% @doc Result query iq.
-%%
-%% [{xmlel,<<"iq">>,
-%%     [{<<"from">>,<<"alice@localhost">>},
-%%      {<<"to">>,<<"alice@localhost/res1">>},
-%%      {<<"id">>,<<"387862024ce65379b049e19751e4309e">>},
-%%      {<<"type">>,<<"result">>}],
-%%     []}]
-%%
-%%
-%%  [{xmlel,<<"iq">>,
-%%       [{<<"from">>,<<"alice@localhost">>},
-%%        {<<"to">>,<<"alice@localhost/res1">>},
-%%        {<<"id">>,<<"c256a18c4b720465e215a81362d41eb7">>},
-%%        {<<"type">>,<<"result">>}],
-%%       [{xmlel,<<"query">>,
-%%            [{<<"xmlns">>,<<"urn:xmpp:mam:tmp">>}],
-%%            [{xmlel,<<"set">>,
-%%                 [{<<"xmlns">>,<<"http://jabber.org/protocol/rsm">>}],
-%%                 [{xmlel,<<"first">>,
-%%                      [{<<"index">>,<<"10">>}],
-%%                      [{xmlcdata,<<"103439">>}]},
-%%                  {xmlel,<<"last">>,[],[{xmlcdata,<<"103447">>}]},
-%%                  {xmlel,<<"count">>,[],[{xmlcdata,<<"15">>}]}]}]}]}]
+get_pre_generated_msgs_ids(Msgs, Nums) ->
+    lists:map(fun(N) ->
+                 Msg = lists:nth(N, Msgs),
+                 {{MsgID, _}, _, _, _, _} = Msg,
+                 rpc_apply(mod_mam_utils, mess_id_to_external_binary, [MsgID])
+              end, Nums).
+
+get_received_msgs_ids(Response) ->
+    Msgs = respond_messages(Response),
+    lists:map(fun(M) ->
+                 Parsed = parse_forwarded_message(M),
+                 Parsed#forwarded_message.result_id
+              end, Msgs).
+
 parse_result_iq(#mam_archive_respond{respond_iq = IQ, respond_fin = undefined}) ->
     Fin = exml_query:subelement(IQ, <<"fin">>),
     Set = exml_query:subelement(Fin, <<"set">>),
@@ -553,8 +562,8 @@ parse_set_and_iq(IQ, Set, QueryId, Complete) ->
         count       = maybe_binary_to_integer(exml_query:path(Set, [{element, <<"count">>},
                                                                     cdata]))}.
 
-is_def(X) -> X =/= undefined.
-
+get_attr(Key, Attrs) ->
+    maps:get(Key, Attrs, undefined).
 
 parse_prefs_result_iq(#xmlel{name = <<"iq">>, children = Children}) ->
     IQ = #prefs_result_iq{},
@@ -563,7 +572,7 @@ parse_prefs_result_iq(#xmlel{name = <<"iq">>, children = Children}) ->
 parse_children_prefs_iq(#xmlel{name = <<"prefs">>,
                                attrs = Attrs, children = Children},
                         IQ) ->
-    DefaultMode = proplists:get_value(<<"default">>, Attrs),
+    DefaultMode = get_attr(<<"default">>, Attrs),
     IQ1 = IQ#prefs_result_iq{default_mode = DefaultMode},
     lists:foldl(fun parse_children_prefs_iq_prefs/2, IQ1, Children).
 
@@ -580,7 +589,7 @@ parse_children_prefs_iq_prefs(#xmlel{name = <<"never">>,
 
 parse_jids(Els) ->
     [escalus_utils:jid_to_lower(JID) %% MongooseIM normalizes JIDs
-     || #xmlel{name = <<"jid">>, children = [{xmlcdata, JID}]} <- Els].
+     || #xmlel{name = <<"jid">>, children = [#xmlcdata{content = JID}]} <- Els].
 
 %%--------------------------------------------------------------------
 %% Helpers (muc)
@@ -616,6 +625,7 @@ send_muc_rsm_messages(Config) ->
     Room = ?config(room, Config),
     RoomAddr = room_address(Room),
     P = ?config(props, Config),
+    N = 15,
     F = fun(Alice, Bob) ->
         escalus:send(Alice, stanza_muc_enter_room(Room, nick(Alice))),
         escalus:send(Bob, stanza_muc_enter_room(Room, nick(Bob))),
@@ -624,21 +634,19 @@ send_muc_rsm_messages(Config) ->
         escalus:wait_for_stanzas(Alice, 3),
 
         %% Alice sends messages to Bob.
-        lists:foreach(fun(N) ->
+        lists:foreach(fun(NN) ->
                               escalus:send(Alice, escalus_stanza:groupchat_to(
-                                                    RoomAddr, generate_message_text(N)))
-                      end, lists:seq(1, 15)),
-        %% Bob is waiting for 15 messages for 5 seconds.
-        escalus:wait_for_stanzas(Bob, 15, 5000),
-        escalus:wait_for_stanzas(Alice, 15, 5000),
+                                                    RoomAddr, generate_message_text(NN)))
+                      end, lists:seq(1, N)),
+        assert_list_size(N, escalus:wait_for_stanzas(Bob, N)),
+        assert_list_size(N, escalus:wait_for_stanzas(Alice, N)),
+        wait_for_room_archive_size(muc_host(), Room, N),
 
-        maybe_wait_for_archive(Config),
-
-        %% Get whole history.
+        %% Get the whole history.
         escalus:send(Alice,
             stanza_to_room(stanza_archive_request(P, <<"all_room_messages">>), Room)),
         AllMessages =
-            respond_messages(assert_respond_size(15, wait_archive_respond(Alice))),
+            respond_messages(assert_respond_size(N, wait_archive_respond(Alice))),
         ParsedMessages = [parse_forwarded_message(M) || M <- AllMessages],
         Pid ! {parsed_messages, ParsedMessages},
         ok
@@ -652,20 +660,21 @@ send_muc_rsm_messages(Config) ->
     [{all_messages, ParsedMessages}|Config].
 
 send_rsm_messages(Config) ->
+    N = 15,
     Pid = self(),
-    %%    Room = ?config(room, Config),
     P = ?config(props, Config),
     F = fun(Alice, Bob) ->
                 %% Alice sends messages to Bob.
                 [escalus:send(Alice,
-                              escalus_stanza:chat_to(Bob, generate_message_text(N))) || N <- lists:seq(1, 15)],
-                %% Bob is waiting for 15 messages for 5 seconds.
-                escalus:wait_for_stanzas(Bob, 15, 5000),
-                maybe_wait_for_archive(Config),
-                %% Get whole history.
+                              escalus_stanza:chat_to(Bob, generate_message_text(K)))
+                 || K <- lists:seq(1, N)],
+                assert_list_size(N, escalus:wait_for_stanzas(Bob, N)),
+                wait_for_archive_size(Alice, N),
+
+                %% Get the whole history.
                 rsm_send(Config, Alice, stanza_archive_request(P, <<"all_messages">>)),
-                AllMessages =
-                respond_messages(assert_respond_size(15, wait_archive_respond(Alice))),
+                AllMessages = respond_messages(
+                                assert_respond_size(N, wait_archive_respond(Alice))),
                 ParsedMessages = [parse_forwarded_message(M) || M <- AllMessages],
                 Pid ! {parsed_messages, ParsedMessages},
                 ok
@@ -678,16 +687,32 @@ send_rsm_messages(Config) ->
     escalus:end_per_testcase(pre_rsm, Config1),
     [{all_messages, ParsedMessages}|Config].
 
+prepare_for_suite(Config) ->
+    Loaded = is_module_loaded(mod_offline),
+    [{mod_offline_loaded, Loaded}|Config].
+
+is_module_loaded(Mod) ->
+    rpc(mim(), gen_mod, is_loaded, [host_type(), Mod]).
+
 clean_archives(Config) ->
     SUs = serv_users(Config),
     %% It is not the best place to delete these messages.
-    [ok = delete_offline_messages(S, U) || {S, U} <- SUs],
+    case ?config(mod_offline_loaded, Config) of
+        true ->
+            [ok = delete_offline_messages(S, U) || {S, U} <- SUs];
+        false ->
+            ok
+    end,
+    %% Wait until messages are flushed before removing them
+    wait_for_parallel_writer(Config),
     [ok = delete_archive(S, U) || {S, U} <- SUs],
     %% Wait for archive to be empty
     [wait_for_archive_size(S, U, 0) || {S, U} <- SUs],
     Config.
 
 destroy_room(Config) ->
+    %% Wait until messages are flushed before removing them
+    wait_for_parallel_writer(Config),
     clean_room_archive(Config),
     muc_helper:destroy_room(Config).
 
@@ -699,8 +724,8 @@ clean_room_archive(Config) ->
     Config.
 
 serv_users(Config) ->
-    [serv_user(Config, UserSpec)
-     || {_, UserSpec} <- escalus_users:get_users(all)].
+    Users = ?config(escalus_users, Config),
+    [serv_user(Config, UserSpec) || {_Tag, UserSpec} <- Users].
 
 serv_user(Config, UserSpec) ->
     [Username, Server, _Pass] = escalus_users:get_usp(Config, UserSpec),
@@ -713,20 +738,35 @@ wait_for_archive_size(User, ExpectedSize) ->
       ExpectedSize).
 
 wait_for_archive_size(Server, Username, ExpectedSize) ->
-    mongoose_helper:wait_until(fun() -> archive_size(Server, Username) end,
+    wait_helper:wait_until(fun() -> archive_size(Server, Username) end,
+                           ExpectedSize,
+                           #{
+                             time_left => timer:seconds(20),
+                             name => archive_size
+                            }).
+
+wait_for_archive_size_with_host_type(HostType, User, ExpectedSize) ->
+    wait_for_archive_size_with_host_type(
+      HostType,
+      escalus_utils:get_server(User),
+      escalus_utils:jid_to_lower(escalus_utils:get_username(User)),
+      ExpectedSize).
+
+wait_for_archive_size_with_host_type(HostType, Server, Username, ExpectedSize) ->
+    F = fun() -> archive_size_with_host_type(HostType, Server, Username) end,
+    wait_helper:wait_until(F, ExpectedSize,
+                           #{
+                             time_left => timer:seconds(20),
+                             name => archive_size_with_host_type
+                            }).
+
+wait_for_archive_size_or_warning(Server, Username, ExpectedSize) ->
+    try wait_helper:wait_until(fun() -> archive_size(Server, Username) end,
                                ExpectedSize,
                                #{
                                  time_left => timer:seconds(20),
                                  name => archive_size
-                                }).
-
-wait_for_archive_size_or_warning(Server, Username, ExpectedSize) ->
-    try mongoose_helper:wait_until(fun() -> archive_size(Server, Username) end,
-                                   ExpectedSize,
-                                   #{
-                                     time_left => timer:seconds(20),
-                                     name => archive_size
-                                    }) of
+                                }) of
         {ok, ExpectedSize} ->
             ok
     catch
@@ -736,35 +776,51 @@ wait_for_archive_size_or_warning(Server, Username, ExpectedSize) ->
     end.
 
 wait_for_room_archive_size(Server, Username, ExpectedSize) ->
-    {ok, ExpectedSize} = mongoose_helper:wait_until(fun() -> room_archive_size(Server, Username) end,
-                                                    ExpectedSize,
-                                                    #{
-                                                        time_left => timer:seconds(20),
-                                                        name => room_archive_size
-                                                    }).
+    {ok, ExpectedSize} = wait_helper:wait_until(fun() -> room_archive_size(Server, Username) end,
+                                                ExpectedSize,
+                                                #{
+                                                  time_left => timer:seconds(20),
+                                                  name => room_archive_size
+                                                 }).
 
 
 archive_size(Server, Username) ->
-    rpc_apply(mod_mam, archive_size, [Server, Username]).
+    rpc_apply(mod_mam_pm, archive_size, [Server, Username]).
+
+archive_size_with_host_type(HostType, Server, Username) ->
+    rpc_apply(mod_mam_pm, archive_size_with_host_type, [HostType, Server, Username]).
 
 room_archive_size(Server, Username) ->
     rpc_apply(mod_mam_muc, archive_size, [Server, Username]).
 
 delete_archive(Server, Username) ->
-    rpc_apply(mod_mam, delete_archive, [Server, Username]).
+    ArcJID = jid:make_bare(Username, Server),
+    rpc_apply(mod_mam_pm, delete_archive, [ArcJID]).
 
 delete_room_archive(Server, Username) ->
     rpc_apply(mod_mam_muc, delete_archive, [Server, Username]).
 
 delete_offline_messages(Server, Username) ->
-    %% Do not care
-    catch rpc_apply(mod_offline, remove_user, [Username, Server]),
-    ok.
+    HostType = domain_helper:host_type(),
+    rpc_apply(mod_offline_backend, remove_user, [HostType, Username, Server]).
 
-wait_message_range(Client, FromN, ToN) ->
-    wait_message_range(Client, 15, FromN-1, FromN, ToN).
+wait_message_range(Client, FromN, ToN) when FromN =< ToN ->
+    wait_message_range(Client, 15, FromN-1, FromN, ToN, 1);
+wait_message_range(Client, FromN, ToN) when FromN > ToN ->
+    wait_message_range(Client, 15, FromN-1, FromN, ToN, -1).
 
-wait_message_range(Client, TotalCount, Offset, FromN, ToN) ->
+wait_message_range(Client, TotalCount, Offset, FromN, ToN) when FromN =< ToN ->
+    wait_message_range(Client, TotalCount, Offset, FromN, ToN, 1);
+wait_message_range(Client, TotalCount, Offset, FromN, ToN) when FromN > ToN ->
+    wait_message_range(Client, TotalCount, Offset, FromN, ToN, -1).
+
+wait_message_range(Client, TotalCount, Offset, FromN, ToN, Step) ->
+    wait_message_range(Client, #{total_count => TotalCount, offset => Offset,
+                                 from => FromN, to => ToN, step => Step}).
+
+wait_message_range(Client, Params = #{total_count := TotalCount, offset := Offset,
+                                      from := FromN, to := ToN, step := Step}) ->
+    IsComplete = maps:get(is_complete, Params, undefined),
     Result = wait_archive_respond(Client),
     Messages = respond_messages(Result),
     IQ = respond_iq(Result),
@@ -773,10 +829,18 @@ wait_message_range(Client, TotalCount, Offset, FromN, ToN) ->
     ParsedIQ = parse_result_iq(Result),
     try
         ?assert_equal(TotalCount, ParsedIQ#result_iq.count),
-        ?assert_equal(Offset, ParsedIQ#result_iq.first_index),
+        case Step of
+            -1 -> ok;
+            _ -> ?assert_equal(Offset, ParsedIQ#result_iq.first_index)
+        end,
         %% Compare body of the messages.
-        ?assert_equal([generate_message_text(N) || N <- lists:seq(FromN, ToN)],
+        ?assert_equal([generate_message_text(N) || N <- maybe_seq(FromN, ToN, Step)],
                       [B || #forwarded_message{message_body=B} <- ParsedMessages]),
+        case IsComplete of
+            true      -> ?assert_equal(<<"true">>, ParsedIQ#result_iq.complete);
+            false     -> ?assert_equal(<<"false">>, ParsedIQ#result_iq.complete);
+            undefined -> ok
+        end,
         ok
     catch Class:Reason:StackTrace ->
         ct:pal("IQ: ~p~n"
@@ -787,6 +851,8 @@ wait_message_range(Client, TotalCount, Offset, FromN, ToN) ->
         erlang:raise(Class, Reason, StackTrace)
     end.
 
+maybe_seq(undefined, undefined, _) -> [];
+maybe_seq(A, B, Step) -> lists:seq(A, B, Step).
 
 wait_empty_rset(Alice, TotalCount) ->
     Result = wait_archive_respond(Alice),
@@ -809,7 +875,6 @@ parse_messages(Messages) ->
     end.
 
 bootstrap_archive(Config) ->
-    random:seed(os:timestamp()),
     AliceJID    = escalus_users:get_jid(Config, alice),
     BobJID      = escalus_users:get_jid(Config, bob),
     CarolJID    = escalus_users:get_jid(Config, carol),
@@ -820,11 +885,11 @@ bootstrap_archive(Config) ->
     BobServer   = escalus_users:get_server(Config, bob),
     CarolServer = escalus_users:get_server(Config, carol),
     ArcJID = {AliceJID, make_jid(AliceName, AliceServer, <<>>),
-              rpc_apply(mod_mam, archive_id, [AliceServer, AliceName])},
+              get_archive_id(AliceServer, AliceName)},
     OtherUsers = [{BobJID, make_jid(BobName, BobServer, <<>>),
-                   rpc_apply(mod_mam, archive_id, [BobServer, BobName])},
+                   get_archive_id(BobServer, BobName)},
                   {CarolJID, make_jid(CarolName, CarolServer, <<>>),
-                   rpc_apply(mod_mam, archive_id, [CarolServer, CarolName])}],
+                   get_archive_id(CarolServer, CarolName)}],
     Msgs = generate_msgs_for_days(ArcJID, OtherUsers, 16),
     put_msgs(Msgs),
     AllUsers = [{AliceServer, AliceName},
@@ -868,20 +933,21 @@ generate_msgs_for_day(Day, OwnerJID, OtherUsers) ->
      || RemoteJID <- OtherUsers].
 
 generate_msg_for_date_user(Owner, Remote, DateTime) ->
-    generate_msg_for_date_user(Owner, Remote, DateTime, base16:encode(crypto:strong_rand_bytes(4))).
+    generate_msg_for_date_user(Owner, Remote, DateTime, random_text()).
+
+random_text() ->
+    binary:encode_hex(crypto:strong_rand_bytes(4)).
 
 generate_msg_for_date_user(Owner, {RemoteBin, _, _} = Remote, DateTime, Content) ->
-    MicrosecDateTime = datetime_to_microseconds(DateTime),
-    NowMicro = rpc_apply(erlang, system_time, [microsecond]),
-    Microsec = min(NowMicro, MicrosecDateTime),
-    MsgIdOwner = rpc_apply(mod_mam_utils, encode_compact_uuid, [Microsec, random:uniform(20)]),
-    MsgIdRemote = rpc_apply(mod_mam_utils, encode_compact_uuid, [Microsec+1, random:uniform(20)]),
+    Microsec = datetime_to_microseconds(DateTime),
+    MsgIdOwner = rpc_apply(mod_mam_utils, encode_compact_uuid, [Microsec, rand:uniform(20)]),
+    MsgIdRemote = rpc_apply(mod_mam_utils, encode_compact_uuid, [Microsec+1, rand:uniform(20)]),
     Packet = escalus_stanza:chat_to(RemoteBin, Content),
     {{MsgIdOwner, MsgIdRemote}, Owner, Remote, Owner, Packet}.
 
 random_time() ->
     MaxSecondsInDay = 86399,
-    RandSeconds = random:uniform(MaxSecondsInDay),
+    RandSeconds = rand:uniform(MaxSecondsInDay),
     calendar:seconds_to_time(RandSeconds).
 
 datetime_to_microseconds({{_, _, _}, {_, _, _}} = DateTime) ->
@@ -898,14 +964,17 @@ put_msg({{MsgIdOwner, MsgIdRemote},
          {_FromBin, FromJID, FromArcID},
          {_ToBin, ToJID, ToArcID},
          {_, Source, _}, Packet}) ->
-    Host = ct:get_config({hosts, mim, domain}),
-    archive_message([Host, MsgIdOwner, FromArcID, FromJID, ToJID, Source, none, outgoing, Packet]),
-    archive_message([Host, MsgIdRemote, ToArcID, ToJID, FromJID, Source, none, incoming, Packet]).
+    Map1 = #{message_id => MsgIdOwner, archive_id => FromArcID,
+             local_jid => FromJID, remote_jid => ToJID, source_jid => Source,
+             origin_id => none, direction => outgoing, packet => Packet, is_groupchat => false},
+    Map2 = #{message_id => MsgIdRemote, archive_id => ToArcID,
+             local_jid => ToJID, remote_jid => FromJID, source_jid => Source,
+             origin_id => none, direction => incoming, packet => Packet, is_groupchat => false},
+    archive_message(Map1),
+    archive_message(Map2).
 
-archive_message(Args) ->
-    rpc_apply(mod_mam, archive_message, Args).
-
-
+archive_message(#{} = Map) ->
+    ok = rpc_apply(mod_mam_pm, archive_message_from_ct, [Map]).
 
 muc_bootstrap_archive(Config) ->
     Room = ?config(room, Config),
@@ -923,8 +992,7 @@ muc_bootstrap_archive(Config) ->
 
     Domain = muc_host(),
     RoomJid = make_jid(Room, Domain, <<>>),
-    ArcJID = {R, RoomJid,
-              rpc_apply(mod_mam_muc, archive_id, [Domain, Room])},
+    ArcJID = {R, RoomJid, get_muc_archive_id(Domain, Room)},
     Msgs = generate_msgs_for_days(ArcJID,
                                  [{B, make_jid(BobName, BobServer, <<"res1">>),
                                   rpc_apply(jid, replace_resource, [RoomJid, BobNick])},
@@ -941,14 +1009,25 @@ muc_bootstrap_archive(Config) ->
      {bob_nickname, BobNick} | Config].
 
 put_muc_msgs(Msgs) ->
-    Host = host(),
-    [archive_muc_msg(Host, Msg) || Msg <- Msgs].
+    [archive_muc_msg(Msg) || Msg <- Msgs].
 
-archive_muc_msg(Host, {{MsgID, _},
+archive_muc_msg({{MsgID, _},
                 {_RoomBin, RoomJID, RoomArcID},
                 {_FromBin, FromJID, SrcJID}, _, Packet}) ->
-    rpc_apply(mod_mam_muc, archive_message, [Host, MsgID, RoomArcID, RoomJID,
-                                             FromJID, SrcJID, none, incoming, Packet]).
+    rpc_apply(mod_mam_muc, archive_message_for_ct, [#{message_id => MsgID,
+                                                     archive_id => RoomArcID,
+                                                     local_jid => RoomJID,
+                                                     remote_jid => FromJID,
+                                                     source_jid => SrcJID,
+                                                     origin_id => none,
+                                                     direction => incoming,
+                                                     packet => Packet}]).
+
+get_archive_id(Server, User) ->
+    rpc_apply(mod_mam_pm, archive_id, [Server, User]).
+
+get_muc_archive_id(MucHost, Room) ->
+    rpc_apply(mod_mam_muc, archive_id, [MucHost, Room]).
 
 %% @doc Get a binary jid of the user, that tagged with `UserName' in the config.
 nick_to_jid(UserName, Config) when is_atom(UserName) ->
@@ -958,9 +1037,9 @@ nick_to_jid(UserName, Config) when is_atom(UserName) ->
 make_jid(U, S, R) ->
     mongoose_helper:make_jid(U, S, R).
 
--spec backend() -> rdbms | riak | cassandra | false.
+-spec backend() -> rdbms | cassandra | disabled.
 backend() ->
-    Funs = [fun maybe_rdbms/1, fun maybe_riak/1, fun maybe_cassandra/1],
+    Funs = [fun maybe_rdbms/1, fun maybe_cassandra/1],
     determine_backend(host(), Funs).
 
 determine_backend(_, []) ->
@@ -981,14 +1060,6 @@ maybe_rdbms(Host) ->
             false
     end.
 
-maybe_riak(Host) ->
-    case is_riak_enabled(Host) of
-        true ->
-            riak;
-        _ ->
-            false
-    end.
-
 maybe_cassandra(Host) ->
     case is_cassandra_enabled(Host) of
         true ->
@@ -998,17 +1069,9 @@ maybe_cassandra(Host) ->
     end.
 
 is_mam_possible(Host) ->
-    mongoose_helper:is_rdbms_enabled(Host) orelse is_riak_enabled(Host) orelse
-    is_cassandra_enabled(Host) orelse is_elasticsearch_enabled(Host).
-
-%% TODO create mongoose_riak:get_status() for cleaner checks, same for cassandra and elasticsearch
-is_riak_enabled(_Host) ->
-    case catch rpc(mim(), mongoose_riak, list_buckets, [<<"default">>]) of
-        {ok, _} ->
-            true;
-        _ ->
-            false
-    end.
+    mongoose_helper:is_rdbms_enabled(Host) orelse
+    is_cassandra_enabled(Host) orelse
+    is_elasticsearch_enabled(Host).
 
 is_cassandra_enabled(_) ->
     is_cassandra_enabled().
@@ -1031,12 +1094,27 @@ login_send_presence(Config, User) ->
     Client.
 
 maybe_wait_for_archive(Config) ->
+    wait_for_parallel_writer(Config),
     case ?config(archive_wait, Config) of
         undefined ->
             ok;
         Value ->
             timer:sleep(Value)
     end.
+
+wait_for_parallel_writer(Config) ->
+    case ?config(wait_for_parallel_writer, Config) of
+        undefined ->
+            ok;
+        Types ->
+            HostType = domain_helper:host_type(),
+            [wait_for_parallel_writer(Type, HostType) || Type <- Types]
+    end.
+
+wait_for_parallel_writer(pm, HostType) ->
+    rpc(mim(), mongoose_hooks, mam_archive_sync, [HostType]);
+wait_for_parallel_writer(muc, HostType) ->
+    rpc(mim(), mongoose_hooks, mam_muc_archive_sync, [HostType]).
 
 %% Bob and Alice are friends.
 %% Kate and Alice are not friends.
@@ -1080,6 +1158,36 @@ prefs_cases2() ->
      {{always, [], [bob, kate]},     [false, false, false, false]}
     ].
 
+prefs_cases2_muc() ->
+    [
+     {{roster, [], []},              [true, true, true, true]},
+     {{roster, [bob], []},           [true, true, true, true]},
+     {{roster, [kate], []},          [true, true, true, true]},
+     {{roster, [kate, bob], []},     [true, true, true, true]},
+
+     {{roster, [], [bob]},           [false, true, true, true]},
+     {{roster, [], [kate]},          [true, true, false, true]},
+     {{roster, [], [bob, kate]},     [false, true, false, true]},
+
+     {{never, [], []},              [false, false, false, false]},
+     {{never, [bob], []},           [true, false, false, false]},
+     {{never, [kate], []},          [false, false, true, false]},
+     {{never, [kate, bob], []},     [true, false, true, false]},
+
+     {{never, [], [bob]},           [false, false, false, false]},
+     {{never, [], [kate]},          [false, false, false, false]},
+     {{never, [], [bob, kate]},     [false, false, false, false]},
+
+     {{always, [], []},              [true, true, true, true]},
+     {{always, [bob], []},           [true, true, true, true]},
+     {{always, [kate], []},          [true, true, true, true]},
+     {{always, [kate, bob], []},     [true, true, true, true]},
+
+     {{always, [], [bob]},           [false, true, true, true]},
+     {{always, [], [kate]},          [true, true, false, true]},
+     {{always, [], [bob, kate]},     [false, true, false, true]}
+    ].
+
 default_policy({{Default, _, _}, _}) -> Default.
 
 make_alice_and_bob_friends(Alice, Bob) ->
@@ -1105,6 +1213,8 @@ make_alice_and_bob_friends(Alice, Bob) ->
                                                 % presence
         ok.
 
+%% Alice and Bob are friends.
+%% Alice and Kate are not friends.
 run_prefs_case({PrefsState, ExpectedMessageStates}, Namespace, Alice, Bob, Kate, Config) ->
     {DefaultMode, AlwaysUsers, NeverUsers} = PrefsState,
     IqSet = stanza_prefs_set_request({DefaultMode, AlwaysUsers, NeverUsers, Namespace}, Config),
@@ -1121,9 +1231,47 @@ run_prefs_case({PrefsState, ExpectedMessageStates}, Namespace, Alice, Bob, Kate,
     escalus:send(Alice, escalus_stanza:chat_to(Bob, lists:nth(2, Messages))),
     escalus:send(Kate, escalus_stanza:chat_to(Alice, lists:nth(3, Messages))),
     escalus:send(Alice, escalus_stanza:chat_to(Kate, lists:nth(4, Messages))),
-    escalus:wait_for_stanzas(Bob, 1, 5000),
-    escalus:wait_for_stanzas(Kate, 1, 5000),
-    escalus:wait_for_stanzas(Alice, 2, 5000),
+    [M1] = escalus:wait_for_stanzas(Bob, 1, 5000),
+    [M2] = escalus:wait_for_stanzas(Kate, 1, 5000),
+    [M3, M4] = escalus:wait_for_stanzas(Alice, 2, 5000),
+    [escalus:assert(is_message, Message) || Message <- [M1, M2, M3, M4]],
+    %% Delay check
+    fun(Bodies) ->
+        ActualMessageStates = [lists:member(M, Bodies) || M <- Messages],
+        Debug = make_debug_prefs(ExpectedMessageStates, ActualMessageStates),
+        ?_assert_equal_extra(ExpectedMessageStates, ActualMessageStates,
+                             #{prefs_state => PrefsState,
+                               debug => Debug,
+                               bob_receives => [M1],
+                               kate_receives => [M2],
+                               alice_receives => [M3, M4]})
+    end.
+
+muc_run_prefs_case({PrefsState, ExpectedMessageStates}, Namespace, Alice, Bob, Kate, Config) ->
+    Room = ?config(room, Config),
+    RoomAddr = room_address(Room),
+
+    {DefaultMode, AlwaysUsers, NeverUsers} = PrefsState,
+    IqSet = stanza_prefs_set_request_muc({DefaultMode, AlwaysUsers, NeverUsers, Namespace}, Config),
+    escalus:send(Alice, stanza_to_room(IqSet, Room)),
+    _ReplySet = escalus:wait_for_stanza(Alice),
+
+    Messages = [iolist_to_binary(io_lib:format("n=~p, prefs=~p, now=~p",
+                                               [N, PrefsState, os:timestamp()]))
+                || N <- [1, 2, 3, 4]],
+
+    escalus:send(Bob, escalus_stanza:groupchat_to(RoomAddr, lists:nth(1,Messages))),
+    escalus:wait_for_stanza(Alice),
+
+    escalus:send(Alice, escalus_stanza:groupchat_to(RoomAddr, lists:nth(2,Messages))),
+    escalus:wait_for_stanza(Alice),
+
+    escalus:send(Kate, escalus_stanza:groupchat_to(RoomAddr, lists:nth(3,Messages))),
+    escalus:wait_for_stanza(Alice),
+
+    escalus:send(Alice, escalus_stanza:groupchat_to(RoomAddr, lists:nth(4,Messages))),
+    escalus:wait_for_stanza(Alice),
+
     %% Delay check
     fun(Bodies) ->
         ActualMessageStates = [lists:member(M, Bodies) || M <- Messages],
@@ -1172,6 +1320,16 @@ stanza_prefs_set_request({DefaultMode, AlwaysUsers, NeverUsers, Namespace}, Conf
     NeverJIDs  = users_to_jids(NeverUsers, Config),
     stanza_prefs_set_request(DefaultModeBin, AlwaysJIDs, NeverJIDs, Namespace).
 
+stanza_prefs_set_request_muc({DefaultMode, AlwaysUsers, NeverUsers, Namespace}, Config) ->
+    DefaultModeBin = atom_to_binary(DefaultMode, utf8),
+    AlwaysJIDs = users_to_nick(AlwaysUsers, Config),
+    NeverJIDs  = users_to_nick(NeverUsers, Config),
+    stanza_prefs_set_request(DefaultModeBin, AlwaysJIDs, NeverJIDs, Namespace).
+
+users_to_nick(Users, Config) ->
+    Room = ?config(room, Config),
+    [muc_helper:room_address(Room, string:lowercase(nick(escalus_users:get_jid(Config, User)))) || User <- Users].
+
 users_to_jids(Users, Config) ->
     [escalus_users:get_jid(Config, User) || User <- Users].
 
@@ -1201,21 +1359,29 @@ maybe_binary_to_integer(B) when is_binary(B) ->
 maybe_binary_to_integer(undefined) ->
     undefined.
 
-add_nostore_hint(#xmlel{children=Children}=Elem) ->
-    Elem#xmlel{children=Children ++ [nostore_hint_elem()]}.
+add_store_hint(#xmlel{children=Children}=Elem) ->
+    Elem#xmlel{children=Children ++ [hint_elem(store)]}.
 
-nostore_hint_elem() ->
-    #xmlel{name = <<"no-store">>, attrs = [{<<"xmlns">>, <<"urn:xmpp:hints">>}]}.
+add_nostore_hint(#xmlel{children=Children}=Elem) ->
+    Elem#xmlel{children=Children ++ [hint_elem(no_store)]}.
+
+hint_elem(store) ->
+    #xmlel{name = <<"store">>, attrs = #{<<"xmlns">> => <<"urn:xmpp:hints">>}};
+hint_elem(no_store) ->
+    #xmlel{name = <<"no-store">>, attrs = #{<<"xmlns">> => <<"urn:xmpp:hints">>}}.
 
 has_x_user_element(ArcMsg) ->
     ParsedMess = parse_forwarded_message(ArcMsg),
     ParsedMess#forwarded_message.has_x_user_element.
 
 muc_light_host() ->
-    <<"muclight.localhost">>.
+    muc_light_helper:muc_host().
 
 host() ->
     ct:get_config({hosts, mim, domain}).
+
+host_type() ->
+    domain_helper:host_type().
 
 room_name(Config) ->
     AliceName   = escalus_users:get_username(Config, alice),
@@ -1231,3 +1397,82 @@ rewrite_nodename($<) -> <<>>;
 rewrite_nodename($>) -> <<>>;
 rewrite_nodename($.) -> <<"-">>;
 rewrite_nodename(X)  -> <<X>>.
+
+assert_list_size(N, List) when N =:= length(List) -> List.
+
+%% Assertions for instrumentation events
+
+assert_archive_message_event(EventName, BinJid) ->
+    instrument_helper:assert_one(
+      EventName, labels(),
+      fun(#{count := 1, time := T, params := #{local_jid := LocalJid}}) ->
+              eq_bjid(LocalJid, BinJid) andalso pos_int(T)
+      end).
+
+assert_lookup_event(EventName, BinJid) ->
+    instrument_helper:assert_one(
+      EventName, labels(),
+      fun(#{count := 1, size := 1, time := T, params := #{caller_jid := CallerJid}}) ->
+              eq_bjid(CallerJid, BinJid) andalso pos_int(T)
+      end).
+
+%% The event might originate from a different test case running in parallel,
+%% but there is no easy way around it other than adding all flushed messages to measurements.
+assert_flushed_event_if_async(EventName, Config) ->
+    case ?config(configuration, Config) of
+        C when C =:= rdbms_async_pool;
+               C =:= rdbms_async_cache ->
+            instrument_helper:assert(
+              EventName, labels(),
+              fun(#{count := Count, time := T, time_per_message := T1}) ->
+                      pos_int(Count) andalso pos_int(T) andalso pos_int(T1) andalso T >= T1
+              end);
+        _ ->
+            ok
+    end.
+
+assert_async_batch_flush_event(TS, ExpectedCount, PoolId) ->
+    instrument_helper:assert(
+        async_pool_flush,
+        #{host_type => host_type(), pool_id => PoolId},
+        fun(#{batch := 1}) -> true end,
+        #{min_timestamp => TS, expected_count => ExpectedCount}).
+
+assert_async_timed_flush_event(Config, TS, PoolId) ->
+    case ?config(configuration, Config) of
+        rdbms_async_pool ->
+            instrument_helper:assert(
+                async_pool_flush,
+                #{host_type => host_type(), pool_id => PoolId},
+                fun(#{timed := 1}) -> true end,
+                #{min_timestamp => TS});
+        _ ->
+            ok
+    end.
+
+assert_dropped_iq_event(Config, BinJid) ->
+    EventName = case ?config(room, Config) of
+                    undefined -> mod_mam_pm_dropped_iq;
+                    _ -> mod_mam_muc_dropped_iq
+                end,
+    instrument_helper:assert_one(
+      EventName, labels(),
+      fun(#{acc := #{stanza := #{from_jid := FromJid}}}) -> eq_bjid(FromJid, BinJid) end).
+
+assert_dropped_msg_event(EventName, TS) ->
+    instrument_helper:assert(
+      EventName, labels(), fun(#{count := 1}) -> true end, #{min_timestamp => TS}).
+
+assert_event_with_jid(EventName, BinJid) ->
+    instrument_helper:assert_one(
+      EventName, labels(), fun(#{count := 1, jid := Jid}) -> eq_bjid(Jid, BinJid) end).
+
+assert_no_event_with_jid(EventName, BinJid) ->
+    instrument_helper:assert_not_emitted(
+      EventName, labels(), fun(#{count := 1, jid := Jid}) -> eq_bjid(Jid, BinJid) end).
+
+labels() -> #{host_type => host_type()}.
+
+pos_int(T) -> is_integer(T) andalso T > 0.
+
+eq_bjid(Jid, BinJid) -> Jid =:= jid:from_binary(BinJid).

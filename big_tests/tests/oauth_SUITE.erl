@@ -15,7 +15,7 @@
 %%==============================================================================
 
 -module(oauth_SUITE).
--compile(export_all).
+-compile([export_all, nowarn_export_all]).
 
 -include_lib("escalus/include/escalus.hrl").
 -include_lib("escalus/include/escalus_xmlns.hrl").
@@ -26,6 +26,8 @@
                              require_rpc_nodes/1,
                              rpc/4]).
 
+-import(domain_helper, [domain/0]).
+
 %%--------------------------------------------------------------------
 %% Suite configuration
 %%--------------------------------------------------------------------
@@ -35,7 +37,6 @@ all() ->
      {group, token_login},
      {group, token_revocation},
      {group, provision_token},
-     {group, commands},
      {group, cleanup},
      {group, sasl_mechanisms}
     ].
@@ -45,8 +46,6 @@ groups() ->
          {token_login, [sequence], token_login_tests()},
          {token_revocation, [sequence], token_revocation_tests()},
          {provision_token, [], [provision_token_login]},
-         {commands, [], [revoke_token_cmd_when_no_token,
-                         revoke_token_cmd]},
          {cleanup, [], [token_removed_on_user_removal]},
          {sasl_mechanisms, [], [check_for_oauth_with_mod_auth_token_not_loaded,
                                 check_for_oauth_with_mod_auth_token_loaded]}
@@ -55,6 +54,7 @@ groups() ->
 
 token_login_tests() ->
     [
+     disco_test,
      request_tokens_test,
      login_access_token_test,
      login_refresh_token_test,
@@ -76,65 +76,49 @@ suite() ->
 %%--------------------------------------------------------------------
 
 init_per_suite(Config0) ->
-    case is_pgsql_available(Config0) of
+    case mongoose_helper:is_rdbms_enabled(domain_helper:host_type()) of
         true ->
-            Config = dynamic_modules:stop_running(mod_last, Config0),
-            Host = ct:get_config({hosts, mim, domain}),
-            KeyStoreOpts = [{keys, [
-                                    {token_secret, ram},
-                                    %% This is a hack for tests! As the name implies,
-                                    %% a pre-shared key should be read from a file stored
-                                    %% on disk. This way it can be shared with trusted 3rd
-                                    %% parties who can use it to sign tokens for users
-                                    %% to authenticate with and MongooseIM to verify.
-                                    {provision_pre_shared, ram}
-                                   ]}],
-            AuthOpts = [{ {validity_period, access}, {60, minutes} },
-                        { {validity_period, refresh}, {1, days} }],
-            dynamic_modules:start(Host, mod_keystore, KeyStoreOpts),
-            dynamic_modules:start(Host, mod_auth_token, AuthOpts),
-            escalus:init_per_suite([{auth_opts, AuthOpts} | Config]);
+            HostType = domain_helper:host_type(),
+            Config = dynamic_modules:save_modules(HostType, Config0),
+            dynamic_modules:ensure_modules(HostType, required_modules()),
+            escalus:init_per_suite(Config);
         false ->
-            {skip, "PostgreSQL not available - check env configuration"}
+            {skip, "RDBMS not available"}
     end.
 
 end_per_suite(Config) ->
-    Host = ct:get_config({hosts, mim, domain}),
-    dynamic_modules:start_running(Config),
-    dynamic_modules:stop(Host, mod_auth_token),
-    dynamic_modules:stop(Host, mod_keystore),
+    dynamic_modules:restore_modules(Config),
     escalus:end_per_suite(Config).
 
-init_per_group(GroupName, Config0) ->
-    Config = case GroupName of
-                 commands -> ejabberd_node_utils:init(Config0);
-                 _ -> Config0
-             end,
-    Config1 = mongoose_helper:backup_auth_config(Config),
-    config_password_format(GroupName),
+init_per_group(GroupName, Config) ->
+    AuthOpts = mongoose_helper:auth_opts_with_password_format(password_format(GroupName)),
+    HostType = domain_helper:host_type(),
+    Config1 = mongoose_helper:backup_and_set_config_option(Config, {auth, HostType}, AuthOpts),
     Config2 = escalus:create_users(Config1, escalus:get_users([bob, alice])),
     assert_password_format(GroupName, Config2).
 
+password_format(login_scram) -> scram;
+password_format(_) -> plain.
+
 end_per_group(cleanup, Config) ->
-    mongoose_helper:restore_auth_config(Config),
+    mongoose_helper:restore_config(Config),
     escalus:delete_users(Config, escalus:get_users([alice]));
 end_per_group(_GroupName, Config) ->
-    mongoose_helper:restore_auth_config(Config),
+    mongoose_helper:restore_config(Config),
     escalus:delete_users(Config, escalus:get_users([bob, alice])).
 
-init_per_testcase(check_for_oauth_with_mod_auth_token_not_loaded = CaseName, Config) ->
-    Host = ct:get_config({hosts, mim, domain}),
-    dynamic_modules:stop(Host, mod_auth_token),
+init_per_testcase(check_for_oauth_with_mod_auth_token_not_loaded, Config) ->
+    HostType = domain_helper:host_type(),
+    dynamic_modules:stop(HostType, mod_auth_token),
     init_per_testcase(generic, Config);
 init_per_testcase(CaseName, Config) ->
     clean_token_db(),
     escalus:init_per_testcase(CaseName, Config).
 
 
-end_per_testcase(check_for_oauth_with_mod_auth_token_not_loaded = CaseName, Config) ->
-    Host = ct:get_config({hosts, mim, domain}),
-    AuthOpts = proplists:get_value(auth_opts, Config),
-    dynamic_modules:start(Host, mod_auth_token, AuthOpts),
+end_per_testcase(check_for_oauth_with_mod_auth_token_not_loaded, Config) ->
+    HostType = domain_helper:host_type(),
+    dynamic_modules:start(HostType, mod_auth_token, auth_token_opts()),
     end_per_testcase(generic, Config);
 end_per_testcase(CaseName, Config) ->
     clean_token_db(),
@@ -144,6 +128,15 @@ end_per_testcase(CaseName, Config) ->
 %%
 %% Tests
 %%
+
+disco_test(Config) ->
+    escalus:story(
+      Config, [{alice, 1}],
+      fun(Alice) ->
+              escalus_client:send(Alice, escalus_stanza:disco_info(domain())),
+              Response = escalus_client:wait_for_stanza(Alice),
+              escalus:assert(has_feature, [?NS_ESL_TOKEN_AUTH], Response)
+      end).
 
 request_tokens_test(Config) ->
     request_tokens_once_logged_in_impl(Config, bob).
@@ -161,13 +154,14 @@ token_login_failure(Config, User, Token) ->
 
 get_revoked_token(Config, UserName) ->
     BJID = escalus_users:get_jid(Config, UserName),
-    JID = rpc(mim(), jid, from_binary, [BJID]),
-    Token = rpc(mim(), mod_auth_token, token, [refresh, JID]),
-    ValidSeqNo = rpc(mim(), mod_auth_token_rdbms, get_valid_sequence_number, [JID]),
+    JID = jid:from_binary(BJID),
+    HostType = domain_helper:host_type(),
+    Token = rpc(mim(), mod_auth_token, token, [HostType, JID, refresh]),
+    ValidSeqNo = rpc(mim(), mod_auth_token_rdbms, get_valid_sequence_number, [HostType, JID]),
     RevokedToken0 = record_set(Token, [{5, invalid_sequence_no(ValidSeqNo)},
                                        {7, undefined},
                                        {8, undefined}]),
-    RevokedToken = rpc(mim(), mod_auth_token, token_with_mac, [RevokedToken0]),
+    RevokedToken = rpc(mim(), mod_auth_token, token_with_mac, [HostType, RevokedToken0]),
     rpc(mim(), mod_auth_token, serialize, [RevokedToken]).
 
 invalid_sequence_no(SeqNo) ->
@@ -241,7 +235,7 @@ login_refresh_token_impl(Config, {_AccessToken, RefreshToken}) ->
 
     {ok, ClientConnection = #client{props = Props}, _Features} = escalus_connection:start(BobSpec, ConnSteps),
     Props2 = lists:keystore(oauth_token, 1, Props, {oauth_token, RefreshToken}),
-    AuthResultToken = (catch escalus_auth:auth_sasl_oauth(ClientConnection, Props2)),
+    (catch escalus_auth:auth_sasl_oauth(ClientConnection, Props2)),
     ok.
 
 %% users logs in using access token he obtained in previous session (stream has been
@@ -279,31 +273,16 @@ token_revocation_test(Config) ->
 get_owner_seqno_to_revoke(Config, User) ->
     {_, RefreshToken} = request_tokens_once_logged_in_impl(Config, User),
     [_, BOwner, _, SeqNo, _] = binary:split(RefreshToken, <<0>>, [global]),
-    Owner = rpc(mim(), jid, from_binary, [BOwner]),
+    Owner = jid:from_binary(BOwner),
     {Owner, binary_to_integer(SeqNo), RefreshToken}.
 
 revoke_token(Owner) ->
-    rpc(mim(), mod_auth_token, revoke, [Owner]).
-
-revoke_token_cmd_when_no_token(Config) ->
-    %% given existing user with no token
-    %% when revoking token
-    R = mimctl(Config, ["revoke_token", escalus_users:get_jid(Config, bob)]),
-    %% then no token was found
-    "User or token not found.\n" = R.
-
-revoke_token_cmd(Config) ->
-    %% given existing user and token present in the database
-    _Tokens = request_tokens_once_logged_in_impl(Config, bob),
-    %% when
-    R = mimctl(Config, ["revoke_token", escalus_users:get_jid(Config, bob)]),
-    %% then
-    "Revoked.\n" = R.
+    rpc(mim(), mod_auth_token, revoke, [domain_helper:host_type(), Owner]).
 
 token_removed_on_user_removal(Config) ->
     %% given existing user with token and XMPP (de)registration available
     _Tokens = request_tokens_once_logged_in_impl(Config, bob),
-    true = is_xmpp_registration_available(escalus_users:get_server(Config, bob)),
+    true = is_xmpp_registration_available(domain_helper:host_type()),
     %% when user account is deleted
     S = fun (Bob) ->
                 IQ = escalus_stanza:remove_account(),
@@ -311,8 +290,8 @@ token_removed_on_user_removal(Config) ->
                 escalus:assert(is_iq_result, [IQ], escalus:wait_for_stanza(Bob))
         end,
     escalus:story(Config, [{bob, 1}], S),
-    %% then token database doesn't contain user's tokens
-    {selected, []} = get_users_token(Config, bob).
+    %% then token database doesn't contain user's tokens (cleanup is done after IQ result)
+    wait_helper:wait_until(fun() -> get_users_token(Config, bob) end, {selected, []}).
 
 provision_token_login(Config) ->
     %% given
@@ -357,11 +336,6 @@ extract_tokens(#xmlel{name = <<"iq">>, children = [#xmlel{name = <<"items">>} = 
     RTD = exml_query:path(Items, [{element, <<"refresh_token">>}, cdata]),
     {base64:decode(ATD), base64:decode(RTD)}.
 
-config_password_format(login_scram) ->
-    monggose_helper:set_store_password(scram);
-config_password_format(_) ->
-    mongoose_helper:set_store_password(plain).
-
 assert_password_format(GroupName, Config) ->
     Users = proplists:get_value(escalus_users, Config),
     [verify_format(GroupName, User) || User <- Users],
@@ -371,7 +345,9 @@ verify_format(GroupName, {_User, Props}) ->
     Username = escalus_utils:jid_to_lower(proplists:get_value(username, Props)),
     Server = proplists:get_value(server, Props),
     Password = proplists:get_value(password, Props),
-    SPassword = rpc(mim(), ejabberd_auth, get_password, [Username, Server]),
+    JID = mongoose_helper:make_jid(Username, Server),
+    {SPassword, _} = rpc(mim(), ejabberd_auth, get_passterm_with_authmodule,
+                         [domain_helper:host_type(), JID]),
     do_verify_format(GroupName, Password, SPassword).
 
 do_verify_format(login_scram, _Password, SPassword) ->
@@ -400,8 +376,7 @@ convert_arg(S) when is_list(S) -> S.
 
 clean_token_db() ->
     Q = [<<"DELETE FROM auth_token">>],
-    RDBMSHost = domain(), %% mam is also tested against local rdbms
-    {updated, _} = rpc(mim(), mongoose_rdbms, sql_query, [RDBMSHost, Q]).
+    {updated, _} = rpc(mim(), mongoose_rdbms, sql_query, [domain_helper:host_type(), Q]).
 
 get_users_token(C, User) ->
     Q = ["SELECT * FROM auth_token at "
@@ -414,15 +389,15 @@ is_xmpp_registration_available(Domain) ->
 user_authenticating_with_token(Config, UserName, Token) ->
     Spec1 = lists:keystore(oauth_token, 1, escalus_users:get_userspec(Config, UserName),
                            {oauth_token, Token}),
-    lists:keystore(auth, 1, Spec1, {auth, {escalus_auth, auth_sasl_oauth}}).
+    lists:keystore(auth, 1, Spec1, {auth, fun escalus_auth:auth_sasl_oauth/2}).
 
 extract_bound_jid(BindReply) ->
     exml_query:path(BindReply, [{element, <<"bind">>}, {element, <<"jid">>},
                                 cdata]).
 
 get_provision_key(Domain) ->
-    RPCArgs = [get_key, Domain, [], [{provision_pre_shared, Domain}]],
-    [{_, RawKey}] = rpc(mim(), ejabberd_hooks, run_fold, RPCArgs),
+    RPCArgs = [Domain, provision_pre_shared],
+    [{_, RawKey}] = rpc(mim(), mongoose_hooks, get_key, RPCArgs),
     RawKey.
 
 make_vcard(Config, User) ->
@@ -436,8 +411,7 @@ make_provision_token(Config, User, VCard) ->
     ExpiryFarInTheFuture = {{2055, 10, 27}, {10, 54, 22}},
     Username = escalus_users:get_username(Config, User),
     Domain = escalus_users:get_server(Config, User),
-    ServerSideJID = {jid, Username, Domain, <<>>,
-                     Username, Domain, <<>>},
+    ServerSideJID = jid:make(Username, Domain, <<>>),
     T0 = {token, provision,
           ExpiryFarInTheFuture,
           ServerSideJID,
@@ -448,7 +422,7 @@ make_provision_token(Config, User, VCard) ->
           undefined,
           %% body
           undefined},
-    T = rpc(mim(), mod_auth_token, token_with_mac, [T0]),
+    T = rpc(mim(), mod_auth_token, token_with_mac, [domain_helper:host_type(), T0]),
     %% assert no RPC error occured
     {token, provision} = {element(1, T), element(2, T)},
     serialize(T).
@@ -461,18 +435,23 @@ serialize(ServerSideToken) ->
     end.
 
 to_lower(B) when is_binary(B) ->
-    list_to_binary(string:to_lower(binary_to_list(B))).
+    string:lowercase(B).
 
-is_pgsql_available(_) ->
-    Q = [<<"SELECT version();">>],
-    %% TODO: hardcoded RDBMSHost
-    RDBMSHost = domain(),
-    case rpc(mim(), mongoose_rdbms, sql_query, [RDBMSHost, Q]) of
-        {selected, [{<<"PostgreSQL", _/binary>>}]} ->
-            true;
-        _ ->
-            false
-    end.
+required_modules() ->
+    KeyOpts = #{backend => ct_helper:get_internal_database(),
+                keys => #{token_secret => ram,
+                         %% This is a hack for tests! As the name implies,
+                         %% a pre-shared key should be read from a file stored
+                         %% on disk. This way it can be shared with trusted 3rd
+                         %% parties who can use it to sign tokens for users
+                         %% to authenticate with and MongooseIM to verify.
+                         provision_pre_shared => ram}},
+    KeyStoreOpts = config_parser_helper:mod_config(mod_keystore, KeyOpts),
+    [{mod_last, stopped},
+     {mod_keystore, KeyStoreOpts},
+     {mod_auth_token, auth_token_opts()}].
 
-domain() ->
-    ct:get_config({hosts, mim, domain}).
+auth_token_opts() ->
+    Defaults = config_parser_helper:default_mod_config(mod_auth_token),
+    Defaults#{validity_period => #{access => #{value => 60, unit => minutes},
+                                   refresh => #{value => 1, unit => days}}}.

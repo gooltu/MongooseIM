@@ -30,6 +30,8 @@
 -export([start_link/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, code_change/3, terminate/2]).
 
+-ignore_xref([start_link/1]).
+
 %%--------------------------------------------------------------------
 %% API
 %%--------------------------------------------------------------------
@@ -55,9 +57,9 @@ handle_cast({route, {From, To, Acc, Packet}}, State) ->
 handle_cast({data, Host, TransferTime, Stamp, Data}, State) ->
     QueueTimeNative = erlang:monotonic_time() - Stamp,
     QueueTimeUS = erlang:convert_time_unit(QueueTimeNative, native, microsecond),
-    mongoose_metrics:update(global, ?GLOBAL_DISTRIB_RECV_QUEUE_TIME, QueueTimeUS),
-    mongoose_metrics:update(global, ?GLOBAL_DISTRIB_TRANSFER_TIME(Host), TransferTime),
-    mongoose_metrics:update(global, ?GLOBAL_DISTRIB_MESSAGES_RECEIVED(Host), 1),
+    mongoose_instrument:execute(?GLOBAL_DISTRIB_RECV_QUEUE, #{}, #{time => QueueTimeUS, host => Host}),
+    mongoose_instrument:execute(?GLOBAL_DISTRIB_TRANSFER, #{}, #{time => TransferTime, host => Host}),
+    mongoose_instrument:execute(?GLOBAL_DISTRIB_MESSAGES_RECEIVED, #{}, #{count => 1, host => Host}),
     do_work(Data),
     {noreply, State, ?TIMEOUT}.
 
@@ -80,7 +82,6 @@ terminate(_Reason, _State) ->
 do_work(Data) ->
     {From, To, Acc, Packet} = erlang:binary_to_term(Data),
     mod_global_distrib_utils:maybe_update_mapping(From, Acc),
-    ?DEBUG("event=route_incoming_gd,id=~s,stanza=~s",
-           [mod_global_distrib:get_metadata(Acc, id, "unknown"),
-            exml:to_binary(mongoose_acc:element(Acc))]),
+    ?LOG_DEBUG(#{what => gd_route_incoming, acc => Acc,
+                 gd_id => mod_global_distrib:get_metadata(Acc, id, "unknown")}),
     ejabberd_router:route(From, To, Acc, Packet).

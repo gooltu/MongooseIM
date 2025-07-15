@@ -1,16 +1,27 @@
 -module(muc_helper).
--compile(export_all).
+-compile([export_all, nowarn_export_all]).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("exml/include/exml.hrl").
 -include_lib("escalus/include/escalus_xmlns.hrl").
+-include_lib("eunit/include/eunit.hrl").
+
+-include("mam_helper.hrl").
 
 -import(distributed_helper, [mim/0,
+                             subhost_pattern/1,
                              rpc/4]).
 
 -type verify_fun() :: fun((Incoming :: #xmlel{}) -> any()).
 
 -export_type([verify_fun/0]).
+
+%% Extend default opts with new ExtraOpts
+make_opts(ExtraOpts) ->
+    config_parser_helper:mod_config(mod_muc, ExtraOpts).
+
+make_log_opts(ExtraOpts) ->
+    config_parser_helper:mod_config(mod_muc_log, ExtraOpts).
 
 -spec foreach_occupant(
         Users :: [escalus:client()], Stanza :: #xmlel{}, VerifyFun :: verify_fun()) -> ok.
@@ -41,36 +52,47 @@ foreach_recipient(Users, VerifyFun) ->
               VerifyFun(escalus:wait_for_stanza(Recipient))
       end, Users).
 
-load_muc(Host) ->
-    %% Stop modules before trying to start them
-    unload_muc(),
+load_muc() ->
+    load_muc(domain_helper:host_type()).
+
+load_muc(HostType) ->
     Backend = muc_backend(),
-    %% TODO refactoring. "localhost" should be passed as a parameter
-    dynamic_modules:start(<<"localhost">>, mod_muc,
-                          [{host, binary_to_list(Host)},
-                           {backend, Backend},
-                           {hibernate_timeout, 2000},
-                           {hibernated_room_check_interval, 1000},
-                           {hibernated_room_timeout, 2000},
-                           {access, muc},
-                           {access_create, muc_create}]),
-    dynamic_modules:start(<<"localhost">>, mod_muc_log,
-                          [{outdir, "/tmp/muclogs"},
-                           {access_log, muc}]).
+    MucHostPattern = ct:get_config({hosts, mim, muc_service_pattern}),
+    ct:log("Starting MUC for ~p", [HostType]),
+    Opts = #{host => subhost_pattern(MucHostPattern), backend => Backend,
+             online_backend => muc_online_backend(),
+             hibernate_timeout => 2000,
+             hibernated_room_check_interval => 1000,
+             hibernated_room_timeout => 2000,
+             access => muc, access_create => muc_create},
+    LogOpts = #{outdir => "/tmp/muclogs", access_log => muc},
+    dynamic_modules:start(HostType, mod_muc, make_opts(Opts)),
+    dynamic_modules:start(HostType, mod_muc_log, make_log_opts(LogOpts)).
 
 unload_muc() ->
-    dynamic_modules:stop(<<"localhost">>, mod_muc),
-    dynamic_modules:stop(<<"localhost">>, mod_muc_log).
+    HostType = domain_helper:host_type(),
+    dynamic_modules:stop(HostType, mod_muc),
+    dynamic_modules:stop(HostType, mod_muc_log).
+
+unload_muc(HostType) ->
+    dynamic_modules:stop(HostType, mod_muc),
+    dynamic_modules:stop(HostType, mod_muc_log).
 
 muc_host() ->
-    <<"muc.localhost">>.
+    ct:get_config({hosts, mim, muc_service}).
+
+muc_host_pattern() ->
+    ct:get_config({hosts, mim, muc_service_pattern}).
 
 muc_backend() ->
     mongoose_helper:mnesia_or_rdbms_backend().
 
+muc_online_backend() ->
+    ct_helper:get_internal_database().
+
 start_room(Config, User, Room, Nick, Opts) ->
     From = generate_rpc_jid(User),
-    create_instant_room(<<"localhost">>, Room, From, Nick, Opts),
+    create_instant_room(Room, From, Nick, Opts),
     RoomJID = room_address(Room),
     [{nick, Nick}, {room, Room}, {room_jid, RoomJID}, {muc_host, muc_host()} | Config].
 
@@ -133,27 +155,58 @@ generate_rpc_jid({_,User}) ->
     {server, Server} = lists:keyfind(server, 1, User),
     LUsername = escalus_utils:jid_to_lower(Username),
     LServer = escalus_utils:jid_to_lower(Server),
-    {jid, Username, Server, <<"rpc">>, LUsername, LServer, <<"rpc">>}.
+    jid:make_noprep(LUsername, LServer, <<"rpc">>).
 
-create_instant_room(Host, Room, From, Nick, Opts) ->
-    Room1 = rpc(mim(), jid, nodeprep, [Room]),
-    rpc(mim(), mod_muc, create_instant_room,
-        [Host, Room1, From, Nick, Opts]).
+create_instant_room(Room, From, Nick, Opts) ->
+    ServerHost = ct:get_config({hosts, mim, domain}),
+    assert_valid_server(ServerHost),
+    Room1 = jid:nodeprep(Room),
+    ok = rpc(mim(), mod_muc, create_instant_room,
+        [ServerHost, muc_host(), Room1, From, Nick, Opts]).
+
+assert_valid_server(ServerHost) ->
+    HostType = domain_helper:host_type(),
+    case rpc(mim(), mongoose_domain_api, get_domain_host_type, [ServerHost]) of
+        {ok, HostType} ->
+            ok;
+        Other ->
+            ct:fail(#{what => assert_valid_server_failed,
+                      server => ServerHost,
+                      expected_host_type => HostType,
+                      got_host_type => Other})
+    end.
 
 destroy_room(Config) ->
     destroy_room(muc_host(), ?config(room, Config)).
 
 destroy_room(Host, Room) when is_binary(Host), is_binary(Room) ->
-    Room1 = rpc(mim(), jid, nodeprep, [Room]),
-    case rpc(mim(), ets, lookup, [muc_online_room, {Room1, Host}]) of
-        [{_,_,Pid}|_] -> gen_fsm_compat:send_all_state_event(Pid, destroy);
-        _ -> ok
+    HostType = domain_helper:host_type(),
+    Room1 = jid:nodeprep(Room),
+    case rpc(mim(), mod_muc_online_backend, find_room_pid, [HostType, Host, Room1]) of
+        {ok, Pid} ->
+            %% @TODO related to gen_fsm_compat: after migration to gen_statem
+            %%       should be replaced to - gen_statem:call(Pid, destroy).
+            Pid ! {'$gen_all_state_event', destroy},
+            wait_for_process_down(Pid),
+            ok;
+        {error, not_found} ->
+            ok
+    end.
+
+wait_for_process_down(Pid) ->
+    Ref = monitor(process, Pid),
+    receive
+        {'DOWN', Ref, _Type, Pid, _Info} ->
+            ok
+    after 5000 ->
+              ct:fail(wait_for_process_down_failed)
     end.
 
 stanza_muc_enter_room(Room, Nick) ->
+    Attrs = #{<<"xmlns">> => <<"http://jabber.org/protocol/muc">>},
     stanza_to_room(
         escalus_stanza:presence(  <<"available">>,
-                                [#xmlel{ name = <<"x">>, attrs=[{<<"xmlns">>, <<"http://jabber.org/protocol/muc">>}]}]),
+                                [#xmlel{ name = <<"x">>, attrs = Attrs}]),
         Room, Nick).
 
 stanza_default_muc_room(Room, Nick) ->
@@ -208,7 +261,7 @@ fresh_room_name(Username) ->
     escalus_utils:jid_to_lower(<<"room-", Username/binary>>).
 
 fresh_room_name() ->
-    fresh_room_name(base16:encode(crypto:strong_rand_bytes(5))).
+    fresh_room_name(binary:encode_hex(crypto:strong_rand_bytes(5), lowercase)).
 
 stanza_get_features() ->
     %% <iq from='hag66@shakespeare.lit/pda'
@@ -220,7 +273,7 @@ stanza_get_features() ->
     escalus_stanza:setattr(escalus_stanza:iq_get(?NS_DISCO_INFO, []), <<"to">>,
                            muc_host()).
 
-has_features(#xmlel{children = [ Query ]}, Features) ->
+has_features(#xmlel{children = [ Query ]} = _Iq, Features) ->
     %%<iq from='chat.shakespeare.lit'
     %%  id='lx09df27'
     %%  to='hag66@shakespeare.lit/pda'
@@ -234,10 +287,16 @@ has_features(#xmlel{children = [ Query ]}, Features) ->
     %%  </query>
     %%</iq>
 
+    HostType = domain_helper:host_type(),
+    Loaded = rpc(mim(), gen_mod, loaded_modules_with_opts, [HostType]),
+    ct:log("Loaded modules:~n~p", [Loaded]),
+
     Identity = exml_query:subelement(Query, <<"identity">>),
     <<"conference">> = exml_query:attr(Identity, <<"category">>),
-    Features = exml_query:paths(Query, [{element, <<"feature">>},
-                                        {attr, <<"var">>}]).
+    ExpectedFeatures = lists:sort(Features),
+    ActualFeatures = lists:sort(exml_query:paths(Query, [{element, <<"feature">>},
+                                                         {attr, <<"var">>}])),
+    ?assertEqual(ExpectedFeatures, ActualFeatures).
 
 assert_valid_affiliation(<<"owner">>) -> ok;
 assert_valid_affiliation(<<"admin">>) -> ok;
@@ -259,5 +318,42 @@ story_with_room(Config, RoomOpts, [{Owner, _}|_] = UserSpecs, StoryFun) ->
         StoryFun2 = fun(Args) -> apply(StoryFun, [Config2 | Args]) end,
         escalus_story:story_with_client_list(Config2, UserSpecs, StoryFun2)
     after
-        destroy_room(Config2)
+        case dynamic_modules:get_current_modules(domain_helper:host_type()) of
+            #{mod_mam_muc := _} ->
+                mam_helper:destroy_room(Config2);
+            #{} ->
+                ok
+        end
     end.
+
+%%--------------------------------------------------------------------
+%% Helpers (stanzas)
+%%--------------------------------------------------------------------
+
+change_nick_form_iq(Nick) ->
+    NS = <<"jabber:iq:register">>,
+    NickField = #{var => <<"nick">>, values => [Nick], type => <<"text-single">>},
+    Form = form_helper:form(#{ns => NS, fields => [NickField]}),
+    SetIQ = escalus_stanza:iq_set(NS, [Form]),
+    escalus_stanza:to(SetIQ, muc_helper:muc_host()).
+
+set_nick(User, Nick) ->
+    escalus:send_iq_and_wait_for_result(User, change_nick_form_iq(Nick)).
+
+%% Instrumentation utilities
+
+wait_for_room_count(ExpectedCounts) ->
+    F = fun(Counts) -> Counts =:= ExpectedCounts end,
+    instrument_helper:wait_and_assert_new(mod_muc_rooms, labels(), F).
+
+assert_room_event(EventName, RoomJid) ->
+    assert_event(EventName, fun(#{count := 1, jid := Jid}) -> Jid =:= RoomJid end).
+
+assert_event(EventName, F) ->
+    instrument_helper:assert_one(EventName, labels(), F).
+
+count_rooms() ->
+    rpc(mim(), mod_muc, probe, [mod_muc_rooms, labels()]).
+
+labels() ->
+    #{host_type => domain_helper:host_type()}.

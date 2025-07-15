@@ -16,27 +16,34 @@ This page describes what GDPR implies in terms of server management.
 
 ## GDPR CLI commands
 
-All CLI commands are accessible via `mongooseimctl` command, located in `bin/` inside MIM release.
-
-Personal data retrieval requires `service_admin_extra` with `gdpr` group enabled.
+All CLI commands are accessible via the `mongooseimctl` command, located in the `bin/` directory inside the MIM release.
 
 ### Creating a GDPR-safe user account
 
-`mongooseimctl register <domain> <password>`
+`mongooseimctl account registerUser --domain <domain> --password <password>`
 
 This command will create an anonymised JID with a random username part.
 It ensures that no personal information will be leaked via logs or database entries, which include the user's JID.
 
 #### Example
 
-```
-$ mongooseimctl register localhost abc123
-User 1567-420657-155810-C1CEC31F5C993258@localhost successfully registered
+```bash
+$ mongooseimctl account registerUser --domain localhost --password secret
+{
+  "data" : {
+    "account" : {
+      "registerUser" : {
+        "message" : "User 1661-175924-881845-449bca06515e060a@localhost successfully registered",
+        "jid" : "1661-175924-881845-449bca06515e060a@localhost"
+      }
+    }
+  }
+}
 ```
 
 ### Retrieval of Personal Data
 
-`mongooseimctl retrieve_personal_data <username> <domain> <filepath for the output as a zip>`
+`mongooseimctl gdpr retrievePersonalData --username <username> --domain <domain> --resultFilepath <filepath for the output as a zip>`
 
 It retrieves personal data accessible to the server (see "Technical limitations" section below).
 The directory where the zip file will be created must already exist.
@@ -45,17 +52,31 @@ After the execution is complete, a zip file will appear in the specified folder 
 
 #### Example
 
-`mongooseimctl retrieve_personal_data 1567-420657-155810-C1CEC31F5C993258 localhost /home/mongooseim/gdpr/1567-420657-155810-C1CEC31F5C993258.zip`
+```bash
+$ mongooseimctl gdpr retrievePersonalData --username 1661-175924-881845-449bca06515e060a --domain localhost --resultFilepath /home/mongooseim/gdpr/1661-175924-881845-449bca06515e060a.zip
+```
 
 ### Removal of Personal Data
 
-`mongooseimctl unregister <username> <domain>`
+`mongooseimctl account removeUser --user <jid>`
 
 It removes the user's account along with all associated personal data accessible to the server (see "Technical limitations" section below).
 
 #### Example
 
-`mongooseimctl unregister 1567-420657-155810-C1CEC31F5C993258 localhost`
+```bash
+$ mongooseimctl account removeUser --user 1661-175924-881845-449bca06515e060a@localhost
+{
+  "data" : {
+    "account" : {
+      "removeUser" : {
+        "message" : "User 1661-175924-881845-449bca06515e060a@localhost successfully unregistered",
+        "jid" : "1661-175924-881845-449bca06515e060a@localhost"
+      }
+    }
+  }
+}
+```
 
 ## Technical limitations of GDPR retrieval and removal
 

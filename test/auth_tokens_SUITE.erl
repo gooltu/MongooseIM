@@ -1,5 +1,5 @@
 -module(auth_tokens_SUITE).
--compile([export_all]).
+-compile([export_all, nowarn_export_all]).
 
 -include_lib("exml/include/exml.hrl").
 -include_lib("common_test/include/ct.hrl").
@@ -39,68 +39,51 @@ groups() ->
       ]}
     ].
 
-init_per_suite(C) ->
-    %lager:start(),
+init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(jid),
-    C.
+    mongoose_config:set_opts(opts()),
+    async_helper:start(Config, [{mongoose_instrument, start_link, []},
+                                {mongooseim_helper, start_link_loaded_hooks, []}]).
 
-end_per_suite(C) ->
-    %application:stop(lager),
-    C.
+end_per_suite(Config) ->
+    async_helper:stop_all(Config),
+    mongoose_config:erase_opts().
+
+opts() ->
+    #{{modules, host_type()} => #{mod_auth_token => config_parser_helper:default_mod_config(mod_auth_token)},
+      instrumentation => config_parser_helper:default_config([instrumentation])}.
 
 init_per_testcase(Test, Config)
         when Test =:= serialize_deserialize_property;
              Test =:= validation_test;
              Test =:= validation_property;
              Test =:= choose_key_by_token_type ->
-    mock_mongoose_metrics(),
-    Config1 = async_helper:start(Config, [{ejabberd_hooks, start_link, []},
-                                          {gen_mod, start, []}]),
     mock_keystore(),
     mock_rdbms_backend(),
-    Config1;
-
+    Config;
 init_per_testcase(validity_period_test, Config) ->
-    mock_mongoose_metrics(),
+    mock_rdbms_backend(),
     mock_gen_iq_handler(),
-    mock_ejabberd_commands(),
-    async_helper:start(Config, [{gen_mod, start, []},
-                                {ejabberd_hooks, start_link, []}]);
-
+    Config;
 init_per_testcase(revoked_token_is_not_valid, Config) ->
-    mock_mongoose_metrics(),
     mock_tested_backend(),
-    Config1 = async_helper:start(Config, [{gen_mod, start, []},
-                                          {ejabberd_hooks, start_link, []}]),
     mock_keystore(),
-    Config1;
-
+    Config;
 init_per_testcase(_, C) -> C.
 
-end_per_testcase(Test, C)
+end_per_testcase(Test, _C)
         when Test =:= serialize_deserialize_property;
              Test =:= validation_test;
              Test =:= validation_property;
              Test =:= choose_key_by_token_type ->
-    meck:unload(mongoose_metrics),
-    meck:unload(mod_auth_token_rdbms),
-    async_helper:stop_all(C),
-    C;
-
-end_per_testcase(validity_period_test, C) ->
-    meck:unload(mongoose_metrics),
-    meck:unload(gen_iq_handler),
-    meck:unload(ejabberd_commands),
-    async_helper:stop_all(C),
-    C;
-
-end_per_testcase(revoked_token_is_not_valid, C) ->
-    meck:unload(mongoose_metrics),
-    meck:unload(mod_auth_token_rdbms),
-    async_helper:stop_all(C),
-    C;
-
-end_per_testcase(_, C) -> C.
+    meck:unload(mod_auth_token_backend);
+end_per_testcase(validity_period_test, _C) ->
+    meck:unload(mod_auth_token_backend),
+    meck:unload(gen_iq_handler);
+end_per_testcase(revoked_token_is_not_valid, _C) ->
+    meck:unload(mod_auth_token_backend);
+end_per_testcase(_, _) ->
+    ok.
 
 %%
 %% Tests
@@ -127,9 +110,13 @@ validation_test(Config) ->
 
 validation_test(_, ExampleToken) ->
     %% given
-    Serialized = ?TESTED:serialize(ExampleToken),
+    Serialized = mod_auth_token:serialize(ExampleToken),
+    ct:log("ExampleToken:~n  ~p", [ExampleToken]),
+
     %% when
-    Result = ?TESTED:authenticate(Serialized),
+    Result = mod_auth_token:authenticate(host_type(), Serialized),
+    ct:log("Result: ~p", [Result]),
+
     %% then
     ?ae(true, is_validation_success(Result)).
 
@@ -139,29 +126,24 @@ validation_property(_) ->
 
 validity_period_test(_) ->
     %% given
-    ok = ?TESTED:start(<<"localhost">>,
-                       validity_period_cfg(access, {13, hours})),
+    ok = mod_auth_token:start(host_type(), mongoose_config:get_opt([{modules, host_type()}, mod_auth_token])),
     UTCSeconds = utc_now_as_seconds(),
-    ExpectedSeconds = UTCSeconds + (    13 %% hours
-                                    * 3600 %% seconds per hour
-                                   ),
+    ExpectedSeconds = UTCSeconds + 3600, %% seconds per hour
     %% when
-    ActualDT = ?TESTED:expiry_datetime(<<"localhost">>, access, UTCSeconds),
+    ActualDT = mod_auth_token:expiry_datetime(host_type(), access, UTCSeconds),
     %% then
-    ?ae(calendar:gregorian_seconds_to_datetime(ExpectedSeconds),
-        ActualDT).
+    ?ae(calendar:gregorian_seconds_to_datetime(ExpectedSeconds), ActualDT).
 
 choose_key_by_token_type(_) ->
     %% given mocked keystore (see init_per_testcase)
-    JID = jid:from_binary(<<"alice@localhost">>),
     %% when mod_auth_token asks for key for given token type
     %% then the correct key is returned
-    ?ae(<<"access_or_refresh">>, ?TESTED:get_key_for_user(access, JID)),
-    ?ae(<<"access_or_refresh">>, ?TESTED:get_key_for_user(refresh, JID)),
-    ?ae(<<"provision">>, ?TESTED:get_key_for_user(provision, JID)).
+    ?ae(<<"access_or_refresh">>, mod_auth_token:get_key_for_host_type(host_type(), access)),
+    ?ae(<<"access_or_refresh">>, mod_auth_token:get_key_for_host_type(host_type(), refresh)),
+    ?ae(<<"provision">>, mod_auth_token:get_key_for_host_type(host_type(), provision)).
 
 is_join_and_split_with_base16_and_zeros_reversible(RawToken) ->
-    MAC = base16:encode(crypto:hmac(sha384, <<"unused_key">>, RawToken)),
+    MAC = binary:encode_hex(crypto:mac(hmac, sha384, <<"unused_key">>, RawToken), lowercase),
     Token = <<RawToken/bytes, 0, MAC/bytes>>,
     BodyPartsLen = length(binary:split(RawToken, <<0>>, [global])),
     Parts = binary:split(Token, <<0>>, [global]),
@@ -173,11 +155,11 @@ is_join_and_split_with_base16_and_zeros_reversible(RawToken) ->
     end.
 
 is_serialization_reversible(Token) ->
-    Token =:= ?TESTED:deserialize(?TESTED:serialize(Token)).
+    Token =:= mod_auth_token:deserialize(mod_auth_token:serialize(Token)).
 
 is_valid_token_prop(Token) ->
-    Serialized = ?TESTED:serialize(Token),
-    R = ?TESTED:authenticate(Serialized),
+    Serialized = mod_auth_token:serialize(Token),
+    R = mod_auth_token:authenticate(host_type(), Serialized),
     case is_validation_success(R) of
         true -> true;
         _    -> ct:fail(R)
@@ -196,12 +178,12 @@ revoked_token_is_not_valid(_) ->
     RevokedSeqNo = 123455,
     self() ! {valid_seq_no, ValidSeqNo},
     T = #token{type = refresh,
-               expiry_datetime = ?TESTED:seconds_to_datetime(utc_now_as_seconds() + 10),
+               expiry_datetime = mod_auth_token:seconds_to_datetime(utc_now_as_seconds() + 10),
                user_jid = jid:from_binary(<<"alice@localhost">>),
                sequence_no = RevokedSeqNo},
-    Revoked = ?TESTED:serialize(?TESTED:token_with_mac(T)),
+    Revoked = mod_auth_token:serialize(mod_auth_token:token_with_mac(host_type(), T)),
     %% when
-    ValidationResult = ?TESTED:authenticate(Revoked),
+    ValidationResult = mod_auth_token:authenticate(host_type(), Revoked),
     %% then
     {error, _} = ValidationResult.
 
@@ -218,116 +200,88 @@ seconds_to_datetime(Seconds) ->
 utc_now_as_seconds() ->
     calendar:datetime_to_gregorian_seconds(calendar:universal_time()).
 
-%% Like in:
-%% {modules, [
-%%            {mod_auth_token, [{{validity_period, access}, {13, minutes}},
-%%                              {{validity_period, refresh}, {13, days}}]}
-%%           ]}.
-validity_period_cfg(Type, Period) ->
-    Opts = [ {{validity_period, Type}, Period} ],
-    ets:insert(ejabberd_modules, {ejabberd_module, {?TESTED, <<"localhost">>}, Opts}),
-    Opts.
-
 %% This is a negative test case helper - that's why we invert the logic below.
 %% I.e. we expect the property to fail.
 negative_prop(Name, Prop) ->
     Props = proper:conjunction([{Name, Prop}]),
     [[{Name, _}]] = proper:quickcheck(Props, [verbose, long_result, {numtests, 50}]).
 
-mock_mongoose_metrics() ->
-    meck:new(mongoose_metrics, []),
-    meck:expect(mongoose_metrics, create_generic_hook_metric, fun (_, _) -> ok end),
-    meck:expect(mongoose_metrics, increment_generic_hook_metric, fun (_, _) -> ok end),
+mock_rdbms_backend() ->
+    meck:new(mod_auth_token_backend, []),
+    meck:expect(mod_auth_token_backend, start, fun(_, _) -> ok end),
+    meck:expect(mod_auth_token_backend, get_valid_sequence_number,
+                fun (_, _) -> valid_seq_no_threshold() end),
     ok.
 
-mock_rdbms_backend() ->
-    gen_mod:start_backend_module(?TESTED, [{backend, rdbms}]),
-    meck:new(mod_auth_token_rdbms, []),
-    meck:expect(mod_auth_token_rdbms, get_valid_sequence_number,
-                fun (_) -> valid_seq_no_threshold() end).
-
 mock_keystore() ->
-    ejabberd_hooks:add(get_key, <<"localhost">>, ?MODULE, mod_keystore_get_key, 50).
+    gen_hook:add_handler(get_key, host_type(), fun ?MODULE:mod_keystore_get_key/3, #{}, 50).
 
 mock_gen_iq_handler() ->
     meck:new(gen_iq_handler, []),
-    meck:expect(gen_iq_handler, add_iq_handler, fun (_, _, _, _, _, _) -> ok end).
+    meck:expect(gen_iq_handler, add_iq_handler_for_domain, fun (_, _, _, _, _, _) -> ok end).
 
-mod_keystore_get_key(_, {KeyName, _} = KeyID) ->
-    case KeyName of
+mod_keystore_get_key(_, #{key_id := {KeyName, _} = KeyID}, _) ->
+    Acc = case KeyName of
         token_secret -> [{KeyID, <<"access_or_refresh">>}];
         provision_pre_shared -> [{KeyID, <<"provision">>}]
-    end.
+    end,
+    {ok, Acc}.
 
 mock_tested_backend() ->
-    meck:new(mod_auth_token_rdbms, []),
-    meck:expect(mod_auth_token_rdbms, get_valid_sequence_number,
-                fun (_) ->
+    meck:new(mod_auth_token_backend, []),
+    meck:expect(mod_auth_token_backend, get_valid_sequence_number,
+                fun (_, _) ->
                         receive {valid_seq_no, SeqNo} -> SeqNo end
                 end).
 
-mock_ejabberd_commands() ->
-    meck:new(ejabberd_commands, []),
-    meck:expect(ejabberd_commands, register_commands, fun (_) -> ok end).
-
 provision_token_example() ->
-    {token,provision,
-     {{2055,10,27},{10,54,22}},
-     {jid,<<"cEE2M1S0I">>,<<"localhost">>,<<>>,<<"cee2m1s0i">>,
-      <<"localhost">>,<<>>},
-     undefined,
-     {xmlel,<<"vCard">>,
-      [{<<"sgzldnl">>,<<"inxdutpu">>},
-       {<<"scmgsrfi">>,<<"nhgybwu">>},
-       {<<"ixrsmzee">>,<<"rysdh">>},
-       {<<"oxwothgyei">>,<<"wderkfgexv">>}],
-      [{xmlel,<<"nqe">>,
-        [{<<"i">>,<<"u">>},
-         {<<"gagnixjgml">>,<<"odaorofnra">>},
-         {<<"ijz">>,<<"zvbrqnybi">>}],
-        [{xmlcdata,<<"uprmzqf">>},
-         {xmlel,<<"lnnitxm">>,
-          [{<<"qytehi">>,<<"axl">>},
-           {<<"xaxforb">>,<<"jrdeydsqhj">>}],
-          []},
-         {xmlcdata,<<"pncgsaxl">>},
-         {xmlel,<<"jfofazuau">>,[{<<"si">>,<<"l">>}],[]}]},
-       {xmlel,<<"moy">>,
-        [{<<"femjc">>,<<"qqb">>},{<<"tirfmekvpk">>,<<"sa">>}],
-        []},
-       {xmlcdata,<<"bgxlyqdeeuo">>}]},
-     <<109,213,86,17,172,7,27,229,193,103,207,86,43,31,239,117,234,234,
-       232,0,223,168,125,154,189,87,232,159,77,11,35,216,127,171,83,207,
-       208,184,40,208,45,102,189,131,110,204,245,28>>,
-     <<112,114,111,118,105,115,105,111,110,0,99,69,69,50,77,49,83,48,73,
-       64,108,111,99,97,108,104,111,115,116,0,54,52,56,55,53,52,54,54,52,
-       54,50,0,60,118,67,97,114,100,32,115,103,122,108,100,110,108,61,39,
-       105,110,120,100,117,116,112,117,39,32,115,99,109,103,115,114,102,
-       105,61,39,110,104,103,121,98,119,117,39,32,105,120,114,115,109,
-       122,101,101,61,39,114,121,115,100,104,39,32,111,120,119,111,116,
-       104,103,121,101,105,61,39,119,100,101,114,107,102,103,101,120,118,
-       39,62,60,110,113,101,32,105,61,39,117,39,32,103,97,103,110,105,
-       120,106,103,109,108,61,39,111,100,97,111,114,111,102,110,114,97,
-       39,32,105,106,122,61,39,122,118,98,114,113,110,121,98,105,39,62,
-       117,112,114,109,122,113,102,60,108,110,110,105,116,120,109,32,113,
-       121,116,101,104,105,61,39,97,120,108,39,32,120,97,120,102,111,114,
-       98,61,39,106,114,100,101,121,100,115,113,104,106,39,47,62,112,110,
-       99,103,115,97,120,108,60,106,102,111,102,97,122,117,97,117,32,115,
-       105,61,39,108,39,47,62,60,47,110,113,101,62,60,109,111,121,32,102,
-       101,109,106,99,61,39,113,113,98,39,32,116,105,114,102,109,101,107,
-       118,112,107,61,39,115,97,39,47,62,98,103,120,108,121,113,100,101,
-       101,117,111,60,47,118,67,97,114,100,62>>}.
+    Token =
+        #token{
+            type = provision,
+            expiry_datetime = {{2055,10,27},{10,54,22}},
+            user_jid = jid:make(<<"cee2m1s0i">>,domain(),<<>>),
+            sequence_no = undefined,
+            vcard = #xmlel{
+                name = <<"vCard">>,
+                attrs = #{<<"sgzldnl">> => <<"inxdutpu">>,
+                        <<"scmgsrfi">> => <<"nhgybwu">>,
+                        <<"ixrsmzee">> => <<"rysdh">>,
+                        <<"oxwothgyei">> => <<"wderkfgexv">>},
+                children = [
+                    #xmlel{
+                        name = <<"nqe">>,
+                        attrs = #{<<"i">> => <<"u">>,
+                                <<"gagnixjgml">> => <<"odaorofnra">>,
+                                <<"ijz">> => <<"zvbrqnybi">>},
+                        children = [
+                            #xmlcdata{content = <<"uprmzqf">>},
+                            #xmlel{name = <<"lnnitxm">>,
+                                attrs = #{<<"qytehi">> => <<"axl">>,
+                                            <<"xaxforb">> => <<"jrdeydsqhj">>}},
+                            #xmlcdata{content = <<"pncgsaxl">>},
+                            #xmlel{name = <<"jfofazuau">>,
+                                attrs = #{<<"si">> => <<"l">>}}
+                        ]},
+                    #xmlel{name = <<"moy">>,
+                        attrs = #{<<"femjc">> => <<"qqb">>,
+                                    <<"tirfmekvpk">> => <<"sa">>}},
+                    #xmlcdata{content = <<"bgxlyqdeeuo">>}
+                ]},
+            mac_signature = undefined,
+            token_body = undefined},
+    mod_auth_token:token_with_mac(host_type(), Token).
 
 refresh_token_example() ->
-    {token,refresh,
-     {{2055,10,27},{10,54,14}},
-     {jid,<<"a">>,<<"localhost">>,<<>>,<<"a">>,<<"localhost">>,<<>>},
-     4,undefined,
-     <<151,225,117,181,0,168,228,208,238,182,157,253,24,200,231,25,189,
-       160,176,144,85,193,20,108,31,23,46,35,215,41,250,57,68,201,45,33,
-       241,219,197,83,155,118,217,92,172,42,8,118>>,
-     <<114,101,102,114,101,115,104,0,97,64,108,111,99,97,108,104,111,115,
-       116,0,54,52,56,55,53,52,54,54,52,53,52,0,52>>}.
+    Token =
+        #token{
+            type = refresh,
+            expiry_datetime = {{2055,10,27},{10,54,14}},
+            user_jid = jid:make(<<"a">>,domain(),<<>>),
+            sequence_no = 4,
+            vcard = undefined,
+            mac_signature = undefined,
+            token_body = undefined},
+    mod_auth_token:token_with_mac(host_type(), Token).
 
 %%
 %% Generators
@@ -359,11 +313,11 @@ make_token({Type, Expiry, JID, SeqNo, VCard}) ->
                user_jid = jid:from_binary(JID)},
     case Type of
         access ->
-            ?TESTED:token_with_mac(T);
+            mod_auth_token:token_with_mac(host_type(), T);
         refresh ->
-            ?TESTED:token_with_mac(T#token{sequence_no = SeqNo});
+            mod_auth_token:token_with_mac(host_type(), T#token{sequence_no = SeqNo});
         provision ->
-            ?TESTED:token_with_mac(T#token{vcard = VCard})
+            mod_auth_token:token_with_mac(host_type(), T#token{vcard = VCard})
     end.
 
 serialized_token(Sep) ->
@@ -398,15 +352,16 @@ vcard() ->
 
 bare_jid() ->
     ?LET({Username, Domain}, {username(), domain()},
-         <<(?l2b(Username))/bytes, "@", (?l2b(Domain))/bytes>>).
+         <<(?l2b(Username))/bytes, "@", (Domain)/bytes>>).
 
 %full_jid() ->
 %    ?LET({Username, Domain, Res}, {username(), domain(), resource()},
 %         <<(?l2b(Username))/bytes, "@", (?l2b(Domain))/bytes, "/", (?l2b(Res))/bytes>>).
 
 username() -> ascii_string().
-domain()   -> "localhost".
+domain()   -> <<"localhost">>.
 %resource() -> ascii_string().
+host_type()   -> <<"localhost">>.
 
 ascii_string() ->
     ?LET({Alpha, Alnum}, {ascii_alpha(), list(ascii_alnum())}, [Alpha | Alnum]).

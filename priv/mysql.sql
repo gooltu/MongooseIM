@@ -23,6 +23,7 @@
 
 CREATE TABLE test_types(
     unicode text CHARACTER SET utf8mb4,
+    unicode250 varchar(250) CHARACTER SET utf8mb4,
     `binary_data_8k` blob, -- blob has 65k bytes limit
     `binary_data_65k` blob,
     `binary_data_16m` mediumblob, -- mediumblob has 16MB size limit
@@ -36,52 +37,55 @@ CREATE TABLE test_types(
 );
 
 CREATE TABLE users (
-    username varchar(250) PRIMARY KEY,
+    username varchar(250),
+    server varchar(250),
     password text NOT NULL,
     pass_details text,
-    created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (server, username)
 ) CHARACTER SET utf8mb4
   ROW_FORMAT=DYNAMIC;
-
 
 CREATE TABLE last (
-    username varchar(250) PRIMARY KEY,
+    server varchar(250),
+    username varchar(250),
     seconds int NOT NULL,
-
-    state text NOT NULl
+    state text NOT NULL,
+    PRIMARY KEY (server, username)
 ) CHARACTER SET utf8mb4
   ROW_FORMAT=DYNAMIC;
 
-CREATE INDEX i_last_seconds ON last(seconds);
-
+CREATE INDEX i_last_server_seconds ON last (server, seconds);
 
 CREATE TABLE rosterusers (
+    server varchar(250) NOT NULL,
     username varchar(250) NOT NULL,
-    jid varchar(250) NOT NULL,
+    jid varchar(250) NOT NULL, -- must be a parsable jid
     nick text NOT NULL,
     subscription character(1) NOT NULL,
     ask character(1) NOT NULL,
     askmessage text NOT NULL,
-    server character(1) NOT NULL,
-    subscribe text NOT NULL,
-    type text,
-    created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (server, username, jid)
 ) CHARACTER SET utf8mb4
   ROW_FORMAT=DYNAMIC;
-
-CREATE UNIQUE INDEX i_rosteru_user_jid ON rosterusers(username(75), jid(75));
-CREATE INDEX i_rosteru_username ON rosterusers(username);
-CREATE INDEX i_rosteru_jid ON rosterusers(jid);
 
 CREATE TABLE rostergroups (
+    server varchar(250) NOT NULL,
     username varchar(250) NOT NULL,
     jid varchar(250) NOT NULL,
-    grp text NOT NULL
+    grp varchar(250) NOT NULL,
+    PRIMARY KEY (server(150), username(200), jid, grp(150))
 ) CHARACTER SET utf8mb4
   ROW_FORMAT=DYNAMIC;
 
-CREATE INDEX pk_rosterg_user_jid ON rostergroups(username(75), jid(75));
-
+CREATE TABLE roster_version (
+    server varchar(250),
+    username varchar(250),
+    version text NOT NULL,
+    PRIMARY KEY (server, username)
+) CHARACTER SET utf8mb4
+  ROW_FORMAT=DYNAMIC;
 
 CREATE TABLE vcard (
     username varchar(150),
@@ -137,17 +141,20 @@ CREATE INDEX i_vcard_search_lorgname  ON vcard_search(lorgname);
 CREATE INDEX i_vcard_search_lorgunit  ON vcard_search(lorgunit);
 
 CREATE TABLE privacy_default_list (
-    username varchar(250) PRIMARY KEY,
-    name varchar(250) NOT NULL
+    server varchar(250) NOT NULL,
+    username varchar(250) NOT NULL,
+    name varchar(250) NOT NULL,
+    PRIMARY KEY (server, username)
 ) CHARACTER SET utf8mb4
   ROW_FORMAT=DYNAMIC;
 
 CREATE TABLE privacy_list (
+    server varchar(250) NOT NULL,
     username varchar(250) NOT NULL,
     name varchar(250) NOT NULL,
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT UNIQUE,
     created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (username(75), name(75))
+    PRIMARY KEY (server, username(75), name(75))
 ) CHARACTER SET utf8mb4
   ROW_FORMAT=DYNAMIC;
 
@@ -156,7 +163,7 @@ CREATE TABLE privacy_list_data (
     t character(1) NOT NULL,
     value text NOT NULL,
     action character(1) NOT NULL,
-    ord bigint NOT NULL,
+    ord INT NOT NULL,
     match_all boolean NOT NULL,
     match_iq boolean NOT NULL,
     match_message boolean NOT NULL,
@@ -167,20 +174,12 @@ CREATE TABLE privacy_list_data (
   ROW_FORMAT=DYNAMIC;
 
 CREATE TABLE private_storage (
+    server varchar(250) NOT NULL,
     username varchar(250) NOT NULL,
     namespace varchar(250) NOT NULL,
     data text NOT NULL,
-    created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP
-) CHARACTER SET utf8mb4
-  ROW_FORMAT=DYNAMIC;
-
-CREATE INDEX i_private_storage_username USING BTREE ON private_storage(username);
-CREATE UNIQUE INDEX i_private_storage_username_namespace USING BTREE ON private_storage(username(75), namespace(75));
-
--- Not tested in mysql
-CREATE TABLE roster_version (
-    username varchar(250) PRIMARY KEY,
-    version text NOT NULL
+    created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(server, username, namespace)
 ) CHARACTER SET utf8mb4
   ROW_FORMAT=DYNAMIC;
 
@@ -240,6 +239,7 @@ CREATE TABLE mam_message(
   message mediumblob NOT NULL,
   search_body mediumtext,
   origin_id varchar(250) CHARACTER SET binary,
+  is_groupchat boolean NOT NULL,
   PRIMARY KEY (user_id, id),
   INDEX i_mam_message_rem USING BTREE (user_id, remote_bare_jid, id)
 ) CHARACTER SET utf8mb4
@@ -264,6 +264,7 @@ CREATE TABLE mam_config(
 ) CHARACTER SET utf8mb4
   ROW_FORMAT=DYNAMIC;
 
+-- The server field is a MUC host for MUC rooms
 CREATE TABLE mam_server_user(
   id INT UNSIGNED NOT NULL AUTO_INCREMENT,
   server    varchar(250) CHARACTER SET binary NOT NULL,
@@ -305,13 +306,19 @@ CREATE TABLE offline_message(
   ROW_FORMAT=DYNAMIC;
 CREATE INDEX i_offline_message USING BTREE ON offline_message(server, username, id);
 
+CREATE TABLE auth_token(
+    owner varchar(250)      NOT NULL PRIMARY KEY,
+    seq_no BIGINT UNSIGNED NOT NULL
+) CHARACTER SET utf8mb4
+  ROW_FORMAT=DYNAMIC;
+
 CREATE TABLE muc_light_rooms(
     id BIGINT UNSIGNED      NOT NULL AUTO_INCREMENT,
     luser VARCHAR(250)      NOT NULL,
     lserver VARCHAR(250)    NOT NULL,
     version VARCHAR(20)     NOT NULL,
     PRIMARY KEY (lserver, luser),
-    UNIQUE KEY k_id USING HASH (id)
+    UNIQUE KEY uk_muc_light_rooms_id USING BTREE (id)
 ) CHARACTER SET utf8mb4
   ROW_FORMAT=DYNAMIC;
 
@@ -345,7 +352,7 @@ CREATE TABLE muc_light_blocking(
 ) CHARACTER SET utf8mb4
   ROW_FORMAT=DYNAMIC;
 
-CREATE INDEX i_muc_light_blocking USING HASH ON muc_light_blocking(luser, lserver);
+CREATE INDEX i_muc_light_blocking_su USING BTREE ON muc_light_blocking(lserver, luser);
 
 CREATE TABLE muc_rooms(
     id SERIAL,
@@ -356,7 +363,7 @@ CREATE TABLE muc_rooms(
 );
 
 CREATE TABLE muc_room_aff(
-    room_id BIGINT          NOT NULL REFERENCES muc_rooms(id),
+    room_id BIGINT UNSIGNED NOT NULL REFERENCES muc_rooms(id),
     luser VARCHAR(250)      NOT NULL,
     lserver VARCHAR(250)    NOT NULL,
     resource VARCHAR(250)   NOT NULL,
@@ -378,13 +385,17 @@ CREATE TABLE inbox (
     luser VARCHAR(250)               NOT NULL,
     lserver VARCHAR(250)             NOT NULL,
     remote_bare_jid VARCHAR(250)     NOT NULL,
-    content blob                     NOT NULL,
-    unread_count int                 NOT NULL,
-    msg_id varchar(250),
+    msg_id VARCHAR(250),
+    box VARCHAR(64)                  NOT NULL DEFAULT 'inbox',
+    content BLOB                     NOT NULL,
     timestamp BIGINT UNSIGNED        NOT NULL,
-    PRIMARY KEY(luser, lserver, remote_bare_jid));
+    muted_until BIGINT               DEFAULT 0,
+    unread_count INT                 NOT NULL,
+    PRIMARY KEY(lserver, luser, remote_bare_jid));
 
-CREATE INDEX i_inbox USING BTREE ON inbox(luser, lserver, timestamp);
+CREATE INDEX i_inbox USING BTREE ON inbox(lserver, luser, timestamp);
+CREATE INDEX i_inbox_us_box USING BTREE ON inbox(lserver, luser, box);
+CREATE INDEX i_inbox_box USING BTREE ON inbox(box);
 
 CREATE TABLE pubsub_nodes (
     nidx BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -480,16 +491,17 @@ CREATE TABLE mongoose_cluster_id (
 );
 
 CREATE TABLE smart_markers (
-    from_jid VARCHAR(250) NOT NULL,
-    to_jid VARCHAR(250) NOT NULL,
-    thread VARCHAR(250) NOT NULL,
+    lserver VARBINARY(255) NOT NULL,
+    luser VARBINARY(1023) NOT NULL,
+    to_jid VARBINARY(1542) NOT NULL,
+    thread VARBINARY(250) NOT NULL,
     -- 'R' - received
     -- 'D' - displayed
     -- 'A' - acknowledged
     type ENUM('R', 'D', 'A') NOT NULL,
-    msg_id VARCHAR(250) NOT NULL,
+    msg_id VARBINARY(250) NOT NULL,
     timestamp BIGINT NOT NULL,
-    PRIMARY KEY(from_jid, to_jid, thread, type)
+    PRIMARY KEY(lserver, luser, to_jid, thread, type)
 ) CHARACTER SET utf8mb4;
 
 CREATE INDEX i_smart_markers USING BTREE ON smart_markers(to_jid, thread);
@@ -504,3 +516,64 @@ CREATE TABLE offline_markers (
 ) CHARACTER SET utf8mb4;
 
 CREATE INDEX i_offline_markers ON offline_markers(jid);
+
+CREATE TABLE domain_admins(
+     domain VARCHAR(250) NOT NULL,
+     pass_details text NOT NULL,
+     PRIMARY KEY(domain)
+);
+
+-- Mapping from domain hostname to host_type.
+-- Column id is used for ordering only.
+CREATE TABLE domain_settings (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    domain VARCHAR(250) NOT NULL,
+    host_type VARCHAR(250) NOT NULL,
+    status TINYINT NOT NULL DEFAULT 1
+);
+
+-- A new record is inserted into domain_events, each time
+-- domain_settings table is updated.
+-- Column id is used for ordering and not related to domain_settings.id.
+CREATE TABLE domain_events (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    domain VARCHAR(250) NOT NULL
+);
+CREATE INDEX i_domain_events_domain ON domain_events(domain);
+
+CREATE TABLE discovery_nodes (
+    cluster_name varchar(250) NOT NULL,
+    node_name varchar(250) NOT NULL,
+    node_num INT UNSIGNED NOT NULL,
+    address varchar(250) NOT NULL DEFAULT '', -- empty means we should ask DNS
+    updated_timestamp BIGINT NOT NULL, -- in seconds
+    PRIMARY KEY (node_name)
+);
+CREATE UNIQUE INDEX i_discovery_nodes_node_num USING BTREE ON discovery_nodes(cluster_name, node_num);
+
+CREATE TABLE caps (
+    node varchar(250) NOT NULL,
+    sub_node varchar(250) NOT NULL,
+    features text NOT NULL,
+    PRIMARY KEY (node, sub_node)
+);
+
+-- XEP-0484: Fast Authentication Streamlining Tokens
+-- Module: mod_fast_auth_token
+CREATE TABLE fast_auth_token(
+     server VARCHAR(250) NOT NULL,
+     username VARCHAR(250) NOT NULL,
+     -- Device installation ID (User-Agent ID)
+     -- Unique for each device
+     -- https://xmpp.org/extensions/xep-0388.html#initiation
+     user_agent_id VARCHAR(250) NOT NULL,
+     current_token VARCHAR(250),
+     current_expire BIGINT, -- seconds unix timestamp
+     current_count INT, -- replay counter
+     current_mech_id TINYINT UNSIGNED,
+     new_token VARCHAR(250),
+     new_expire BIGINT, -- seconds unix timestamp
+     new_count INT,
+     new_mech_id TINYINT UNSIGNED,
+     PRIMARY KEY(server, username, user_agent_id)
+);

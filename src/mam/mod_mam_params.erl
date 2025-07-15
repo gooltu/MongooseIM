@@ -16,60 +16,53 @@
 
 -module(mod_mam_params).
 
--type mam_module() :: mod_mam | mod_mam_muc.
+-type mam_module() :: mod_mam_pm | mod_mam_muc.
 
 -export([extra_params_module/2, max_result_limit/2, default_result_limit/2,
-         has_full_text_search/2, is_archivable_message_fun/2, archive_chat_markers/2,
-         add_stanzaid_element/2]).
+         has_full_text_search/2, is_archivable_message_module/2, send_message_mod/2,
+         archive_chat_markers/2, add_stanzaid_element/2, extra_fin_element_module/2,
+         enforce_simple_queries/2]).
 
 %%--------------------------------------------------------------------
 %% API
 %%--------------------------------------------------------------------
 
--spec extra_params_module(mam_module(), Host :: ejabberd:lserver()) -> module() | undefined.
-extra_params_module(Module, Host) ->
-    param(Module, Host, extra_lookup_params, undefined).
+-spec extra_params_module(mam_module(), mongooseim:host_type()) -> module() | undefined.
+extra_params_module(Module, HostType) ->
+    gen_mod:get_module_opt(HostType, Module, extra_lookup_params, undefined).
 
--spec max_result_limit(mam_module(), Host :: ejabberd:lserver()) -> pos_integer().
-max_result_limit(Module, Host) ->
-    param(Module, Host, max_result_limit, 50).
+-spec max_result_limit(mam_module(), mongooseim:host_type()) -> pos_integer().
+max_result_limit(Module, HostType) ->
+    gen_mod:get_module_opt(HostType, Module, max_result_limit).
 
--spec default_result_limit(mam_module(), Host :: ejabberd:lserver()) -> pos_integer().
-default_result_limit(Module, Host) ->
-    param(Module, Host, default_result_limit, 50).
+-spec default_result_limit(mam_module(), mongooseim:host_type()) -> pos_integer().
+default_result_limit(Module, HostType) ->
+    gen_mod:get_module_opt(HostType, Module, default_result_limit).
 
+-spec enforce_simple_queries(mam_module(), mongooseim:host_type()) -> module() | undefined.
+enforce_simple_queries(Module, HostType) ->
+    gen_mod:get_module_opt(HostType, Module, enforce_simple_queries, false).
 
--spec has_full_text_search(Module :: mod_mam | mod_mam_muc, Host :: ejabberd:server()) -> boolean().
-has_full_text_search(Module, Host) ->
-    param(Module, Host, full_text_search, true).
+-spec has_full_text_search(Module :: mod_mam_pm | mod_mam_muc, mongooseim:host_type()) -> boolean().
+has_full_text_search(Module, HostType) ->
+    gen_mod:get_module_opt(HostType, Module, full_text_search).
 
--spec is_archivable_message_fun(mam_module(), Host :: ejabberd:lserver()) ->
-                                       MF :: {module(), atom()}.
-is_archivable_message_fun(Module, Host) ->
-    {IsArchivableModule, IsArchivableFunction} =
-        case param(Module, Host, is_archivable_message, undefined) of
-            undefined ->
-                case param(Module, Host, is_complete_message, undefined) of
-                    undefined -> {mod_mam_utils, is_archivable_message};
-                    OldStyleMod -> {OldStyleMod, is_complete_message}
-                end;
+-spec is_archivable_message_module(mam_module(), mongooseim:host_type()) -> module().
+is_archivable_message_module(Module, HostType) ->
+    gen_mod:get_module_opt(HostType, Module, is_archivable_message).
 
-            Mod -> {Mod, is_archivable_message}
-        end,
-    {IsArchivableModule, IsArchivableFunction}.
+-spec send_message_mod(mam_module(), mongooseim:host_type()) -> module().
+send_message_mod(Module, HostType) ->
+    gen_mod:get_module_opt(HostType, Module, send_message).
 
--spec archive_chat_markers(mam_module(), Host :: ejabberd:lserver()) -> boolean().
-archive_chat_markers(Module, Host) ->
-    param(Module, Host, archive_chat_markers, false).
+-spec archive_chat_markers(mam_module(), mongooseim:host_type()) -> boolean().
+archive_chat_markers(Module, HostType) ->
+    gen_mod:get_module_opt(HostType, Module, archive_chat_markers).
 
--spec add_stanzaid_element(mam_module(), Host :: ejabberd:lserver()) -> boolean().
-add_stanzaid_element(Module, Host) ->
-    not param(Module, Host, no_stanzaid_element, false).
+-spec add_stanzaid_element(mam_module(), mongooseim:host_type()) -> boolean().
+add_stanzaid_element(Module, HostType) ->
+    not gen_mod:get_module_opt(HostType, Module, no_stanzaid_element).
 
-%%--------------------------------------------------------------------
-%% Internal functions
-%%--------------------------------------------------------------------
-
--spec param(mam_module(), Host :: ejabberd:lserver(), Opt :: term(), Default :: term()) -> term().
-param(Module, Host, Opt, Default) ->
-    gen_mod:get_module_opt(Host, Module, Opt, Default).
+-spec extra_fin_element_module(mam_module(), mongooseim:host_type()) -> module() | undefined.
+extra_fin_element_module(Module, HostType) ->
+    gen_mod:get_module_opt(HostType, Module, extra_fin_element, undefined).

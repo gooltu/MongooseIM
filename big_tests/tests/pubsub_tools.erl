@@ -8,67 +8,11 @@
 
 -module(pubsub_tools).
 
--include_lib("escalus/include/escalus.hrl").
--include_lib("common_test/include/ct.hrl").
+-compile([export_all, nowarn_export_all]).
+
 -include_lib("escalus/include/escalus_xmlns.hrl").
 -include_lib("exml/include/exml.hrl").
--include_lib("exml/include/exml_stream.hrl").
 -include_lib("eunit/include/eunit.hrl").
-%% Send request, receive (optional) response
--export([pubsub_node/0,
-         pubsub_node_with_num/1,
-         pubsub_node_with_subdomain/1,
-         pubsub_node_with_num_and_domain/2,
-         domain/0,
-         node_addr/0,
-         node_addr/1,
-         rand_name/1,
-         pubsub_node_name/0,
-         encode_group_name/2,
-         decode_group_name/1]).
--export([
-         discover_nodes/3,
-
-         create_node/3,
-         delete_node/3,
-
-         get_configuration/3,
-         set_configuration/4,
-
-         get_affiliations/3,
-         set_affiliations/4,
-
-         publish/4,
-         publish_without_node_attr/4,
-         retract_item/4,
-         get_all_items/3,
-         get_item/4,
-         purge_all_items/3,
-
-         subscribe/3,
-         unsubscribe/3,
-         get_user_subscriptions/3,
-         get_subscription_options/3,
-         upsert_subscription_options/3,
-         get_node_subscriptions/3,
-         submit_subscription_response/5,
-         get_pending_subscriptions/3,
-         get_pending_subscriptions/4,
-         modify_node_subscriptions/4,
-
-         create_node_names/1,
-         create_nodes/1
-        ]).
-
-%% Receive notification or response
--export([receive_item_notification/4,
-         check_item_notification/4,
-         receive_subscription_notification/4,
-         receive_subscription_request/4,
-         receive_subscription_requests/4,
-         receive_node_creation_notification/3,
-         receive_subscribe_response/3,
-         receive_unsubscribe_response/3]).
 
 -type pubsub_node() :: {binary(), binary()}.
 
@@ -112,12 +56,14 @@ create_node(User, Node, Options) ->
                 #xmlel{children = [
                     #xmlel{children = [CreateEl | OtherEls]} = PubsubEl
                 ]} = IQ = Request0,
-                NewCreateEl = CreateEl#xmlel{attrs = [{<<"type">>, Type} | CreateEl#xmlel.attrs]},
+                Attrs = CreateEl#xmlel.attrs,
+                NewCreateEl = CreateEl#xmlel{attrs = Attrs#{<<"type">> => Type}},
                 NewPubsubEl = PubsubEl#xmlel{children = [NewCreateEl | OtherEls]},
                 IQ#xmlel{children = [NewPubsubEl]}
         end,
 
-    send_request_and_receive_response(User, Request, Id, Options).
+    ModifyF = proplists:get_value(modify_request, Options, fun(R) -> R end),
+    send_request_and_receive_response(User, ModifyF(Request), Id, Options).
 
 delete_node(User, Node, Options) ->
     Id = id(User, Node, <<"delete_node">>),
@@ -136,7 +82,15 @@ get_configuration(User, Node, Options) ->
 set_configuration(User, Node, Config, Options) ->
     Id = id(User, Node, <<"set_config">>),
     Request = escalus_pubsub_stanza:set_configuration(User, Id, Node, Config),
-    send_request_and_receive_response(User, Request, Id, Options).
+    ModifyF = proplists:get_value(modify_request, Options, fun(R) -> R end),
+    send_request_and_receive_response(User, ModifyF(Request), Id, Options).
+
+get_default_configuration(User, NodeAddr, Options) ->
+    Id = id(User, {NodeAddr, <<>>}, <<"get_default_config">>),
+    Request = escalus_pubsub_stanza:get_default_configuration(User, Id, NodeAddr),
+    NOptions = lists:keystore(preprocess_response, 1, Options,
+                              {preprocess_response, fun decode_default_config_form/1}),
+    send_request_and_receive_response(User, Request, Id, NOptions, fun verify_form_values/2).
 
 %% ------------------------ affiliations --------------------------------
 
@@ -157,12 +111,17 @@ publish(User, ItemId, Node, Options) ->
     Request = publish_request(Id, User, ItemId, Node, Options),
     send_request_and_receive_response(User, Request, Id, Options).
 
+publish_with_options(User, ItemId, Node, Options, PublishOptions) ->
+    Id = id(User, Node, <<"publish">>),
+    Request = publish_request(Id, User, ItemId, Node, Options, PublishOptions),
+    send_request_and_receive_response(User, Request, Id, Options).
+
 publish_without_node_attr(User, ItemId, Node, Options) ->
     Id = id(User, Node, <<"publish">>),
     Request = publish_request(Id, User, ItemId, Node, Options),
     [PubSubEl] = Request#xmlel.children,
     [PublishEl] = PubSubEl#xmlel.children,
-    PublishElDefect = PublishEl#xmlel{ attrs = [] },
+    PublishElDefect = PublishEl#xmlel{ attrs = #{} },
     RequestDefect = Request#xmlel{ children = [PubSubEl#xmlel{ children = [PublishElDefect] }] },
     send_request_and_receive_response(User, RequestDefect, Id, Options).
 
@@ -172,6 +131,14 @@ publish_request(Id, User, ItemId, Node, Options) ->
         {true, Payload} -> escalus_pubsub_stanza:publish(User, ItemId, Payload, Id, Node);
         false -> escalus_pubsub_stanza:publish(User, Id, Node);
         #xmlel{} = El -> escalus_pubsub_stanza:publish(User, ItemId, El, Id, Node)
+    end.
+
+publish_request(Id, User, ItemId, Node, Options, PublishOptions) ->
+    case proplists:get_value(with_payload, Options, true) of
+        true -> escalus_pubsub_stanza:publish_with_options(User, ItemId, item_content(), Id, Node, PublishOptions);
+        {true, Payload} -> escalus_pubsub_stanza:publish_with_options(User, ItemId, Payload, Id, Node, PublishOptions);
+        false -> escalus_pubsub_stanza:publish(User, Id, Node, PublishOptions);
+        #xmlel{} = El -> escalus_pubsub_stanza:publish_with_options(User, ItemId, El, Id, Node, PublishOptions)
     end.
 
 retract_item(User, Node, ItemId, Options) ->
@@ -264,13 +231,15 @@ submit_subscription_response(User, {MsgId, SubForm}, Node, Allow, Options) ->
 
 get_pending_subscriptions(User, Node, Options) ->
     Id = id(User, Node, <<"request_pending_subscriptions">>),
-    Request = escalus_pubsub_stanza:get_pending_subscriptions(User, Id, Node),
+    ModifyF = proplists:get_value(modify_request, Options, fun(R) -> R end),
+    Request = ModifyF(escalus_pubsub_stanza:get_pending_subscriptions(User, Id, Node)),
     send_request_and_receive_response(User, Request, Id, Options),
     Request.
 
 get_pending_subscriptions(User, NodesAddr, NodeNames, Options) ->
     Id = id(User, {<<>>, <<>>}, <<"get_pending_subscriptions">>),
-    Request = escalus_pubsub_stanza:get_pending_subscriptions(User, Id, NodesAddr),
+    ModifyF = proplists:get_value(modify_request, Options, fun(R) -> R end),
+    Request = ModifyF(escalus_pubsub_stanza:get_pending_subscriptions(User, Id, NodesAddr)),
     Response = send_request_and_receive_response(User, Request, Id, Options),
     check_pending_subscriptions(Response, NodeNames).
 
@@ -606,10 +575,13 @@ id(User, {NodeAddr, NodeName}, Suffix) ->
 
 item_content() ->
     #xmlel{name = <<"entry">>,
-           attrs = [{<<"xmlns">>, <<"http://www.w3.org/2005/Atom">>}]}.
+           attrs = #{<<"xmlns">> => <<"http://www.w3.org/2005/Atom">>}}.
 
 decode_config_form(IQResult) ->
     decode_form(IQResult, ?NS_PUBSUB_OWNER, <<"configure">>).
+
+decode_default_config_form(IQResult) ->
+    decode_form(IQResult, ?NS_PUBSUB_OWNER, <<"default">>).
 
 decode_options_form(IQResult) ->
     decode_form(IQResult, ?NS_PUBSUB, <<"options">>).
@@ -688,7 +660,7 @@ pubsub_node_with_num_and_domain(Num, Dom) ->
 
 -spec rand_name(binary()) -> binary().
 rand_name(Prefix) ->
-    Suffix = base64:encode(crypto:strong_rand_bytes(6)),
+    Suffix = base64:encode(crypto:strong_rand_bytes(8)),
     <<Prefix/binary, "_", Suffix/binary>>.
 
 %% Generates nodetree_tree-safe names
@@ -704,6 +676,9 @@ decode_group_name(ComplexName) ->
     [NodeTree, BaseName] = binary:split(atom_to_binary(ComplexName, utf8), <<"+">>),
     #{node_tree => NodeTree, base_name => binary_to_atom(BaseName, utf8)}.
 
+nodetree_to_mod(NodeTree) ->
+    binary_to_atom(<<"nodetree_", NodeTree/binary>>).
+
 -spec create_node_names(non_neg_integer()) -> [pubsub_node()].
 create_node_names(Count) ->
     [pubsub_node_with_num(N) || N <- lists:seq(1, Count)].
@@ -712,4 +687,3 @@ create_nodes(List) ->
     lists:map(fun({User, Node, Opts}) ->
                       pubsub_tools:create_node(User, Node, Opts)
               end, List).
-

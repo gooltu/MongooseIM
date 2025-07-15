@@ -15,9 +15,11 @@
 %%==============================================================================
 -module(http_client_SUITE).
 
--compile(export_all).
+-compile([export_all, nowarn_export_all]).
 
--include_lib("common_test/include/ct.hrl").
+-import(config_parser_helper, [config/2]).
+
+-include_lib("eunit/include/eunit.hrl").
 
 all() ->
     [get_test,
@@ -28,7 +30,7 @@ all() ->
     ].
 
 init_per_suite(Config) ->
-    http_helper:start(8080, '_', fun process_request/1),
+    http_helper:start(8081, '_', fun process_request/1),
     Pid = self(),
     spawn(fun() ->
                   register(test_helper, self()),
@@ -53,45 +55,37 @@ end_per_suite(_Config) ->
     exit(whereis(ejabberd_sup), shutdown),
     whereis(test_helper) ! stop.
 
-init_per_testcase(request_timeout_test, Config) ->
-    mongoose_wpool:start_configured_pools([{http, global, pool(), [],
-                                            [{server, "http://localhost:8080"},
-                                             {request_timeout, 10}]}],
-                                          [<<"a.com">>]),
-    Config;
-init_per_testcase(pool_timeout_test, Config) ->
-    mongoose_wpool:start_configured_pools([{http, global, pool(),
-                                            [{workers, 1},
-                                             {max_overflow, 0},
-                                             {strategy, available_worker},
-                                             {call_timeout, 10}],
-                                            [{server, "http://localhost:8080"}]}],
-                                          [<<"a.com">>]),
-    Config;
-init_per_testcase(_TC, Config) ->
-    mongoose_wpool:start_configured_pools([{http, global, pool(), [],
-                                            [{server, "http://localhost:8080"}]}],
-                                          [<<"a.com">>]),
+init_per_testcase(TC, Config) ->
+    Pool = config([outgoing_pools, http, pool()], pool_opts(TC)),
+    mongoose_wpool:start_configured_pools([Pool], [], [<<"a.com">>]),
     Config.
+
+pool_opts(request_timeout_test) ->
+    #{conn_opts => #{host => "http://localhost:8081", request_timeout => 10}};
+pool_opts(pool_timeout_test) ->
+    #{opts => #{workers => 1, max_overflow => 0, strategy => available_worker, call_timeout => 10},
+      conn_opts => #{host => "http://localhost:8081", request_timeout => 5000}};
+pool_opts(_TC) ->
+    #{conn_opts => #{host => "http://localhost:8081", request_timeout => 1000}}.
 
 end_per_testcase(_TC, _Config) ->
     mongoose_wpool:stop(http, global, pool()).
 
 get_test(_Config) ->
     Result = mongoose_http_client:get(global, pool(), <<"some/path">>, []),
-    {ok, {<<"200">>, <<"OK">>}} = Result.
+    ?assertEqual({ok, {<<"200">>, <<"OK">>}}, Result).
 
 no_pool_test(_Config) ->
     Result = mongoose_http_client:get(global, non_existent_pool, <<"some/path">>, []),
-    {error, pool_not_started} = Result.
+    ?assertEqual({error, pool_not_started}, Result).
 
 post_test(_Config) ->
     Result = mongoose_http_client:post(global, pool(), <<"some/path">>, [], <<"test request">>),
-    {ok, {<<"200">>, <<"OK">>}} = Result.
+    ?assertEqual({ok, {<<"200">>, <<"OK">>}}, Result).
 
 request_timeout_test(_Config) ->
     Result = mongoose_http_client:get(global, pool(), <<"some/path?sleep=true">>, []),
-    {error, request_timeout} = Result.
+    ?assertEqual({error, request_timeout}, Result).
 
 pool_timeout_test(_Config) ->
     Pid = self(),
@@ -101,7 +95,7 @@ pool_timeout_test(_Config) ->
           end),
     timer:sleep(10), % wait for the only pool worker to start handling the request
     Result = mongoose_http_client:get(global, pool(), <<"some/path">>, []),
-    {error, pool_timeout} = Result,
+    ?assertEqual({error, pool_timeout}, Result),
     receive finished -> ok after 1000 -> error(no_finished_message) end.
 
 pool() -> tmp_pool.

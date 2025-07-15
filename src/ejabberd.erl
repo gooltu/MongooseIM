@@ -25,71 +25,19 @@
 
 -module(ejabberd).
 -author('alexey@process-one.net').
--xep([{xep, 212}, {version, "1.0"}]).
--export([start/0,
-         stop/0,
-         get_pid_file/0,
-         get_status_file/0,
-         get_so_path/0,
-         get_bin_path/0]).
-
--include("jlib.hrl").
+-export([get_pid_file/0, get_status_file/0]).
 
 -type lang() :: binary().
-
--type sockmod() :: gen_tcp
-                 | ejabberd_socket
-                 | mod_bosh_socket
-                 | mod_websockets
-                 | ejabberd_tls
-                 | ejabberd_zlib.
 
 %% Incoming event from XML stream. Used everywhere in xmlstream fsm modules
 -type xml_stream_item() :: 'closed'
                           | 'timeout'
                           | {'xmlstreamelement', exml:element()}
-                          | {'xmlstreamend', _}
-                          | {'xmlstreamerror', _}
-                          | {'xmlstreamstart', Name :: any(), Attrs :: list()}.
+                          | exml_stream:start()
+                          | exml_stream:stop()
+                          | jlib:xmlstreamerror().
 
--export_type([lang/0,
-              sockmod/0,
-              xml_stream_item/0
-             ]).
-
-start() ->
-    application:ensure_all_started(mongooseim).
-
-stop() ->
-    application:stop(mongooseim).
-
--spec get_so_path() -> binary() | string().
-get_so_path() ->
-    case os:getenv("EJABBERD_SO_PATH") of
-        false ->
-            case code:priv_dir(mongooseim) of
-                {error, _} ->
-                    ".";
-                Path ->
-                    filename:join([Path, "lib"])
-            end;
-        Path ->
-            Path
-    end.
-
--spec get_bin_path() -> binary() | string().
-get_bin_path() ->
-    case os:getenv("EJABBERD_BIN_PATH") of
-        false ->
-            case code:priv_dir(ejabberd) of
-                {error, _} ->
-                    ".";
-                Path ->
-                    filename:join([Path, "bin"])
-            end;
-        Path ->
-            Path
-    end.
+-export_type([lang/0, xml_stream_item/0]).
 
 -spec get_pid_file() -> 'false' | nonempty_string().
 get_pid_file() ->

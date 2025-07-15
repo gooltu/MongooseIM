@@ -12,8 +12,7 @@
 
 -export([get_cert_domains/1,
          get_common_name/1,
-         get_xmpp_addresses/1,
-         get_dns_addresses/1
+         get_xmpp_addresses/1
 ]).
 
 -include_lib("public_key/include/public_key.hrl").
@@ -32,7 +31,7 @@ get_common_name(Cert) ->
         CN
     catch
         Class:Exception:StackTrace ->
-            log_exception(Class,Exception,StackTrace),
+            log_exception(Cert, Class, Exception, StackTrace),
             error
     end.
 
@@ -49,14 +48,16 @@ get_xmpp_addresses(Cert) ->
                  case 'XmppAddr':decode('XmppAddr', V) of
                      {ok, XmppAddr} -> XmppAddr;
                      Error ->
-                         ?DEBUG("'XmppAddr':decode/2 failed with ~p",[Error]),
+                         ?LOG_DEBUG(#{what => get_xmpp_addresses_failed,
+                                      text => <<"'XmppAddr':decode/2 failed">>,
+                                      cert => Cert, reason => Error}),
                          ok
                  end
              end || {otherName, #'AnotherName'{'type-id' = ?'id-on-xmppAddr', value = V}} <- SANs],
         [Addr || Addr <- XmppAddresses, is_binary(Addr)]
     catch
         Class:Exception:StackTrace ->
-            log_exception(Class, Exception,StackTrace),
+            log_exception(Cert, Class, Exception,StackTrace),
             []
     end.
 
@@ -71,7 +72,7 @@ get_dns_addresses(Cert) ->
         [DNS || {dNSName, DNS} <- SANs]
     catch
         Class:Exception:StackTrace ->
-            log_exception(Class,Exception,StackTrace),
+            log_exception(Cert, Class, Exception, StackTrace),
             []
     end.
 
@@ -91,12 +92,12 @@ convert_to_bin(Val) when is_list(Val) ->
 convert_to_bin(Val) ->
     Val.
 
--spec get_lserver_from_addr(bitstring() | string(), boolean()) -> [bitstring()].
+-spec get_lserver_from_addr(bitstring() | string(), boolean()) -> [binary()].
 get_lserver_from_addr(V, UTF8) when is_binary(V); is_list(V) ->
     Val = convert_to_bin(V),
     case {jid:from_binary(Val), UTF8} of
         {#jid{luser = <<"">>, lserver = LD, lresource = <<"">>}, true} ->
-            case ejabberd_s2s:domain_utf8_to_ascii(LD) of
+            case mongoose_s2s_lib:domain_utf8_to_ascii(LD, binary) of
                 false -> [];
                 PCLD -> [PCLD]
             end;
@@ -106,6 +107,7 @@ get_lserver_from_addr(V, UTF8) when is_binary(V); is_list(V) ->
 get_lserver_from_addr(_, _) -> [].
 
 
-log_exception(Class,Exception,StackTrace) ->
-    ?DEBUG("failed to parse certificate with ~p:~p~n\t~p~n",
-           [Class,Exception,StackTrace]).
+log_exception(_Cert, Class, Exception, StackTrace) ->
+    ?LOG_ERROR(#{what => <<"cert_parsing_failed">>,
+                 text => <<"failed to parse certificate">>,
+                 class => Class, reason => Exception, stacktrace => StackTrace}).

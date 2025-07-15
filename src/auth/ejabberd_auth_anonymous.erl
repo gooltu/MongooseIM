@@ -26,179 +26,150 @@
 -module(ejabberd_auth_anonymous).
 -author('mickael.remond@process-one.net').
 
--export([
-         start/1,
+-export([start/1,
          stop/1,
-         anonymous_user_exist/2,
-         allow_multiple_connections/1,
-         register_connection/4,
-         unregister_connection/5,
-         session_cleanup/5
+         config_spec/0,
+         register_connection/3,
+         unregister_connection/3,
+         session_cleanup/3
         ]).
 
--behaviour(ejabberd_gen_auth).
+-behaviour(mongoose_gen_auth).
+
 %% Function used by ejabberd_auth:
--export([login/2,
-         set_password/3,
+-export([login/3,
+         set_password/4,
          authorize/1,
-         try_register/3,
-         dirty_get_registered_users/0,
-         get_vh_registered_users/1,
-         get_password/2,
          get_password/3,
-         does_user_exist/2,
-         remove_user/2,
+         does_user_exist/3,
          supports_sasl_module/2,
-         get_vh_registered_users/2,
-         get_vh_registered_users_number/1,
-         get_vh_registered_users_number/2,
-         get_password_s/2                  % not impl
+         get_registered_users/3,
+         supported_features/0,
+         instrumentation/1
         ]).
 
 %% Internal
--export([check_password/3,
-         check_password/5]).
+-export([check_password/4,
+         check_password/6]).
+
+-ignore_xref([login/3]).
 
 -include("mongoose.hrl").
 -include("jlib.hrl").
--record(anonymous, {us  :: jid:simple_bare_jid(),
-                    sid :: ejabberd_sm:sid()
-                   }).
+-include("session.hrl").
+-include("mongoose_config_spec.hrl").
 
-%% @doc Create the anonymous table if at least one virtual host has anonymous
+%% @doc Create the anonymous table if at least one host type has anonymous
 %% features enabled. Register to login / logout events
-start(Host) ->
+-spec start(mongooseim:host_type()) -> ok.
+start(HostType) ->
     %% TODO: Check cluster mode
-    mnesia:create_table(anonymous, [{ram_copies, [node()]},
-                                    {type, bag},
-                                    {attributes, record_info(fields, anonymous)}]),
-    mnesia:add_table_copy(anonymous, node(), ram_copies),
+    ejabberd_auth_anonymous_backend:init(HostType),
     %% The hooks are needed to add / remove users from the anonymous tables
-    ejabberd_hooks:add(sm_register_connection_hook, Host, ?MODULE, register_connection, 100),
-    ejabberd_hooks:add(sm_remove_connection_hook, Host, ?MODULE, unregister_connection, 100),
-    ejabberd_hooks:add(session_cleanup, Host, ?MODULE, session_cleanup, 50),
+    gen_hook:add_handlers(hooks(HostType)),
     ok.
 
-stop(Host) ->
-    ejabberd_hooks:delete(sm_register_connection_hook, Host, ?MODULE, register_connection, 100),
-    ejabberd_hooks:delete(sm_remove_connection_hook, Host, ?MODULE, unregister_connection, 100),
-    ejabberd_hooks:delete(session_cleanup, Host, ?MODULE, session_cleanup, 50),
+-spec stop(mongooseim:host_type()) -> ok.
+stop(HostType) ->
+    gen_hook:delete_handlers(hooks(HostType)),
+    ejabberd_auth_anonymous_backend:stop(HostType),
     ok.
 
-%% @doc Return true if SASL ANONYMOUS mechanism is enabled one the server
--spec is_sasl_anonymous_enabled(Host :: jid:lserver()) -> boolean().
-is_sasl_anonymous_enabled(Host) ->
-    case anonymous_protocol(Host) of
-        sasl_anon -> true;
-        both      -> true;
-        _Other    -> false
-    end.
+-spec hooks(mongooseim:host_type()) -> gen_hook:hook_list().
+hooks(HostType) ->
+    [
+        {sm_register_connection, HostType, fun ?MODULE:register_connection/3, #{}, 100},
+        {sm_remove_connection, HostType, fun ?MODULE:unregister_connection/3, #{}, 100},
+        {session_cleanup, HostType, fun ?MODULE:session_cleanup/3, #{}, 50}
+    ].
 
-%% @doc Return true if anonymous login is enabled on the server
-%% anonymous login can be used with a standard authentication method
-%% (i.e. with clients that do not support anonymous login)
--spec is_login_anonymous_enabled(Host :: jid:lserver()) -> boolean().
-is_login_anonymous_enabled(Host) ->
-    case anonymous_protocol(Host) of
-        login_anon -> true;
-        both       -> true;
-        _Other     -> false
-    end.
-
-%% @doc Return the anonymous protocol to use: sasl_anon|login_anon|both
-%% defaults to login_anon
--spec anonymous_protocol(Host :: jid:lserver()) ->
-                                      'both' | 'login_anon' | 'sasl_anon'.
-anonymous_protocol(Host) ->
-    case ejabberd_config:get_local_option({anonymous_protocol, Host}) of
-        sasl_anon  -> sasl_anon;
-        login_anon -> login_anon;
-        both       -> both;
-        _Other     -> sasl_anon
-    end.
-
+-spec config_spec() -> mongoose_config_spec:config_section().
+config_spec() ->
+    #section{
+       items = #{<<"backend">> => #option{type = atom, validate = {module, ?MODULE}},
+                 <<"allow_multiple_connections">> => #option{type = boolean},
+                 <<"protocol">> => #option{type = atom,
+                                           validate = {enum, [sasl_anon, login_anon, both]}}
+                },
+       defaults = #{<<"backend">> => mnesia,
+                    <<"allow_multiple_connections">> => false,
+                    <<"protocol">> => sasl_anon}
+      }.
 
 %% @doc Return true if multiple connections have been allowed in the config file
 %% defaults to false
--spec allow_multiple_connections(Host :: jid:lserver()) -> boolean().
-allow_multiple_connections(Host) ->
-    ejabberd_config:get_local_option({allow_multiple_connections, Host}) =:= true.
+-spec allow_multiple_connections(mongooseim:host_type()) -> boolean().
+allow_multiple_connections(HostType) ->
+    mongoose_config:get_opt([{auth, HostType}, anonymous, allow_multiple_connections]).
 
+does_user_exist(HostType, LUser, LServer) ->
+    does_anonymous_user_exist(HostType, LUser, LServer).
 
 %% @doc Check if user exist in the anonymous database
--spec anonymous_user_exist(LUser :: jid:luser(),
-                           LServer :: jid:lserver()) -> boolean().
-anonymous_user_exist(LUser, LServer) ->
+-spec does_anonymous_user_exist(mongooseim:host_type(), jid:luser(), jid:lserver()) -> boolean().
+does_anonymous_user_exist(HostType, LUser, LServer) ->
     US = {LUser, LServer},
-    case catch mnesia:dirty_read({anonymous, US}) of
-        [] ->
-            false;
-        [_H|_T] ->
-            true
-    end.
-
+    ejabberd_auth_anonymous_backend:does_anonymous_user_exist(HostType, US).
 
 %% @doc Remove connection from Mnesia tables
--spec remove_connection(SID :: ejabberd_sm:sid(),
-                        LUser :: jid:luser(),
-                        LServer :: jid:lserver()
-                        ) -> {atomic|aborted|error, _}.
-remove_connection(SID, LUser, LServer) ->
+-spec remove_connection(
+        mongooseim:host_type(), ejabberd_sm:sid(), jid:luser(), jid:lserver()) -> ok.
+remove_connection(HostType, SID, LUser, LServer) ->
     US = {LUser, LServer},
-    F = fun() ->
-                mnesia:delete_object({anonymous, US, SID})
-        end,
-    mnesia:transaction(F).
-
+    ejabberd_auth_anonymous_backend:remove_connection(HostType, SID, US).
 
 %% @doc Register connection
--spec register_connection(Acc,
-                          SID :: ejabberd_sm:sid(),
-                          JID :: jid:jid(),
-                          Info :: list()) -> Acc when Acc :: any().
-register_connection(Acc, SID, #jid{luser = LUser, lserver = LServer}, Info) ->
-    case lists:keyfind(auth_module, 1, Info) of
-        {_, ?MODULE} ->
-            mongoose_hooks:register_user(LServer, ok, LUser),
-            US = {LUser, LServer},
-            mnesia:sync_dirty(
-              fun() -> mnesia:write(#anonymous{us = US, sid=SID})
-              end);
-        _ ->
-            ok
-    end,
-    Acc.
-
+-spec register_connection(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: term(),
+    Params :: map(),
+    Extra :: map().
+register_connection(Acc,
+                    #{sid := SID,
+                      jid := #jid{luser = LUser, lserver = LServer},
+                      info := #{auth_module := AuthModule}},
+                    #{host_type := HostType})
+  when AuthModule =:= ejabberd_auth_anonymous; % login_anon
+       AuthModule =:= cyrsasl_anonymous -> % sasl_anon
+    mongoose_instrument:execute(auth_anonymous_register_user, #{host_type => HostType},
+                                #{count => 1, user => LUser, server => LServer}),
+    mongoose_hooks:register_user(HostType, LServer, LUser),
+    US = {LUser, LServer},
+    ejabberd_auth_anonymous_backend:add_connection(HostType, SID, US),
+    {ok, Acc};
+register_connection(Acc, _Params, _Extra) ->
+    {ok, Acc}.
 
 %% @doc Remove an anonymous user from the anonymous users table
--spec unregister_connection(Acc :: map(),
-                            SID :: ejabberd_sm:sid(),
-                            JID :: jid:jid(),
-                            any(), ejabberd_sm:close_reason()) -> {atomic|error|aborted, _}.
-unregister_connection(Acc, SID, #jid{luser = LUser, lserver = LServer}, _, _) ->
-    purge_hook(anonymous_user_exist(LUser, LServer),
-               LUser, LServer),
-    remove_connection(SID, LUser, LServer),
-    Acc.
-
+-spec unregister_connection(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: mongoose_acc:t(),
+    Params :: map(),
+    Extra :: map().
+unregister_connection(Acc, #{sid := SID, jid := #jid{luser = LUser, lserver = LServer}},
+                      #{host_type := HostType}) ->
+    mongoose_instrument:execute(auth_anonymous_unregister_user, #{host_type => HostType},
+                                #{count => 1, user => LUser, server => LServer}),
+    purge_hook(does_anonymous_user_exist(HostType, LUser, LServer), HostType, LUser, LServer),
+    remove_connection(HostType, SID, LUser, LServer),
+    {ok, Acc}.
 
 %% @doc Launch the hook to purge user data only for anonymous users.
--spec purge_hook(boolean(), jid:luser(), jid:lserver()) -> 'ok'.
-purge_hook(false, _LUser, _LServer) ->
+-spec purge_hook(boolean(), mongooseim:host_type(), jid:luser(), jid:lserver()) -> 'ok'.
+purge_hook(false, _HostType, _LUser, _LServer) ->
     ok;
-purge_hook(true, LUser, LServer) ->
+purge_hook(true, HostType, LUser, LServer) ->
     Acc = mongoose_acc:new(#{ location => ?LOCATION,
+                              host_type => HostType,
                               lserver => LServer,
                               element => undefined }),
-    mongoose_hooks:anonymous_purge_hook(LServer, Acc, LUser).
+    mongoose_hooks:anonymous_purge(LServer, Acc, LUser).
 
--spec session_cleanup(Acc :: map(), LUser :: jid:luser(),
-                      LServer :: jid:lserver(),
-                      LResource :: jid:lresource(),
-                      SID :: ejabberd_sm:sid()) -> any().
-session_cleanup(Acc, LUser, LServer, _LResource, SID) ->
-    remove_connection(SID, LUser, LServer),
-    Acc.
+-spec session_cleanup(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: mongoose_acc:t(),
+    Params :: map(),
+    Extra :: map().
+session_cleanup(Acc, #{sid := SID, jid := #jid{luser = LUser, lserver = LServer}}, #{host_type := HostType}) ->
+    remove_connection(HostType, SID, LUser, LServer),
+    {ok, Acc}.
 
 %% ---------------------------------
 %% Specific anonymous auth functions
@@ -211,35 +182,37 @@ authorize(Creds) ->
 
 %% @doc When anonymous login is enabled, check the password for permanent users
 %% before allowing access
--spec check_password(LUser :: jid:luser(),
+-spec check_password(HostType :: mongooseim:host_type(),
+                     LUser :: jid:luser(),
                      LServer :: jid:lserver(),
                      Password :: binary()) -> boolean().
-check_password(LUser, LServer, Password) ->
-    check_password(LUser, LServer, Password, undefined, undefined).
-check_password(LUser, LServer, _Password, _Digest, _DigestGen) ->
+check_password(HostType, LUser, LServer, Password) ->
+    check_password(HostType, LUser, LServer, Password, undefined, undefined).
+
+check_password(HostType, LUser, LServer, _Password, _Digest, _DigestGen) ->
     %% We refuse login for registered accounts (They cannot logged but
     %% they however are "reserved")
-    case ejabberd_auth:is_user_exists_in_other_modules(?MODULE,
-                                                       LUser, LServer) of
+    case ejabberd_auth:does_stored_user_exist(
+           HostType, jid:make_noprep(LUser, LServer, <<>>)) of
         %% If user exists in other module, reject anonymous authentication
         true  -> false;
         %% If we are not sure whether the user exists in other module, reject anon auth
-        maybe  -> false;
-        false -> login(LUser, LServer)
+        {error, _Error}  -> false;
+        false -> login(HostType, LUser, LServer)
     end.
 
 
--spec login(LUser :: jid:luser(),
+-spec login(HostType :: mongooseim:host_type(), LUser :: jid:luser(),
             LServer :: jid:lserver()) -> boolean().
-login(LUser, LServer) ->
-    case is_login_anonymous_enabled(LServer) of
+login(HostType, LUser, LServer) ->
+    case is_protocol_enabled(HostType, login_anon) of
         false -> false;
         true  ->
-            case anonymous_user_exist(LUser, LServer) of
+            case does_anonymous_user_exist(HostType, LUser, LServer) of
                 %% Reject the login if an anonymous user with the same login
                 %% is already logged and if multiple login has not been enable
                 %% in the config file.
-                true  -> allow_multiple_connections(LServer);
+                true  -> allow_multiple_connections(HostType);
                 %% Accept login and add user to the anonymous table
                 false -> true
             end
@@ -248,92 +221,75 @@ login(LUser, LServer) ->
 
 %% @doc When anonymous login is enabled, check that the user is permanent before
 %% changing its password
--spec set_password(LUser :: jid:luser(),
+-spec set_password(HostType :: mongooseim:host_type(),
+                   LUser :: jid:luser(),
                    LServer :: jid:lserver(),
                    Password :: binary()) -> ok | {error, not_allowed}.
-set_password(LUser, LServer, _Password) ->
-    case anonymous_user_exist(LUser, LServer) of
+set_password(HostType, LUser, LServer, _Password) ->
+    case does_anonymous_user_exist(HostType, LUser, LServer) of
         true ->
             ok;
         false ->
             {error, not_allowed}
     end.
 
-%% @doc When anonymous login is enabled, check if permanent users are allowed on
-%% the server:
--spec try_register(LUser :: jid:luser(),
-                   LServer :: jid:lserver(),
-                   Password :: binary()) -> {error, not_allowed}.
-try_register(_LUser, _LServer, _Password) ->
-    {error, not_allowed}.
-
--spec dirty_get_registered_users() -> [].
-dirty_get_registered_users() ->
-    [].
-
--spec get_vh_registered_users(LServer :: jid:lserver()) -> [jid:simple_bare_jid()].
-get_vh_registered_users(LServer) ->
-    [{U, S} || {{U, S, _R}, _, _, _} <- ejabberd_sm:get_vh_session_list(LServer)].
-
--spec get_vh_registered_users(LServer :: jid:lserver(), Opts :: list()) ->
-    [jid:simple_bare_jid()].
-get_vh_registered_users(LServer, _Opts) ->
-  get_vh_registered_users(LServer).
-
+-spec get_registered_users(mongooseim:host_type(), jid:lserver(), list()) ->
+          [jid:simple_bare_jid()].
+get_registered_users(_HostType, LServer, _) ->
+    [{U, S} || #session{us = {U, S}} <- ejabberd_sm:get_vh_session_list(LServer)].
 
 %% @doc Return password of permanent user or false for anonymous users
--spec get_password(LUser :: jid:luser(),
+-spec get_password(HostType :: mongooseim:host_type(),
+                   LUser :: jid:luser(),
                    LServer :: jid:lserver()) -> binary() | false.
-get_password(LUser, LServer) ->
-    get_password(LUser, LServer, <<"">>).
-
-
--spec get_password(LUser :: jid:luser(),
-                   LServer :: jid:lserver(),
-                   DefaultValue :: binary()) -> binary() | false.
-get_password(LUser, LServer, DefaultValue) ->
-    case anonymous_user_exist(LUser, LServer) or login(LUser, LServer) of
+get_password(HostType, LUser, LServer) ->
+    case does_anonymous_user_exist(HostType, LUser, LServer) orelse login(HostType, LUser, LServer) of
         %% We return the default value if the user is anonymous
         true ->
-            DefaultValue;
+            <<>>;
         %% We return the permanent user password otherwise
         false ->
             false
     end.
 
-
-%% @doc Returns true if the user exists in the DB or if an anonymous user is
-%% logged under the given name
--spec does_user_exist(LUser :: jid:luser(),
-                     LServer :: jid:lserver()) -> boolean().
-does_user_exist(LUser, LServer) ->
-    anonymous_user_exist(LUser, LServer).
-
-
--spec remove_user(LUser :: jid:luser(),
-                  LServer :: jid:lserver()) -> {error, not_allowed}.
-remove_user(_LUser, _LServer) ->
-    {error, not_allowed}.
-
-
--spec supports_sasl_module(jid:lserver(), cyrsasl:sasl_module()) -> boolean().
-supports_sasl_module(Host, cyrsasl_anonymous) ->
-    is_sasl_anonymous_enabled(Host);
-supports_sasl_module(Host, cyrsasl_plain) ->
-    is_login_anonymous_enabled(Host);
-supports_sasl_module(Host, cyrsasl_digest) ->
-    is_login_anonymous_enabled(Host);
-supports_sasl_module(Host, Mechanism) ->
-   case mongoose_scram:enabled(Host, Mechanism) of
+%% @doc Returns true if the SASL mechanism is supportedon the server
+%% Anonymous login can be used with a standard authentication method
+%% (i.e. with clients that do not support SASL ANONYMOUS)
+-spec supports_sasl_module(mongooseim:host_type(), cyrsasl:sasl_module()) -> boolean().
+supports_sasl_module(HostType, cyrsasl_anonymous) ->
+    is_protocol_enabled(HostType, sasl_anon);
+supports_sasl_module(HostType, cyrsasl_plain) ->
+    is_protocol_enabled(HostType, login_anon);
+supports_sasl_module(HostType, cyrsasl_digest) ->
+    is_protocol_enabled(HostType, login_anon);
+supports_sasl_module(HostType, Mechanism) ->
+   case mongoose_scram:enabled(HostType, Mechanism) of
       true ->
-          is_login_anonymous_enabled(Host);
+          is_protocol_enabled(HostType, login_anon);
       _ ->
           false
 end.
 
-get_vh_registered_users_number(_LServer) -> 0.
+%% @doc Returns true if the requested anonymous protocol is enabled
+-spec is_protocol_enabled(mongooseim:host_type(), sasl_anon | login_anon) -> boolean().
+is_protocol_enabled(HostType, Protocol) ->
+    case anonymous_protocol(HostType) of
+        both -> true;
+        Protocol -> true;
+        _ -> false
+    end.
 
-get_vh_registered_users_number(_LServer, _Opts) -> 0.
+%% @doc Returns the anonymous protocol to use, defaults to sasl_anon
+-spec anonymous_protocol(mongooseim:host_type()) -> sasl_anon | login_anon | both.
+anonymous_protocol(HostType) ->
+    mongoose_config:get_opt([{auth, HostType}, anonymous, protocol]).
 
-%% @doc gen_auth unimplemented callbacks
-get_password_s(_LUser, _LServer) -> erlang:error(not_implemented).
+-spec supported_features() -> [atom()].
+supported_features() -> [dynamic_domains].
+
+-spec instrumentation(mongooseim:host_type()) -> [mongoose_instrument:spec()].
+instrumentation(HostType) ->
+    [{auth_anonymous_register_user, #{host_type => HostType},
+      #{metrics => #{count => spiral}}},
+     {auth_anonymous_unregister_user, #{host_type => HostType},
+      #{metrics => #{count => spiral}}}].

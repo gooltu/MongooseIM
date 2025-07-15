@@ -24,15 +24,14 @@
 %% gen_mod callbacks
 -export([start/2]).
 -export([stop/1]).
+-export([hooks/1]).
 
 %% ejabberd_gen_mam_archive callbacks
--export([archive_message/10]).
+-export([archive_message/3]).
 -export([lookup_messages/3]).
--export([remove_archive/4]).
--export([archive_size/4]).
-
-%gdpr
--export([get_mam_muc_gdpr_data/2]).
+-export([remove_archive/3]).
+-export([archive_size/3]).
+-export([get_mam_muc_gdpr_data/3]).
 
 -include("mongoose.hrl").
 -include("mongoose_rsm.hrl").
@@ -46,22 +45,22 @@
 %% gen_mod callbacks
 %%-------------------------------------------------------------------
 
--spec start(jid:server(), list()) -> ok.
-start(Host, _Opts) ->
-    ejabberd_hooks:add(hooks(Host)),
+-spec start(mongooseim:host_type(), gen_mod:module_opts()) -> ok.
+start(_HostType, _Opts) ->
     ok.
 
--spec stop(jid:server()) -> ok.
-stop(Host) ->
-    ejabberd_hooks:delete(hooks(Host)),
+-spec stop(mongooseim:host_type()) -> ok.
+stop(_HostType) ->
     ok.
 
 %%-------------------------------------------------------------------
 %% ejabberd_gen_mam_archive callbacks
 %%-------------------------------------------------------------------
--spec get_mam_muc_gdpr_data(ejabberd_gen_mam_archive:mam_muc_gdpr_data(), jid:jid()) ->
-    ejabberd_gen_mam_archive:mam_muc_gdpr_data().
-get_mam_muc_gdpr_data(Acc, Source) ->
+-spec get_mam_muc_gdpr_data(Acc, Params, Extra) -> {ok | stop, Acc} when
+    Acc :: ejabberd_gen_mam_archive:mam_muc_gdpr_data(),
+    Params :: #{jid := jid:jid()},
+    Extra :: gen_hook:extra().
+get_mam_muc_gdpr_data(Acc, #{jid := Source}, _Extra) ->
     BinSource = mod_mam_utils:bare_jid(Source),
     Filter = #{term => #{from_jid => BinSource}},
     Sorting = #{mam_id => #{order => asc}},
@@ -70,12 +69,21 @@ get_mam_muc_gdpr_data(Acc, Source) ->
     case mongoose_elasticsearch:search(?INDEX_NAME, ?TYPE_NAME, SearchQuery) of
         {ok, #{<<"hits">> := #{<<"hits">> := Hits}}} ->
             Messages = lists:map(fun hit_to_gdpr_mam_message/1, Hits),
-            Messages ++ Acc;
+            {ok, Messages ++ Acc};
         {error, _} ->
-            Acc
+            {ok, Acc}
     end.
 
-archive_message(_Result, Host, MessageId, _UserId, RoomJid, FromJID, SourceJid, _OriginID, _Dir, Packet) ->
+-spec archive_message(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: ok | {error, term()},
+    Params :: mod_mam:archive_message_params(),
+    Extra :: gen_hook:extra().
+archive_message(_Result, Params, #{host_type := HostType}) ->
+    #{message_id := MessageId,
+      local_jid := RoomJid,
+      remote_jid := FromJID,
+      source_jid := SourceJid,
+      packet := Packet} = Params,
     Room = mod_mam_utils:bare_jid(RoomJid),
     SourceBinJid = mod_mam_utils:full_jid(SourceJid),
     From = mod_mam_utils:bare_jid(FromJID),
@@ -83,29 +91,45 @@ archive_message(_Result, Host, MessageId, _UserId, RoomJid, FromJID, SourceJid, 
     Doc = make_document(MessageId, Room, SourceBinJid, Packet, From),
     case mongoose_elasticsearch:insert_document(?INDEX_NAME, ?TYPE_NAME, DocId, Doc) of
         {ok, _} ->
-            ok;
-        {error, _} = Err ->
-            ?ERROR_MSG("event=archive_muc_message_failed server=~s room=~s source=~s mess_id=~p reason=~1000p",
-                       [Host, Room, SourceBinJid, MessageId, Err]),
-            mongoose_metrics:update(Host, modMamDropped, 1),
-            Err
+            {ok, ok};
+        {error, Reason} = Err ->
+            mongoose_instrument:execute(mod_mam_muc_dropped, #{host_type => HostType}, #{count => 1}),
+            ?LOG_ERROR(maps:merge(Params,
+                       #{what => archive_muc_message_failed, reason => Reason,
+                         server => HostType, room => Room, source => SourceBinJid,
+                         message_id => MessageId})),
+            {ok, Err}
     end.
 
-lookup_messages(Result, Host, #{rsm := #rsm_in{direction = before, id = ID} = RSM} = Params)
+-spec lookup_messages(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: {ok, mod_mam:lookup_result()} | {error, term()},
+    Params :: mam_iq:lookup_params(),
+    Extra :: gen_hook:extra().
+lookup_messages(Result,
+                #{rsm := #rsm_in{direction = before, id = ID} = RSM} = Params,
+                #{host_type := HostType})
   when ID =/= undefined ->
-    lookup_message_page(Result, Host, RSM, Params);
-lookup_messages(Result, Host, #{rsm := #rsm_in{direction = aft, id = ID} = RSM} = Params)
+    {ok, lookup_message_page(Result, HostType, RSM, Params)};
+lookup_messages(Result,
+                #{rsm := #rsm_in{direction = aft, id = ID} = RSM} = Params,
+                #{host_type := HostType})
   when ID =/= undefined ->
-    lookup_message_page(Result, Host, RSM, Params);
-lookup_messages(Result, Host, Params) ->
-    do_lookup_messages(Result, Host, Params).
+    {ok, lookup_message_page(Result, HostType, RSM, Params)};
+lookup_messages(Result, Params, #{host_type := HostType}) ->
+    {ok, do_lookup_messages(Result, HostType, Params)}.
 
-lookup_message_page(AccResult, Host, RSM, Params) ->
+lookup_message_page(AccResult, Host, RSM, #{message_id := MsgID} = Params) ->
     PageSize = maps:get(page_size, Params),
     case do_lookup_messages(AccResult, Host, Params#{page_size := 1 + PageSize}) of
-        {error, _} = Err -> Err;
+        {error, _} = Err ->
+            Err;
         {ok, LookupResult} ->
-            mod_mam_utils:check_for_item_not_found(RSM, PageSize, LookupResult)
+            case MsgID of
+                undefined ->
+                    mod_mam_utils:check_for_item_not_found(RSM, PageSize, LookupResult);
+                _ ->
+                    {ok, LookupResult}
+            end
     end.
 
 do_lookup_messages(_Result, Host, Params) ->
@@ -118,47 +142,48 @@ do_lookup_messages(_Result, Host, Params) ->
     case mongoose_elasticsearch:search(?INDEX_NAME, ?TYPE_NAME, SearchQuery2) of
         {ok, Result} ->
             {ok, search_result_to_mam_lookup_result(Result, Params)};
-        {error, _} = Err ->
-            ?ERROR_MSG("event=lookup_muc_messages_failed server=~s reason=~1000p",
-                       [Host, Err]),
+        {error, Reason} = Err ->
+            ?LOG_ERROR(maps:merge(Params,
+                                  #{what => lookup_muc_messages_failed,
+                                    server => Host, reason => Reason})),
             Err
     end.
 
--spec archive_size(Size :: integer(),
-                   Host :: jid:server(),
-                   _ArchiveId,
-                   RoomJid :: jid:jid()) -> non_neg_integer().
-archive_size(_Size, _Host, _ArchiveId, RoomJid) ->
+-spec archive_size(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: integer(),
+    Params :: #{archive_id := mod_mam:archive_id() | undefined, room := jid:jid()},
+    Extra :: gen_hook:extra().
+archive_size(_Size, #{room := RoomJid}, _Extra) ->
     SearchQuery = build_search_query(#{owner_jid => RoomJid}),
-    archive_size(SearchQuery).
+    {ok, archive_size(SearchQuery)}.
 
--spec remove_archive(Acc :: mongoose_acc:t(),
-                     Host :: jid:server(),
-                     ArchiveId :: mod_mam:archive_id(),
-                     RoomJid :: jid:jid()) -> Acc when Acc :: map().
-remove_archive(Acc, Host, _ArchiveId, RoomJid) ->
+-spec remove_archive(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: ok,
+    Params :: #{archive_id := mod_mam:archive_id() | undefined, room := jid:jid()},
+    Extra :: gen_hook:extra().
+remove_archive(Acc, #{room := RoomJid}, #{host_type := HostType}) ->
     SearchQuery = build_search_query(#{owner_jid => RoomJid}),
     case mongoose_elasticsearch:delete_by_query(?INDEX_NAME, ?TYPE_NAME, SearchQuery) of
         ok ->
             ok;
-        {error, _} = Err ->
-            ?ERROR_MSG("event=remove_muc_archive_failed server=~s room=~s reason=~1000p",
-                       [Host, jid:to_binary(RoomJid), Err]),
+        {error, Reason} ->
+            ?LOG_ERROR(#{what => remove_muc_archive_failed,
+                         server => HostType, room_jid => RoomJid, reason => Reason}),
             ok
     end,
-    Acc.
+    {ok, Acc}.
 
 %%-------------------------------------------------------------------
 %% Helpers
 %%-------------------------------------------------------------------
 
--spec hooks(jid:lserver()) -> [ejabberd_hooks:hook()].
+-spec hooks(mongooseim:host_type()) -> gen_hook:hook_list().
 hooks(Host) ->
-    [{mam_muc_archive_message, Host, ?MODULE, archive_message, 50},
-     {mam_muc_lookup_messages, Host, ?MODULE, lookup_messages, 50},
-     {mam_muc_archive_size, Host, ?MODULE, archive_size, 50},
-     {mam_muc_remove_archive, Host, ?MODULE, remove_archive, 50},
-     {get_mam_muc_gdpr_data, Host, ?MODULE, get_mam_muc_gdpr_data, 50}].
+    [{mam_muc_archive_message, Host, fun ?MODULE:archive_message/3, #{}, 50},
+     {mam_muc_lookup_messages, Host, fun ?MODULE:lookup_messages/3, #{}, 50},
+     {mam_muc_archive_size, Host, fun ?MODULE:archive_size/3, #{}, 50},
+     {mam_muc_remove_archive, Host, fun ?MODULE:remove_archive/3, #{}, 50},
+     {get_mam_muc_gdpr_data, Host, fun ?MODULE:get_mam_muc_gdpr_data/3, #{}, 50}].
 
 -spec make_document_id(binary(), mod_mam:message_id()) -> binary().
 make_document_id(Room, MessageId) ->
@@ -188,7 +213,8 @@ build_search_query(Params) ->
 build_filters(Params) ->
     Builders = [fun room_filter/1,
                 fun with_jid_filter/1,
-                fun range_filter/1],
+                fun range_filter/1,
+                fun specific_message_filter/1],
     lists:flatmap(fun(F) -> F(Params) end, Builders).
 
 -spec room_filter(map()) -> [map()].
@@ -215,6 +241,12 @@ range_filter(#{end_ts := End, start_ts := Start, borders := Borders, rsm := RSM}
             [#{range => #{mam_id => Range2}}]
     end;
 range_filter(_) ->
+    [].
+
+-spec specific_message_filter(map()) -> [map()].
+specific_message_filter(#{message_id := ID}) when is_integer(ID) ->
+    [#{term => #{mam_id => ID}}];
+specific_message_filter(_) ->
     [].
 
 -spec maybe_add_end_filter(undefined | mod_mam:message_id(), map()) -> map().
@@ -269,14 +301,13 @@ search_result_to_mam_lookup_result(Result, Params) ->
             {CorrectedTotalCount, Offset, Messages}
     end.
 
--spec hit_to_mam_message(map()) -> {mod_mam:message_id(), jid:jid(), exml:element()}.
+-spec hit_to_mam_message(map()) -> mod_mam:message_row().
 hit_to_mam_message(#{<<"_source">> := JSON}) ->
     MessageId = maps:get(<<"mam_id">>, JSON),
     Packet = maps:get(<<"message">>, JSON),
     SourceJid = maps:get(<<"source_jid">>, JSON),
-
     {ok, Stanza} = exml:parse(Packet),
-    {MessageId, jid:from_binary(SourceJid), Stanza}.
+    #{id => MessageId, jid => jid:from_binary(SourceJid), packet => Stanza}.
 
 hit_to_gdpr_mam_message(#{<<"_source">> := JSON}) ->
     MessageId = maps:get(<<"mam_id">>, JSON),
@@ -320,12 +351,12 @@ update_borders_to_id(undefined, EndId) ->
 update_borders_to_id(Borders, EndId) ->
     Borders#mam_borders{to_id = EndId}.
 
--spec archive_size(mod_mam_elasticsearch:query()) -> non_neg_integer().
+-spec archive_size(mongoose_elasticsearch:query()) -> non_neg_integer().
 archive_size(Query) ->
     case mongoose_elasticsearch:count(?INDEX_NAME, ?TYPE_NAME, Query) of
         {ok, Count} ->
             Count;
-        {error, _} = Err ->
-            ?ERROR_MSG("Failed to retrieve count of messages from ElasticSearch: ~p", [Err]),
+        {error, Reason} ->
+            ?LOG_ERROR(#{what => archive_size_failed, es_query => Query, reason => Reason}),
             0
     end.

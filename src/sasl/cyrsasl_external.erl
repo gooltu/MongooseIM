@@ -20,12 +20,14 @@
 %%%=============================================================================
 -module(cyrsasl_external).
 
--xep([{xep, 178}, {version, "1.1"}, {comment, "partially implemented."}]).
+-xep([{xep, 178}, {version, "1.2"}, {status, partial}]).
 
 -include("mongoose.hrl").
 -include("jlib.hrl").
 
 -export([mechanism/0, mech_new/3, mech_step/2]).
+
+-ignore_xref([mech_new/3, behaviour_info/1]).
 
 -behaviour(cyrsasl).
 
@@ -39,11 +41,14 @@
 mechanism() ->
     <<"EXTERNAL">>.
 
--spec mech_new(Host   :: ejabberd:server(),
+-spec mech_new(Host   :: jid:server(),
                Creds  :: mongoose_credentials:t(),
                Socket :: term()) -> {ok, sasl_external_state()}.
-mech_new(_Host, Creds, _Socket) ->
-    Cert = mongoose_credentials:get(Creds, client_cert, no_cert),
+mech_new(_Host, Creds, #{socket := Socket}) ->
+    Cert = case mongoose_xmpp_socket:get_peer_certificate(Socket) of
+               {ok, C} -> C;
+               _ -> no_cert
+           end,
     maybe_extract_certs(Cert, Creds).
 
 maybe_extract_certs(no_cert, Creds) ->
@@ -54,7 +59,6 @@ maybe_extract_certs(Cert, Creds) ->
     CertFields = get_common_name(Cert) ++ get_xmpp_addresses(Cert),
     SaslExternalCredentials = [{cert_file, true}, {pem_cert, PemCert}, {der_cert, DerCert} | CertFields],
     {ok, #state{creds = mongoose_credentials:extend(Creds, SaslExternalCredentials)}}.
-
 
 -spec mech_step(State :: sasl_external_state(),
                 ClientIn :: binary()) -> {ok, mongoose_credentials:t()} | {error, binary()}.
@@ -86,8 +90,7 @@ maybe_add_auth_id(Creds, User) ->
     mongoose_credentials:set(Creds, auth_id, User).
 
 do_mech_step(Creds) ->
-    Server = mongoose_credentials:lserver(Creds),
-    VerificationList = get_verification_list(Server),
+    VerificationList = get_verification_list(Creds),
     case verification_loop(VerificationList, Creds) of
         {error, Error} ->
             {error, Error};
@@ -102,14 +105,9 @@ authorize(Creds) ->
         {error, not_authorized} -> {error, <<"not-authorized">>}
     end.
 
-get_verification_list(Server) ->
-    case ejabberd_auth:get_opt(Server, cyrsasl_external, [standard]) of
-        [] -> [standard];
-        List when is_list(List) -> List;
-        standard -> [standard];
-        use_common_name -> [standard, common_name];
-        allow_just_user_identity -> [standard, auth_id]
-    end.
+get_verification_list(Creds) ->
+    HostType = mongoose_credentials:host_type(Creds),
+    mongoose_config:get_opt([{auth, HostType}, sasl_external]).
 
 verification_loop([VerificationFn | T], Creds) ->
     case verify_creds(VerificationFn, Creds) of
@@ -179,12 +177,14 @@ custom_verification(Module, Creds) ->
             {error, Error} when is_binary(Error) ->
                 {error, Error};
             InvalidReturnValue ->
-                ?ERROR_MSG("~p:verify_cert/1 invalid return value: ~p", [Module, InvalidReturnValue]),
+                ?LOG_ERROR(#{what => sasl_external_failed, sasl_module => Module,
+                             reason => invalid_return_value, return_value => InvalidReturnValue}),
                 {error, <<"not-authorized">>}
         end
     catch
         Class:Exception ->
-            ?ERROR_MSG("~p:verify_cert/1 crashed: ~p", [Module, {Class, Exception}]),
+            ?LOG_ERROR(#{what => sasl_external_failed, sasl_module => Module,
+                         class => Class, reason => Exception}),
             {error, <<"not-authorized">>}
     end.
 
@@ -199,7 +199,7 @@ verify_server(Jid, Server) ->
     JidRecord = jid:binary_to_bare(Jid),
     case JidRecord#jid.lserver of
         Server ->
-            {ok, JidRecord#jid.user};
+            {ok, JidRecord#jid.luser};
         _ ->
             {error, <<"not-authorized">>}
     end.

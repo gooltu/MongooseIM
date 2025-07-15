@@ -1,5 +1,5 @@
 -module(router_SUITE).
--compile([export_all]).
+-compile([export_all, nowarn_export_all]).
 
 -include_lib("exml/include/exml.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -11,63 +11,34 @@
 
 all() ->
     [
-     {group, routing},
-     {group, schema}
+     {group, routing}
     ].
 
 groups() ->
     [
      {routing, [], [
                     basic_routing,
-                    do_not_reroute_errors
-                   ]},
-     {schema, [], [
-                   update_tables_hidden_components,
-                   update_tables_hidden_components_idempotent
-                  ]}
+                    do_not_reroute_errors,
+                    routing_error_out_of_modules
+                   ]}
     ].
 
-init_per_suite(C) ->
+init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(jid),
-    application:ensure_all_started(lager),
     ok = mnesia:create_schema([node()]),
-    ok = mnesia:start(), 
-    {ok, _} = application:ensure_all_started(exometer_core),
-    C.
+    ok = mnesia:start(),
+    mongoose_config:set_opts(opts()),
+    async_helper:start(Config, [{mongoose_instrument, start_link, []},
+                                {mongooseim_helper, start_link_loaded_hooks, []},
+                                {mongoose_router, start, []},
+                                {ejabberd_router, start_link, []}]).
 
-end_per_suite(_C) ->
+end_per_suite(Config) ->
+    meck:unload(),
     mnesia:stop(),
     mnesia:delete_schema([node()]),
-    application:stop(exometer_core),
-    ok.
-
-init_per_group(routing, Config) ->
-    meck:new(ejabberd_config),
-    meck:expect(ejabberd_config, get_local_option,
-        fun(routing_modules) ->
-            [xmpp_router_a, xmpp_router_b, xmpp_router_c];
-           (_) ->
-            undefined
-        end),
-    ejabberd_hooks:start_link(),
-    ejabberd_router:start_link(),
-    Config;
-init_per_group(schema, Config) ->
-    remove_component_tables(),
-    Config.
-
-end_per_group(_GroupName, _Config) ->
-    ok.
-
-init_per_testcase(_CaseName, Config) ->
-    Config.
-
-end_per_testcase(HiddenComponent, _Config)
-  when HiddenComponent == update_tables_hidden_components;
-       HiddenComponent == update_tables_hidden_components_idempotent ->
-    remove_component_tables();
-end_per_testcase(_CaseName, _Config) ->
-    ok.
+    async_helper:stop_all(Config),
+    mongoose_config:erase_opts().
 
 %% ---------------------------------------------------------------
 %% Test cases
@@ -81,7 +52,7 @@ basic_routing(_C) ->
     %% module 'c' routes everything
     setup_routing_module(xmpp_router_c, none, all),
     %% send messages from 1 to 5
-    lists:map(fun(I) -> route(msg(I)) end, [1,2,3,4,5]),
+    lists:map(fun(I) -> #{} = route(msg(I)) end, [1,2,3,4,5]),
     meck:validate(xmpp_router_a),
     meck:unload(xmpp_router_a),
     meck:validate(xmpp_router_b),
@@ -98,38 +69,33 @@ basic_routing(_C) ->
 do_not_reroute_errors(_) ->
     From = <<"ja@localhost">>,
     To = <<"ty@localhost">>,
-    Stanza = #xmlel{name = <<"iq">>, 
-        attrs = [{<<"from">>, From}, {<<"to">>, To}, {<<"type">>, <<"get">>} ]
+    Stanza = #xmlel{name = <<"iq">>,
+                   attrs = #{<<"from">> => From,
+                             <<"to">> => To,
+                             <<"type">> => <<"get">>}
     },
     Acc = mongoose_acc:new(#{ location => ?LOCATION,
                               lserver => <<"localhost">>,
+                              host_type => <<"localhost">>,
                               element => Stanza }),
     meck:new(xmpp_router_a, [non_strict]),
     meck:expect(xmpp_router_a, filter,
                 fun(From0, To0, Acc0, Packet0) -> {From0, To0, Acc0, Packet0} end),
     meck:expect(xmpp_router_a, route, fun resend_as_error/4),
     ejabberd_router:route(From, To, Acc, Stanza),
-    ok.
-     
-update_tables_hidden_components(_C) ->
-    %% Tables as of b076e4a62a8b21188245f13c42f9cfd93e06e6b7
-    create_component_tables([domain, handler, node]),
+    meck:validate(xmpp_router_a),
+    meck:unload(xmpp_router_a).
 
-    ejabberd_router:update_tables(),
+routing_error_out_of_modules(_C) ->
+    %% all modules don't route anything for this test
+    setup_routing_module(xmpp_router_a, none, 2),
+    setup_routing_module(xmpp_router_b, none, 2),
+    setup_routing_module(xmpp_router_c, none, 2),
 
-    %% Local table is removed and the distributed one has a new list of attributes
-    false = lists:member(external_component, mnesia:system_info(tables)),
-    [domain, handler, node, is_hidden] = mnesia:table_info(external_component_global, attributes).
+    %% router should return an error
+    Res = route(msg(1)),
+    [{error, out_of_modules}] = mongoose_acc:get(router, result, Res).
 
-update_tables_hidden_components_idempotent(_C) ->
-    AttrsWithHidden = [domain, handler, node, is_hidden],
-    create_component_tables(AttrsWithHidden),
-
-    ejabberd_router:update_tables(),
-
-    %% Local table is not removed and the attribute list of the distributed one is not changed
-    true = lists:member(external_component, mnesia:system_info(tables)),
-    AttrsWithHidden = mnesia:table_info(external_component_global, attributes).
 
 %% ---------------------------------------------------------------
 %% Helpers
@@ -151,9 +117,9 @@ setup_routing_module(Name, PacketToDrop, PacketToRoute) ->
 make_routing_fun(Name, all) ->
     Self = self(),
     Marker = list_to_atom([lists:last(atom_to_list(Name))]),
-    fun(_From, _To, _Acc, Packet) ->
+    fun(_From, _To, Acc, Packet) ->
         Self ! {Marker, Packet},
-        done
+        {done, Acc}
     end;
 make_routing_fun(Name, PacketToRoute) ->
     Self = self(),
@@ -162,7 +128,7 @@ make_routing_fun(Name, PacketToRoute) ->
         case msg_to_id(Packet) of
             PacketToRoute ->
                 Self ! {Marker, Packet},
-                done;
+                {done, Acc};
             _ -> {From, To, Acc, Packet}
         end
     end.
@@ -183,10 +149,11 @@ route(I) ->
     ToJID = jid:from_binary(<<"bob@localhost">>),
     Acc = mongoose_acc:new(#{ location => ?LOCATION,
                               lserver => <<"localhost">>,
+                              host_type => <<"localhost">>,
                               element => I,
                               from_jid => FromJID,
                               to_jid => ToJID }),
-    #{} = ejabberd_router:route(FromJID, ToJID, Acc, I).
+    ejabberd_router:route(FromJID, ToJID, Acc, I).
 
 verify(L) ->
     receive
@@ -201,22 +168,15 @@ verify(L) ->
         ct:pal("all messages routed correctly")
     end.
 
-create_component_tables(AttrList) ->
-    {atomic, ok} =
-    mnesia:create_table(external_component,
-                        [{attributes, AttrList},
-                         {local_content, true}]),
-    {atomic, ok} =
-    mnesia:create_table(external_component_global,
-                        [{attributes, AttrList},
-                         {type, bag},
-                         {record_name, external_component}]).
-
-remove_component_tables() ->
-    mnesia:delete_table(external_component),
-    mnesia:delete_table(external_component_global).
-
 resend_as_error(From0, To0, Acc0, Packet0) ->
     {Acc1, Packet1} = jlib:make_error_reply(Acc0, Packet0, #xmlel{}),
-    ejabberd_router:route(To0, From0, Acc1, Packet1),
-    done.
+    Acc2 = ejabberd_router:route(To0, From0, Acc1, Packet1),
+    {done, Acc2}.
+
+opts() ->
+    RoutingModules = [xmpp_router_a, xmpp_router_b, xmpp_router_c],
+    #{hosts => [<<"localhost">>],
+      host_types => [],
+      instrumentation => config_parser_helper:default_config([instrumentation]),
+      component_backend => mnesia,
+      routing_modules => xmpp_router:expand_routing_modules(RoutingModules)}.

@@ -23,78 +23,57 @@
 -include("mongoose.hrl").
 -include("jlib.hrl").
 
--export([start/2, stop/1, get_disco_items/5]).
+-export([start/2, stop/1, hooks/1, deps/2, disco_local_items/3]).
 
 %%--------------------------------------------------------------------
 %% API
 %%--------------------------------------------------------------------
 
--spec start(Host :: jid:server(), Opts :: list()) -> any().
-start(Host, Opts) ->
-    mod_global_distrib_utils:start(?MODULE, Host, Opts, fun start/0).
+-spec start(mongooseim:host_type(), gen_mod:module_opts()) -> any().
+start(_HostType, _Opts) ->
+    ok.
 
--spec stop(Host :: jid:server()) -> any().
-stop(Host) ->
-    mod_global_distrib_utils:stop(?MODULE, Host, fun stop/0).
+-spec stop(mongooseim:host_type()) -> any().
+stop(_HostType) ->
+    ok.
+
+-spec deps(mongooseim:host_type(), gen_mod:module_opts()) -> gen_mod_deps:deps().
+deps(_HostType, Opts) ->
+    [{mod_global_distrib_utils, Opts, hard}].
 
 %%--------------------------------------------------------------------
 %% Hooks implementation
 %%--------------------------------------------------------------------
 
--spec get_disco_items(Acc :: {result, [exml:element()]} | {error, any()} | empty,
-                      From :: jid:jid(), To :: jid:jid(),
-                      Node :: binary(), ejabberd:lang())
-                     -> {result, [exml:element()]} | {error, any()} | empty.
-get_disco_items({result, Nodes}, From, To, <<"">>, _Lang) ->
-    Domains = domains_for_disco(To#jid.lserver, From),
-    ?DEBUG("event=domains_fetched_for_disco,domains=\"~p\",input_nodes=\"~p\"",
-           [Domains, Nodes]),
-    NameSet = gb_sets:from_list([exml_query:attr(Node, <<"jid">>) || Node <- Nodes]),
-    FilteredDomains = [Domain || Domain <- Domains, not gb_sets:is_member(Domain, NameSet)],
-    ?DEBUG("Adding global domains ~p to disco results", [FilteredDomains]),
-    NewNodes =
-        lists:foldl(
-          fun(Domain, Acc) ->
-                  [#xmlel{name  = <<"item">>, attrs = [{<<"jid">>, Domain}]} | Acc]
-          end,
-          Nodes,
-          FilteredDomains),
-    {result, NewNodes};
-get_disco_items(empty, From, To, Node, Lang) ->
-    get_disco_items({result, []}, From, To, Node, Lang);
-get_disco_items(Acc, _From, _To, _Node, _Lang) ->
-    Acc.
+-spec disco_local_items(Acc, Params, Extra) -> {ok, Acc} when
+                        Acc :: mongoose_disco:item_acc(),
+                        Params :: map(),
+                        Extra :: map().
+disco_local_items(Acc = #{host_type := HostType, from_jid := From, node := <<>>}, _, _) ->
+    Domains = domains_for_disco(HostType, From),
+    ?LOG_DEBUG(#{what => gd_domains_fetched_for_disco, domains => Domains}),
+    Items = [#{jid => Domain} || Domain <- Domains],
+    NewAcc = mongoose_disco:add_items(Items, Acc),
+    {ok, NewAcc};
+disco_local_items(Acc, _, _) ->
+    {ok, Acc}.
 
 %%--------------------------------------------------------------------
 %% Helpers
 %%--------------------------------------------------------------------
 
--spec start() -> any().
-start() ->
-    Host = opt(global_host),
-    ejabberd_hooks:add(disco_local_items, Host, ?MODULE, get_disco_items, 99).
+hooks(HostType) ->
+    [{disco_local_items, HostType, fun ?MODULE:disco_local_items/3, #{}, 99}].
 
--spec stop() -> any().
-stop() ->
-    Host = opt(global_host),
-    ejabberd_hooks:delete(disco_local_items, Host, ?MODULE, get_disco_items, 99).
-
--spec opt(Key :: atom()) -> term().
-opt(Key) ->
-    mod_global_distrib_utils:opt(?MODULE, Key).
-
--spec domains_for_disco(Host :: jid:lserver(), From :: jid:jid()) -> Domains :: [binary()].
-domains_for_disco(_Host, #jid{ luser = <<>> } = _From) ->
+-spec domains_for_disco(mongooseim:host_type(), From :: jid:jid()) -> Domains :: [binary()].
+domains_for_disco(_HostType, #jid{ luser = <<>> } = _From) ->
     %% Currently all non-user entities may discover all services
-    {ok, Domains} = mod_global_distrib_mapping:all_domains(),
-    Domains;
-domains_for_disco(Host, _From) ->
-    case gen_mod:get_module_opt(Host, mod_disco, users_can_see_hidden_services, true) of
+    mod_global_distrib_mapping:all_domains();
+domains_for_disco(HostType, _From) ->
+    %% mod_disco is running because it is the only caller of 'disco_local_items'
+    case gen_mod:get_module_opt(HostType, mod_disco, users_can_see_hidden_services) of
         true ->
-            {ok, Domains} = mod_global_distrib_mapping:all_domains(),
-            Domains;
+            mod_global_distrib_mapping:all_domains();
         false ->
-            {ok, Domains} = mod_global_distrib_mapping:public_domains(),
-            Domains
+            mod_global_distrib_mapping:public_domains()
     end.
-

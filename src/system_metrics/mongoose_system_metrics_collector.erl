@@ -1,19 +1,20 @@
 -module(mongoose_system_metrics_collector).
 
+-include("mongoose.hrl").
+
 -type report_struct() ::
     #{
-        report_name := term(),
-        key := term(),
-        value := term()
+        name := term(),
+        params := #{term() := term()}
     }.
 
 -export_type([report_struct/0]).
 
--export([collect/1]).
+-export([collect/2]).
 
-collect(PrevReport) ->
+collect(PrevReport, ExometerEnabled) ->
     ReportResults = [ get_reports(RGetter) || RGetter <- report_getters()],
-    StanzasCount = get_xmpp_stanzas_count(PrevReport),
+    StanzasCount = get_xmpp_stanzas_count(PrevReport, ExometerEnabled),
     lists:flatten(ReportResults ++ StanzasCount).
 
 -spec get_reports(fun(() -> [report_struct()])) -> [report_struct()].
@@ -24,29 +25,44 @@ get_reports(Fun) ->
 report_getters() ->
     [
         fun get_hosts_count/0,
+        fun get_domains_count/0,
         fun get_modules/0,
         fun get_number_of_custom_modules/0,
-        fun get_uptime/0,
-        fun get_cluster_size/0,
-        fun get_version/0,
-        fun get_components/0,
+        fun get_cluster_data/0,
         fun get_api/0,
         fun get_transport_mechanisms/0,
         fun get_tls_options/0,
         fun get_outgoing_pools/0
     ].
 
+get_cluster_data() ->
+    Steps = [
+        fun get_uptime/0,
+        fun get_version/0,
+        fun get_components/0,
+        fun get_cluster_size/0,
+        fun get_config_type/0
+    ],
+    Params = lists:foldl(fun(Step, Acc) ->
+                             maps:merge(Acc, Step())
+                         end, #{}, Steps),
+    [#{name => cluster, params => Params}].
+
 get_hosts_count() ->
-    Hosts = ejabberd_config:get_global_option(hosts),
-    NumberOfHosts = length(Hosts),
-    [#{report_name => hosts, key => count, value => NumberOfHosts}].
+    HostTypes = ?ALL_HOST_TYPES,
+    NumberOfHosts = length(HostTypes),
+    [#{name => host_count, params => #{value => NumberOfHosts}}].
+
+get_domains_count() ->
+    DomainsCount = mongoose_domain_core:domains_count(),
+    [#{name => domain_count, params => #{value => DomainsCount}}].
 
 get_modules() ->
-    Hosts = ejabberd_config:get_global_option(hosts),
-    AllModules = lists:flatten([gen_mod:loaded_modules(H) || H <- Hosts]),
+    HostTypes = ?ALL_HOST_TYPES,
+    AllModules = lists:flatten([gen_mod:loaded_modules(H) || H <- HostTypes]),
     ModulesToReport = filter_behaviour_implementations(lists:usort(AllModules),
                                                        mongoose_module_metrics),
-    ModsWithOpts = [get_modules_metrics(Host, ModulesToReport) || Host <- Hosts],
+    ModsWithOpts = [get_modules_metrics(Host, ModulesToReport) || Host <- HostTypes],
     [report_module_with_opts(Mod, Opt) || {Mod, Opt} <- lists:flatten(ModsWithOpts)].
 
 filter_behaviour_implementations(Modules, Behaviour) ->
@@ -66,152 +82,148 @@ get_modules_metrics(Host, Modules) ->
         fun(M) ->
             case erlang:function_exported(M, config_metrics, 1) of
                 true -> {M, M:config_metrics(Host)};
-                false -> {M ,[{none, none}]}
+                false -> {M, [{none, none}]}
             end
         end, Modules).
 
 report_module_with_opts(Module, Opts) ->
-    lists:map(
-        fun({OptKey, OptValue}) ->
-            #{report_name => Module, key => OptKey, value => OptValue}
-        end,Opts).
+    #{name => module_with_opt, params =>
+        lists:foldl(
+            fun
+                ({none, _}, Acc) -> 
+                    Acc;
+                ({OptKey, OptValue}, Acc) ->
+                    maps:put(OptKey, OptValue, Acc)
+            end, #{module => Module}, Opts)
+    }.
 
 get_number_of_custom_modules() ->
-    Hosts = ejabberd_config:get_global_option(hosts),
+    HostTypes = ?ALL_HOST_TYPES,
     AllModules = lists:flatten(
-                    lists:map(fun gen_mod:loaded_modules/1, Hosts)),
+                    lists:map(fun gen_mod:loaded_modules/1, HostTypes)),
     GenMods = filter_behaviour_implementations(AllModules, gen_mod),
     GenModsSet = sets:from_list(GenMods),
     MetricsModule = filter_behaviour_implementations(AllModules,
                                                      mongoose_module_metrics),
     MetricsModuleSet = sets:from_list(MetricsModule),
     CountCustomMods= sets:size(sets:subtract(GenModsSet, MetricsModuleSet)),
-    #{report_name => custom_modules, key => count, value => CountCustomMods}.
+    [#{name => custom_module_count, params => #{value => CountCustomMods}}].
 
 get_uptime() ->
     {Uptime, _} = statistics(wall_clock),
     UptimeSeconds = Uptime div 1000,
     {D, {H, M, S}} = calendar:seconds_to_daystime(UptimeSeconds),
     Formatted = io_lib:format("~4..0B-~2..0B:~2..0B:~2..0B", [D,H,M,S]),
-    [#{report_name => cluster, key => uptime, value => list_to_binary(Formatted)}].
+    #{uptime => list_to_binary(Formatted)}.
 
 get_cluster_size() ->
     NodesNo = length(nodes()) + 1,
-    [#{report_name => cluster, key => number_of_nodes, value => NodesNo}].
+    #{node_number => NodesNo}.
 
 get_version() ->
     case lists:keyfind(mongooseim, 1, application:which_applications()) of
         {_, _, Version} ->
-            #{report_name => cluster, key => mim_version, value => list_to_binary(Version)};
+            #{version => list_to_binary(Version)};
         _ ->
             []
     end.
 
 get_components() ->
-    Domains = ejabberd_router:dirty_get_all_domains(),
-    Components = [ejabberd_router:lookup_component(D, node()) || D <- Domains],
+    Domains = mongoose_router:get_all_domains() ++ mongoose_component:dirty_get_all_components(all),
+    Components = [mongoose_component:lookup_component(D, node()) || D <- Domains],
     LenComponents = length(lists:flatten(Components)),
-    #{report_name => cluster, key => number_of_components, value => LenComponents}.
+    #{component => LenComponents}.
 
 get_api() ->
-    ServiceOptions = get_service_option(ejabberd_cowboy),
-    ModulesOptions = lists:flatten([ Mod || {modules, Mod} <- ServiceOptions]),
-    % Modules Option can have variable number of elements. To be more
-    % error-proof, extracting 3rd element instead of pattern matching.
-    AllApi = lists:map(fun(Module)-> element(3, Module) end, ModulesOptions),
-    ApiList = filter_unknown_api(lists:usort(AllApi)),
-    [#{report_name => http_api, key => Api, value => enabled} || Api <- ApiList].
+    ApiList = filter_unknown_api(get_http_handler_modules()),
+    [#{name => http_api,
+       params => lists:foldl(fun(Element, Acc) ->
+                                 maps:put(Element, enabled, Acc)
+                             end, #{}, ApiList)}].
 
 filter_unknown_api(ApiList) ->
-    AllowedToReport = [ mongoose_api, mongoose_client_api_rooms_messages,
-                        mongoose_client_api_rooms_users, mongoose_client_api_rooms_config,
-                        mongoose_client_api_rooms ,mongoose_client_api_contacts,
-                        mongoose_client_api_messages, lasse_handler, mongoose_api_admin,
-                        mod_bosh, mod_websockets, mod_revproxy],
+    AllowedToReport = [mongoose_client_api, mongoose_admin_api, mod_bosh, mod_websockets],
     [Api || Api <- ApiList, lists:member(Api, AllowedToReport)].
 
-get_service_option(Service) ->
-    Listen = ejabberd_config:get_local_option_or_default(listen, []),
-    Result = [ Option || {_, S, Option} <- Listen, S == Service],
-    lists:flatten(Result).
-
 get_transport_mechanisms() ->
-    ServiceOptions = get_service_option(ejabberd_cowboy),
-    MaybeBosh  = maybe_api_configured(mod_bosh, ServiceOptions),
-    MaybeWebsockets = maybe_api_configured(mod_websockets, ServiceOptions),
-    MaybeTCP = is_tcp_configured(),
-    ReturnList = lists:flatten([MaybeBosh, MaybeWebsockets, MaybeTCP]),
-    [#{report_name => transport_mechanism,
-       key => Transport,
-       value => enabled} || Transport <- lists:usort(ReturnList)].
+    HTTP = [Mod || Mod <- get_http_handler_modules(),
+                   Mod =:= mod_bosh orelse Mod =:= mod_websockets],
+    TCP = lists:usort([tcp || #{proto := tcp} <- get_listeners(mongoose_c2s_listener)]),
+    [#{name => transport_mechanism,
+       params => lists:foldl(fun(Element, Acc) ->
+                                 maps:put(Element, enabled, Acc)
+                             end, #{}, HTTP ++ TCP)}].
 
-maybe_api_configured(Api, ServiceOptions) ->
-    Modules = proplists:get_value(modules, ServiceOptions, []),
-    case lists:keyfind(Api, 3, Modules) of
-        false -> [];
-        _Return -> Api
-    end.
+get_http_handler_modules() ->
+    Listeners = get_listeners(ejabberd_cowboy),
+    lists:usort(lists:flatmap(fun get_http_handler_modules/1, Listeners)).
+
+get_listeners(Module) ->
+    Listeners = mongoose_config:get_opt(listen),
+    lists:filter(fun(#{module := Mod}) -> Mod =:= Module end, Listeners).
+
+get_http_handler_modules(#{handlers := Handlers}) ->
+    [Module || #{module := Module} <- Handlers].
 
 get_tls_options() ->
-    TcpConfigured = is_tcp_configured(),
-    TlsOption = check_tls_option([starttls, starttls_required, tls]),
-    case {TcpConfigured, TlsOption} of
-        {tcp, {Option, SpecificOption}} ->
-            #{report_name => tls_option, key => Option, value => SpecificOption};
-        { _, _} ->
-            []
-    end.
+    TLSOptions = lists:flatmap(fun extract_tls_options/1, get_listeners(mongoose_c2s_listener)),
+    lists:foldl(fun({Mode, Module}, Acc) ->
+                    [#{name => tls_option, params => #{mode => Mode, module => Module}}] ++ Acc
+                end, [], lists:usort(TLSOptions)).
 
-is_tcp_configured() ->
-    case [] =/= lists:usort(get_service_option(ejabberd_c2s)) of
-        true -> tcp;
-        false -> []
-    end.
-
-check_tls_option([]) ->
-    {none, none};
-check_tls_option([TlsOption | Tail]) ->
-    ServiceOptions = get_service_option(ejabberd_c2s),
-    case lists:member(TlsOption, ServiceOptions) of
-        true -> {TlsOption, check_tls_specific_option()};
-        _ ->  check_tls_option(Tail)
-    end.
-
-check_tls_specific_option() ->
-    ServiceOptions = get_service_option(ejabberd_c2s),
-    case lists:member({tls_module, just_tls}, ServiceOptions) of
-        true -> just_tls;
-        _ -> fast_tls
-    end.
+extract_tls_options(#{tls := #{mode := TLSMode, module := TLSModule}}) ->
+    [{TLSMode, TLSModule}];
+extract_tls_options(_) -> [].
 
 get_outgoing_pools() ->
-    OutgoingPools = ejabberd_config:get_local_option_or_default(outgoing_pools, []),
-    [#{report_name => outgoing_pools,
-       key => type,
-       value => Type} || {Type, _, _, _, _} <- OutgoingPools].
+    OutgoingPools = mongoose_config:get_opt(outgoing_pools),
+    [#{name => outgoing_pool,
+       params => #{value => Type}} || #{type := Type} <- OutgoingPools].
 
-get_xmpp_stanzas_count(PrevReport) ->
+get_xmpp_stanzas_count(_PrevReport, false = _ExometerEnabled) ->
+    [];
+get_xmpp_stanzas_count(PrevReport, true) ->
     StanzaTypes = [xmppMessageSent, xmppMessageReceived, xmppIqSent,
                    xmppIqReceived, xmppPresenceSent, xmppPresenceReceived],
     NewCount = [count_stanzas(StanzaType) || StanzaType <- StanzaTypes],
     StanzasCount = calculate_stanza_rate(PrevReport, NewCount),
-    [#{report_name => StanzaType,
-       key => Total,
-       value => Increment} || {StanzaType, Total, Increment} <- StanzasCount].
+    [#{name => xmpp_stanza_count,
+       params => #{
+        stanza_type => StanzaType,
+        total => Total,
+        increment => Increment
+       }} || {StanzaType, Total, Increment} <- StanzasCount].
 
 count_stanzas(StanzaType) ->
-    ExometerResults = exometer:get_values(['_', StanzaType]),
-    StanzaCount = lists:foldl(fun({ _, [{count,Count}, {one, _}]}, Sum) ->
-                            Count + Sum end, 0, ExometerResults),
+    ExometerResults = exometer:get_values(['_' | metric_name(StanzaType)]),
+    StanzaCount = lists:foldl(fun({ _, [{count, Count}, {one, _}]}, Sum) -> Count + Sum end,
+                              0, ExometerResults),
     {StanzaType, StanzaCount}.
+
+metric_name(xmppMessageSent) -> [xmpp_element_in, '_', message_count];
+metric_name(xmppIqSent) -> [xmpp_element_in, '_', iq_count];
+metric_name(xmppPresenceSent) -> [xmpp_element_in, '_', presence_count];
+metric_name(xmppMessageReceived) -> [xmpp_element_out, '_', message_count];
+metric_name(xmppIqReceived) -> [xmpp_element_out, '_', iq_count];
+metric_name(xmppPresenceReceived) -> [xmpp_element_out, '_', presence_count].
 
 calculate_stanza_rate([], NewCount) ->
     [{Type, Count, Count} || {Type, Count} <- NewCount];
 calculate_stanza_rate(PrevReport, NewCount) ->
     ReportProplist = [{Name, Key} ||
-        #{report_name := Name, key := Key}  <- PrevReport],
+        #{name := xmpp_stanza_count,
+          params := #{stanza_type := Name, total := Key}}  <- PrevReport],
     [{Type, Count,
         case proplists:get_value(Type, ReportProplist) of
             undefined -> Count;
             Total -> Count-Total
         end} || {Type, Count} <- NewCount].
+
+get_config_type() ->
+    ConfigPath = mongoose_config:get_config_path(),
+    ConfigType = case filename:extension(ConfigPath) of
+        ".toml" -> toml;
+        ".cfg" -> cfg;
+        _ -> unknown_config_type
+    end,
+    #{config_type => ConfigType}.

@@ -12,12 +12,19 @@
 # Fail on errors
 set -e
 
+# Switch to the repository directory
+cd "$( dirname "${BASH_SOURCE[0]}" )/.."
+
+source tools/common-vars.sh
+source tools/parallel.sh
+
 USAGE=$(cat <<-END
 This script runs small and big tests for MongooseIM
 
 Options:
 --db [DB]             -- a list of databases to setup for big tests
 --preset [PRESET]     -- a list of presets to run during big tests
+--spec [SPEC]         -- test spec to use instead of 'default.spec'
 --dev-nodes [NODE]    -- a list of release nodes to build and start
 --test-hosts [HOST]   -- a list of test hosts to apply preset to and collect cover info from
 --one-node            -- the same as "--dev-nodes mim1 --test-hosts mim --"
@@ -30,6 +37,8 @@ Options:
 --skip-start-nodes    -- do not start nodes before big tests
 --skip-stop-nodes     -- do not stop nodes after big tests
 --skip-setup-db       -- do not start any databases, the same as "--db --" option
+--skip-validate-nodes -- do not check if MongooseIM is running
+--no-parallel         -- run most commands in sequence
 --tls-dist            -- enable encryption between nodes in big tests
 --verbose             -- print script output
 --colors              -- force colors in help and examples commands
@@ -60,7 +69,7 @@ EXAMPLES=$(cat <<-END
 Script examples:
 
 ./tools/test-runner.sh --db redis mysql --preset mysql_redis -- rdbms mam
-    Setups Redis and MySQL databases
+    Sets up Redis and MySQL databases
     Runs mam_SUITE and rdbms_SUITE
     -- is used to separate test suites from databases
 
@@ -76,32 +85,32 @@ Script examples:
     Disables big tests and cover
 
 ./tools/test-runner.sh --skip-big-tests
-    Travis build job with small tests
+    CI build job with small tests
 
 ./tools/test-runner.sh --skip-small-tests --db redis --tls-dist --preset internal_mnesia
-    Travis build job with internal_mnesia
+    CI build job with internal_mnesia
 
 ./tools/test-runner.sh --skip-small-tests --db redis mysql --preset mysql_redis
-    Travis build job with mysql_redis
+    CI build job with mysql_redis
 
 ./tools/test-runner.sh --skip-small-tests --db redis mssql --preset odbc_mssql_mnesia
-    Travis build job with odbc_mssql_mnesia
+    CI build job with odbc_mssql_mnesia
 
 ./tools/test-runner.sh --skip-small-tests --db redis ldap --preset ldap_mnesia
-    Travis build job with ldap_mnesia
+    CI build job with ldap_mnesia
 
 ./tools/test-runner.sh --skip-small-tests --db redis elasticsearch cassandra --preset elasticsearch_and_cassandra_mnesia -- mam mongoose_cassandra mongoose_elasticsearch
-    Travis MAM-only build job with elasticsearch_and_cassandra_mnesia
+    CI MAM-only build job with elasticsearch_and_cassandra_mnesia
     Separator -- between presets and suites
 
 ./tools/test-runner.sh --db redis pgsql --preset pgsql_mnesia
-    Travis build job with pgsql_mnesia
+    CI build job with pgsql_mnesia
 
-./tools/test-runner.sh --db redis riak --preset riak_mnesia
-    Travis build job with riak_mnesia
+./tools/test-runner.sh --db redis pgsql --preset pgsql_mnesia --spec dynamic_domains.spec
+    CI multi-tenancy build job with pgsql_mnesia
 
-./tools/test-runner.sh --skip-small-tests --db mysql --preset mysql_mnesia --skip-stop-nodes -- mam
-    Runs mam_SUITE with MySQL
+./tools/test-runner.sh --skip-small-tests --db pgsql --preset pgsql_mnesia --skip-stop-nodes -- mam
+    Runs mam_SUITE with PostgreSQL without stopping MongooseIM nodes after the test
 
 ./tools/test-runner.sh --skip-small-tests --skip-setup-db --dev-nodes --test-hosts --skip-cover --skip-preset -- mam
     Sets dev-nodes and test-hosts to empty lists
@@ -109,6 +118,9 @@ Script examples:
 
 ./tools/test-runner.sh --rerun-big-tests -- mam
     The same command as above
+
+./tools/test-runner.sh --skip-small-tests --skip-start-nodes --skip-validate-nodes -- connect
+    Continues test execution even if MongooseIM is not running on all nodes
 
 ./tools/test-runner.sh --help --examples --colors | more
     Display help using "more" command
@@ -255,10 +267,12 @@ PRESETS_ARRAY=(
     $( ./tools/test_runner/list_presets.sh )
 )
 
+SRC_TESTSPEC="default.spec"
+
 DBS_ARRAY=(
+    cockroachdb
     mysql
     pgsql
-    riak
     cassandra
     elasticsearch
     mssql
@@ -293,11 +307,13 @@ BUILD_MIM=true
 START_NODES=true
 STOP_NODES=true
 TLS_DIST=false
+PARALLEL_ENABLED=true
 
 SELECTED_TESTS=()
 STOP_SCRIPT=false
 SKIP_DB_SETUP=false
 DB_FROM_PRESETS=true
+SKIP_VALIDATE_NODES=false
 
 # Parse command line arguments
 # Prefer arguments to env variables
@@ -342,6 +358,11 @@ case $key in
         DB_FROM_PRESETS=false
     ;;
 
+    --skip-validate-nodes)
+        shift # past argument
+        SKIP_VALIDATE_NODES=true
+    ;;
+
     # Similar how we parse --db option
     --preset)
         shift # past argument
@@ -359,6 +380,12 @@ case $key in
                 break
             fi
         done
+    ;;
+
+    --spec)
+        shift # consume argument
+        SRC_TESTSPEC="$1"
+        shift # consume value
     ;;
 
     --dev-nodes)
@@ -408,6 +435,11 @@ case $key in
     --skip-cover)
         shift # past argument
         COVER_ENABLED=false
+    ;;
+
+    --no-parallel)
+        shift # past argument
+        PARALLEL_ENABLED=false
     ;;
 
     --skip-preset)
@@ -463,6 +495,10 @@ case $key in
     ;;
     --list-presets)
         ( IFS=$'\n'; echo "${PRESETS_ARRAY[*]}" )
+        exit 0
+    ;;
+    --list-specs)
+        ( cd big_tests && ls -1 *.spec )
         exit 0
     ;;
     --list-dev-nodes)
@@ -578,7 +614,14 @@ DBS_DEFAULT="${DBS_ARRAY[@]}"
 DEV_NODES_DEFAULT="${DEV_NODES_ARRAY[@]}"
 TEST_HOSTS_DEFAULT="${TEST_HOSTS_ARRAY[@]}"
 
-./tools/configure with-all
+./tools/configure
+
+# Pass extra arguments from tools/test_runner/selected-tests-to-test-spec.sh
+# to rebar3 in Makefile
+REBAR_CT_EXTRA_ARGS=""
+if [[ -f "auto_small_tests.spec" ]]; then
+    REBAR_CT_EXTRA_ARGS=" --spec \"$(pwd)/auto_small_tests.spec\" $REBAR_CT_EXTRA_ARGS"
+fi
 
 # Allow user to pass PRESET and DB as an env variable
 # (or use default value)
@@ -596,17 +639,13 @@ export TEST_HOSTS="${TEST_HOSTS-$TEST_HOSTS_DEFAULT}"
 export BUILD_TESTS="$BUILD_TESTS"
 export BUILD_MIM="$BUILD_MIM"
 export TLS_DIST="$TLS_DIST"
-# Pass extra arguments from tools/test_runner/selected-tests-to-test-spec.sh
-# to rebar3 in Makefile
-if [[ -f "auto_small_tests.spec" ]]; then
-    export REBAR_CT_EXTRA_ARGS=" --spec \"$(pwd)/auto_small_tests.spec\" "
-else
-    export REBAR_CT_EXTRA_ARGS=""
-fi
+export REBAR_CT_EXTRA_ARGS="$REBAR_CT_EXTRA_ARGS"
+export SRC_TESTSPEC="$SRC_TESTSPEC"
 export TESTSPEC="auto_big_tests.spec"
 export START_NODES="$START_NODES"
 export STOP_NODES="$STOP_NODES"
 export PAUSE_BEFORE_BIG_TESTS="$PAUSE_BEFORE_BIG_TESTS"
+export SKIP_VALIDATE_NODES="$SKIP_VALIDATE_NODES"
 
 # Debug printing
 echo "Variables:"
@@ -620,18 +659,25 @@ echo "    PRESET_ENABLED=$PRESET_ENABLED"
 echo "    BUILD_TESTS=$BUILD_TESTS"
 echo "    BUILD_MIM=$BUILD_MIM"
 echo "    REBAR_CT_EXTRA_ARGS=$REBAR_CT_EXTRA_ARGS"
+echo "    SRC_TESTSPEC=$SRC_TESTSPEC"
 echo "    TESTSPEC=$TESTSPEC"
 echo "    TLS_DIST=$TLS_DIST"
 echo "    START_NODES=$START_NODES"
 echo "    STOP_NODES=$STOP_NODES"
+echo "    SKIP_VALIDATE_NODES=$SKIP_VALIDATE_NODES"
 echo ""
 
-./tools/build-releases.sh
 
-./tools/travis-build-tests.sh
+init_parallel test_runner
 
-./tools/test_runner/selected-tests-to-test-spec.sh "${SELECTED_TESTS[@]}"
+parallel build-mim ./tools/build-releases.sh
 
-./tools/travis-setup-db.sh
+parallel build-tests ./tools/build-tests.sh
 
-./tools/travis-test.sh
+parallel make-spec ./tools/test_runner/selected-tests-to-test-spec.sh "${SELECTED_TESTS[@]}"
+
+parallel false ./tools/setup-db.sh
+
+wait_for_parallel test_runner
+
+./tools/test.sh

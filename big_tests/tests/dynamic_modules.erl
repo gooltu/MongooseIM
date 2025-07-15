@@ -1,115 +1,77 @@
 -module(dynamic_modules).
 
--include_lib("common_test/include/ct.hrl").
+-compile([export_all, nowarn_export_all]).
 
--export([save_modules/2, ensure_modules/2, restore_modules/2]).
--export([stop/2, stop/3, start/3, start/4, restart/3, stop_running/2, start_running/1]).
+-import(distributed_helper, [mim/0, rpc/4]).
 
--import(distributed_helper, [mim/0,
-                             rpc/4]).
+save_modules(HostTypes, Config) when is_list(HostTypes) ->
+    save_modules(mim(), HostTypes, Config);
+save_modules(HostType, Config) when is_binary(HostType) ->
+    save_modules(mim(), [HostType], Config).
 
-save_modules(Domain, Config) ->
-    [{saved_modules, get_current_modules(Domain)} | Config].
+%% Save modules from Node for HostTypes, overwriting previously saved modules
+save_modules(Node = #{node := NodeName}, HostTypes, Config) ->
+    lists:foldl(fun(HostType, ConfigIn) ->
+                        Key = {saved_modules, NodeName, HostType},
+                        Value = get_current_modules(Node, HostType),
+                        lists:keystore(Key, 1, ConfigIn, {Key, Value})
+                end, Config, HostTypes).
 
-ensure_modules(Domain, RequiredModules) ->
-    CurrentModules = get_current_modules(Domain),
-    {ToReplace, ReplaceWith} = to_replace(RequiredModules, CurrentModules, [], []),
-    ok = rpc(mim(), gen_mod_deps, replace_modules, [Domain, ToReplace, ReplaceWith]).
+get_saved_config(HostType, Module, Config) ->
+    get_saved_config(mim(), HostType, Module, Config).
 
-to_replace([], _CurrentModules, ReplaceAcc, ReplaceWithAcc) ->
-    {lists:usort(ReplaceAcc), ReplaceWithAcc};
-to_replace([RequiredModule | Rest], CurrentModules, ReplaceAcc, ReplaceWithAcc) ->
-    {Mod, Opts} = RequiredModule,
-    {NewReplaceAcc, NewReplaceWithAcc} =
-        case lists:keyfind(Mod, 1, CurrentModules) of
-            false when Opts =:= stopped -> {ReplaceAcc, ReplaceWithAcc};
-            false -> {ReplaceAcc, [RequiredModule | ReplaceWithAcc]};
-            {Mod, Opts} -> {ReplaceAcc, ReplaceWithAcc};
-            ExistingMod when Opts =:= stopped -> {[ExistingMod | ReplaceAcc], ReplaceWithAcc};
-            ExistingMod -> {[ExistingMod | ReplaceAcc], [RequiredModule | ReplaceWithAcc]}
-        end,
-    to_replace(Rest, CurrentModules, NewReplaceAcc, NewReplaceWithAcc).
+get_saved_config(#{node := NodeName}, HostType, Module, Config) ->
+    SavedModules = proplists:get_value({saved_modules, NodeName, HostType}, Config),
+    maps:get(Module, SavedModules).
 
-restore_modules(Domain, Config) ->
-    SavedModules = ?config(saved_modules, Config),
-    CurrentModules = get_current_modules(Domain),
-    rpc(mim(), gen_mod_deps, replace_modules, [Domain, CurrentModules, SavedModules]).
+ensure_modules(HostType, RequiredModules) ->
+    ensure_modules(mim(), HostType, RequiredModules).
 
-get_current_modules(Domain) ->
-    rpc(mim(), gen_mod, loaded_modules_with_opts, [Domain]).
+ensure_modules(Node, HostType, RequiredModules) ->
+    ToStop = [M || {M, stopped} <- RequiredModules],
+    ToEnsure = maps:without(ToStop, maps:from_list(RequiredModules)),
+    rpc(Node, mongoose_modules, replace_modules, [HostType, ToStop, ToEnsure]).
 
-stop(Domain, Mod) ->
-    Node = escalus_ct:get_config(ejabberd_node),
-    stop(Node, Domain, Mod).
+ensure_stopped(HostType, ModulesToStop) ->
+    ensure_stopped(mim(), HostType, ModulesToStop).
 
-stop(#{node := Node}, Domain, Mod) ->
-    stop(Node, Domain, Mod);
-stop(Node, Domain, Mod) ->
-    Cookie = escalus_ct:get_config(ejabberd_cookie),
-    IsLoaded = escalus_rpc:call(Node, gen_mod, is_loaded, [Domain, Mod], 5000, Cookie),
-    case IsLoaded of
-        true -> unsafe_stop(Node, Cookie, Domain, Mod);
-        false -> {error, stopped}
-    end.
+ensure_stopped(Node, HostType, ModulesToStop) ->
+    [{Mod, stop(Node, HostType, Mod)} || Mod <- ModulesToStop].
 
-unsafe_stop(Node, Cookie, Domain, Mod) ->
-    case escalus_rpc:call(Node, gen_mod, stop_module, [Domain, Mod], 5000, Cookie) of
-        {badrpc, Reason} ->
-            ct:fail("Cannot stop module ~p reason ~p", [Mod, Reason]);
-        R -> R
-    end.
+restore_modules(Config) ->
+    restore_modules(#{}, Config).
 
-start(Domain, Mod, Args) ->
-    Node = escalus_ct:get_config(ejabberd_node),
-    start(Node, Domain, Mod, Args).
+restore_modules(RPCSpec, Config) when is_map(RPCSpec) ->
+    [restore_modules(RPCSpec#{node => NodeName}, HostType, SavedModules)
+     || {{saved_modules, NodeName, HostType}, SavedModules} <- Config],
+    Config.
 
-start(#{node := Node}, Domain, Mod, Args) ->
-    start(Node, Domain, Mod, Args);
-start(Node, Domain, Mod, Args) ->
-    Cookie = escalus_ct:get_config(ejabberd_cookie),
-    case escalus_rpc:call(Node, gen_mod, start_module, [Domain, Mod, Args], 5000, Cookie) of
-        {badrpc, Reason} ->
-            ct:fail("Cannot start module ~p reason ~p", [Mod, Reason]);
-        R -> R
-    end.
+restore_modules(Node, HostType, SavedModules) ->
+    CurrentModules = get_current_modules(Node, HostType),
+    ToStop = maps:keys(CurrentModules) -- maps:keys(SavedModules),
+    rpc(Node, mongoose_modules, replace_modules, [HostType, ToStop, SavedModules]).
 
-restart(Domain, Mod, Args) ->
-    stop(Domain, Mod),
-    ModStr = atom_to_list(Mod),
-    case lists:reverse(ModStr) of
-        "smbdr_" ++ Str -> %%check if we need to start rdbms module or regular
-            stop(Domain, list_to_atom(lists:reverse(Str)));
-        Str ->
-            stop(Domain, list_to_atom(lists:reverse(Str)++"_rdbms"))
-    end,
-    start(Domain, Mod, Args).
+get_current_modules(HostType) ->
+    get_current_modules(mim(), HostType).
 
-start_running(Config) ->
-    Domain = ct:get_config({hosts, mim, domain}),
-    case ?config(running, Config) of
-        List when is_list(List) ->
-            _ = [start(Domain, Mod, Args) || {Mod, Args} <- List];
-        _ ->
-            ok
-    end.
+get_current_modules(Node, HostType) ->
+    rpc(Node, gen_mod, loaded_modules_with_opts, [HostType]).
 
-stop_running(Mod, Config) ->
-    ModL = atom_to_list(Mod),
-    Domain = escalus_ejabberd:unify_str_arg(
-               ct:get_config({hosts, mim, domain})),
-    Modules = rpc(mim(), ejabberd_config, get_local_option, [{modules, Domain}]),
-    Filtered = lists:filter(fun({Module, _}) ->
-                    ModuleL = atom_to_list(Module),
-                    case lists:sublist(ModuleL, 1, length(ModL)) of
-                        ModL -> true;
-                        _ -> false
-                    end;
-                (_) -> false
-            end, Modules),
-    case Filtered of
-        [] ->
-            Config;
-        [{Module,_Args}=Head|_] ->
-            stop(Domain, Module),
-            [{running, [Head]} | Config]
-    end.
+stop(HostType, Mod) ->
+    stop(mim(), HostType, Mod).
+
+stop(Node, HostType, Mod) ->
+    rpc(Node, mongoose_modules, ensure_stopped, [HostType, Mod]).
+
+start(HostType, Mod, Args) ->
+    start(mim(), HostType, Mod, Args).
+
+start(Node, HostType, Mod, Args) ->
+    rpc(Node, mongoose_modules, ensure_started, [HostType, Mod, Args]).
+
+restart(HostType, Mod, Args) ->
+    restart(mim(), HostType, Mod, Args).
+
+restart(Node, HostType, Mod, Args) ->
+    stop(Node, HostType, Mod),
+    start(Node, HostType, Mod, Args).

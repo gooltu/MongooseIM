@@ -1,5 +1,5 @@
 -module(jingle_SUITE).
--compile(export_all).
+-compile([export_all, nowarn_export_all]).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("exml/include/exml.hrl").
@@ -11,6 +11,8 @@
 
 -import(jingle_helper, [content/1,
                         content_group/1]).
+
+-import(domain_helper, [domain/0]).
 
 %%--------------------------------------------------------------------
 %% Suite configuration
@@ -54,35 +56,45 @@ suite() ->
 %%--------------------------------------------------------------------
 
 init_per_suite(Config) ->
-    case rpc(mim(), application, get_application, [nksip]) of
-        {ok, nksip} ->
-            Port = 12345,
-            Host = ct:get_config({hosts, mim, domain}),
-            distributed_helper:add_node_to_cluster(mim2(), Config),
-            dynamic_modules:start(mim(), Host, mod_jingle_sip, [{proxy_host, "localhost"},
-                                                                {proxy_port, Port},
-                                                                {username_to_phone,[{<<"2000006168">>, <<"+919177074440">>}]}]),
-            dynamic_modules:start(mim2(), Host, mod_jingle_sip, [{proxy_host, "localhost"},
-                                                                 {proxy_port, Port},
-                                                                 {listen_port, 12346},
-                                                                 {username_to_phone,[{<<"2000006168">>, <<"+919177074440">>}]}]),
+    distributed_helper:add_node_to_cluster(mim2(), Config),
+    start_nksip_in_mim_nodes(),
+    application:ensure_all_started(esip),
+    spawn(fun() -> ets:new(jingle_sip_translator, [public, named_table]),
+                   ets:new(jingle_sip_translator_bindings, [public, named_table]),
+                   receive stop -> ok end end),
+    esip:add_listener(12345, tcp, []),
+    esip:set_config_value(module, jingle_sip_translator),
+    escalus:init_per_suite(Config).
 
-            application:ensure_all_started(esip),
-            spawn(fun() -> ets:new(jingle_sip_translator, [public, named_table]),
-                           ets:new(jingle_sip_translator_bindings, [public, named_table]),
-                           receive stop -> ok end end),
-            esip:add_listener(12345, tcp, []),
-            esip:set_config_value(module, jingle_sip_translator),
-            escalus:init_per_suite(Config);
-        undefined ->
-            {skip, build_was_not_configured_with_jingle_sip}
+start_nksip_in_mim_nodes() ->
+    Pid1 = start_nskip_in_parallel(mim(), #{}),
+    Pid2 = start_nskip_in_parallel(mim2(), #{listen_port => 12346}),
+    wait_for_process_to_stop(Pid1),
+    wait_for_process_to_stop(Pid2).
+
+wait_for_process_to_stop(Pid) ->
+    erlang:monitor(process, Pid),
+    receive
+        {'DOWN', _, process, Pid, _} -> ok
+    after timer:seconds(60) ->
+              ct:fail(wait_for_process_to_stop_timeout)
     end.
+
+start_nskip_in_parallel(NodeSpec, ExtraOpts) ->
+    Domain = domain(),
+    Opts = #{proxy_host => <<"localhost">>,
+             proxy_port => 12345,
+             backend => ct_helper:get_internal_database()},
+    OptsWithExtra = maps:merge(Opts, ExtraOpts),
+    AllOpts = config_parser_helper:mod_config(mod_jingle_sip, OptsWithExtra),
+    RPCSpec = NodeSpec#{timeout => timer:seconds(60)},
+    proc_lib:spawn_link(dynamic_modules, start, [RPCSpec, Domain, mod_jingle_sip, AllOpts]).
 
 end_per_suite(Config) ->
     escalus_fresh:clean(),
-    Host = ct:get_config({hosts, mim, domain}),
-    dynamic_modules:stop(mim(), Host, mod_jingle_sip),
-    dynamic_modules:stop(mim2(), Host, mod_jingle_sip),
+    Domain = domain(),
+    dynamic_modules:stop(mim(), Domain, mod_jingle_sip),
+    dynamic_modules:stop(mim2(), Domain, mod_jingle_sip),
     distributed_helper:remove_node_from_cluster(mim2(), Config),
     escalus:end_per_suite(Config).
 
@@ -521,13 +533,13 @@ iq_set(I) ->
     iq_with_id(Stanza).
 
 iq_with_id(#xmlel{attrs = Attrs} = Stanza) ->
-    NewAttrs = lists:keystore(<<"id">>, 1, Attrs, {<<"id">>, uuid:uuid_to_string(uuid:get_v4(), binary_standard)}),
+    NewAttrs = Attrs#{<<"id">> => uuid:uuid_to_string(uuid:get_v4(), binary_standard)},
     Stanza#xmlel{attrs = NewAttrs}.
 
 iq_get(I) ->
     Stanza = #xmlel{name = <<"iq">>,
-                    attrs = [{<<"xmlns">>, <<"jabber:client">>},
-                             {<<"type">>, <<"get">>}],
+                    attrs = #{<<"xmlns">> => <<"jabber:client">>,
+                              <<"type">> => <<"get">>},
                     children = [I]},
     iq_with_id(Stanza).
 
@@ -537,9 +549,9 @@ jingle_element(Action, Children) ->
 
 jingle_element(SID, Action, Children) ->
     #xmlel{name = <<"jingle">>,
-           attrs = [{<<"action">>, Action},
-                    {<<"sid">>, SID},
-                    {<<"xmlns">>, <<"urn:xmpp:jingle:1">>}],
+           attrs = #{<<"action">> => Action,
+                     <<"sid">> => SID,
+                     <<"xmlns">> => <<"urn:xmpp:jingle:1">>},
            children = Children}.
 
 jingle_accept(InviteRequest) ->
@@ -574,6 +586,7 @@ jingle_source_update(InviteRequest) ->
                                                   content_group([Audio, Video])]),
     iq_set(I).
 
+%% TODO: this seems to be a dead code. remove it if it's not needed anymore
 jingle_transport_info(InviteRequest, Creator, Media, TransportAttrs) ->
     SID = exml_query:path(InviteRequest, path_to_jingle_sid()),
     iq_set(jingle_element(SID, <<"transport-info">>, [trickle_ice_candidate(Creator, Media, TransportAttrs)])).
@@ -589,15 +602,16 @@ get_ice_candidates() ->
      [{<<"foundation">>, <<"1293499931">>}, {<<"component">>, <<"1">>}, {<<"protocol">>, <<"udp">>}, {<<"priority">>, <<"2122260223">>}, {<<"ip">>, <<"172.86.160.16">>}, {<<"port">>, <<"46515">>}, {<<"type">>, <<"host">>}, {<<"generation">>, <<"0">>}, {<<"network">>, <<"1">>}, {<<"id">>, <<"1.1947885zlx">>}]
     ].
 
+%% TODO: this seems to be a dead code. remove it if it's not needed anymore
 trickle_ice_candidate(Creator, Content, TransportAttrs) ->
     Candidate = #xmlel{name = <<"candidate">>,
                        attrs = TransportAttrs},
     Transport = #xmlel{name = <<"transport">>,
-                       attrs = [{<<"xmlns">>, <<"urn:xmpp:jingle:transports:ice-udp:1">>},
-                                {<<"ufrag">>, <<"7Gpn">>},
-                                {<<"pwd">>, <<"MUOzzatqL2qP7n1uRC7msD+c">>}],
+                       attrs = #{<<"xmlns">> => <<"urn:xmpp:jingle:transports:ice-udp:1">>,
+                                 <<"ufrag">> => <<"7Gpn">>,
+                                 <<"pwd">> => <<"MUOzzatqL2qP7n1uRC7msD+c">>},
                        children = [Candidate]},
     #xmlel{name = <<"content">>,
-           attrs = [{<<"name">>, Content},
-                    {<<"creator">>, Creator}],
+           attrs = #{<<"name">> => Content,
+                     <<"creator">> => Creator},
            children = [Transport]}.

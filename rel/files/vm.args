@@ -10,7 +10,7 @@
 -sname {{node_name}}
 
 ## Cookie for distributed erlang
--setcookie ejabberd
+-setcookie mongooseim
 
 ## Heartbeat management; auto-restarts VM if it dies or becomes unresponsive
 ## (Disabled by default..use with caution!)
@@ -21,5 +21,6 @@
 ## Tweak GC to run more often
 -env ERL_FULLSWEEP_AFTER 2
 
-## With lager sasl reports are redundant so turn them off
--sasl sasl_error_logger false
+{{#epmd_module}}
+-epmd_module {{{epmd_module}}}
+{{/epmd_module}}

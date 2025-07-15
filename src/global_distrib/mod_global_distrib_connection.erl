@@ -25,13 +25,15 @@
 
 -record(state, {
           socket :: mod_global_distrib_transport:t(),
-          host :: atom(),
+          host :: binary(),
           peer :: tuple() | unknown,
           conn_id :: binary()
          }).
 
 -export([start_link/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, code_change/3, terminate/2]).
+
+-ignore_xref([start_link/2]).
 
 %%--------------------------------------------------------------------
 %% API
@@ -44,32 +46,25 @@ start_link(Endpoint, Server) ->
 
 init([{Addr, Port}, Server]) ->
     ConnID = uuid:uuid_to_string(uuid:get_v4(), binary_standard),
-    ?DEBUG("event=outgoing_gd_connection remote_server=~ts address=~1000p:~p pid=~p conn_id=~ts",
-           [Server, Addr, Port, self(), ConnID]),
+    ?LOG_DEBUG(#{what => gd_new_outgoing_connection,
+                 server => Server, address => Addr, port => Port,
+                 pid => self(), conn_id => ConnID}),
     process_flag(trap_exit, true),
-    MetricServer = mod_global_distrib_utils:binary_to_metric_atom(Server),
-    mod_global_distrib_utils:ensure_metric(?GLOBAL_DISTRIB_MESSAGES_SENT(MetricServer), spiral),
-    mod_global_distrib_utils:ensure_metric(
-      ?GLOBAL_DISTRIB_SEND_QUEUE_TIME(MetricServer), histogram),
-    mod_global_distrib_utils:ensure_metric(
-      ?GLOBAL_DISTRIB_OUTGOING_ESTABLISHED(MetricServer), spiral),
-    mod_global_distrib_utils:ensure_metric(
-      ?GLOBAL_DISTRIB_OUTGOING_ERRORED(MetricServer), spiral),
-    mod_global_distrib_utils:ensure_metric(
-      ?GLOBAL_DISTRIB_OUTGOING_CLOSED(MetricServer), spiral),
     try
         {ok, RawSocket} = gen_tcp:connect(Addr, Port, [binary, {active, false}]),
-        {ok, Socket} = mod_global_distrib_transport:wrap(RawSocket, [connect | opt(tls_opts)]),
+        {ok, Socket} = mod_global_distrib_transport:wrap(RawSocket, opt(connections), client),
         GdStart = gd_start(Server, ConnID),
         ok = mod_global_distrib_transport:send(Socket, <<(byte_size(GdStart)):32, GdStart/binary>>),
         mod_global_distrib_transport:setopts(Socket, [{active, once}]),
-        mongoose_metrics:update(global, ?GLOBAL_DISTRIB_OUTGOING_ESTABLISHED(MetricServer), 1),
-        {ok, #state{socket = Socket, host = MetricServer, conn_id = ConnID,
+        mongoose_instrument:execute(?GLOBAL_DISTRIB_OUTGOING_ESTABLISHED, #{},
+                                    #{count => 1, host => Server}),
+        {ok, #state{socket = Socket, host = Server, conn_id = ConnID,
                     peer = mod_global_distrib_transport:peername(Socket)}}
     catch
         error:{badmatch, Reason}:StackTrace ->
-            ?ERROR_MSG("event=gd_connection_failed server=~ts address=~p:~p reason=~1000p conn_id=~ts stacktrace=~1000p",
-                       [Server, Addr, Port, Reason, ConnID, StackTrace]),
+            ?LOG_ERROR(#{what => gd_connection_failed,
+                         server => Server, address => Addr, port => Port,
+                         reason => Reason, conn_id => ConnID, stacktrace => StackTrace}),
             {stop, normal}
     end.
 
@@ -80,30 +75,29 @@ handle_call(Msg, From, State) ->
 handle_cast({data, Stamp, Data}, #state{socket = Socket, host = ToHost} = State) ->
     QueueTimeNative = erlang:monotonic_time() - Stamp,
     QueueTimeUS = erlang:convert_time_unit(QueueTimeNative, native, microsecond),
-    mongoose_metrics:update(global, ?GLOBAL_DISTRIB_SEND_QUEUE_TIME(ToHost), QueueTimeUS),
+    mongoose_instrument:execute(?GLOBAL_DISTRIB_SEND_QUEUE, #{}, #{time => QueueTimeUS, host => ToHost}),
     ClockTime = erlang:system_time(microsecond),
     Annotated = <<(byte_size(Data) + 8):32, ClockTime:64, Data/binary>>,
     case mod_global_distrib_transport:send(Socket, Annotated) of
         ok ->
-            mongoose_metrics:update(global, ?GLOBAL_DISTRIB_MESSAGES_SENT(ToHost), 1);
+            mongoose_instrument:execute(?GLOBAL_DISTRIB_MESSAGES_SENT, #{}, #{count => 1, host => ToHost});
         Error ->
-            ?ERROR_MSG("event=cant_send_global_distrib_packet,reason='~p',packet='~p' conn_id=~ts",
-                       [Error, Data, State#state.conn_id]),
+            ?LOG_ERROR(#{what => gd_cant_send_packet,
+                         reason => Error, packet => Data, conn_id => State#state.conn_id}),
             error(Error)
     end,
     {noreply, State}.
 
-handle_info({tcp, _Socket, RawData}, #state{socket = Socket} = State) ->
+handle_info({Tag, _Socket, _RawData}, #state{socket = Socket} = State)
+  when Tag == tcp; Tag == ssl ->
     ok = mod_global_distrib_transport:setopts(Socket, [{active, once}]),
-    %% Feeding data to drive the TLS state machine (in case of TLS connection)
-    {ok, _} = mod_global_distrib_transport:recv_data(Socket, RawData),
     {noreply, State};
-handle_info({tcp_closed, _}, State) ->
+handle_info({Tag, _Socket}, State) when Tag == tcp_closed; Tag == ssl_closed ->
     {stop, normal, State};
-handle_info({tcp_error, _Socket, Reason}, State) ->
-    ?ERROR_MSG("event=outgoing_global_distrib_socket_error,reason='~p',peer='~p',conn_id=~ts",
-               [Reason, State#state.peer, State#state.conn_id]),
-    mongoose_metrics:update(global, ?GLOBAL_DISTRIB_OUTGOING_ERRORED(State#state.host), 1),
+handle_info({Tag, _Socket, Reason}, State) when Tag == tcp_error; Tag == ssl_error ->
+    ?LOG_ERROR(#{what => gd_outgoing_socket_error,
+                 reason => Reason, peer => State#state.peer, conn_id => State#state.conn_id}),
+    mongoose_instrument:execute(?GLOBAL_DISTRIB_OUTGOING_ERRORED, #{}, #{count => 1, host => State#state.host}),
     {stop, {error, Reason}, State};
 handle_info(_, State) ->
     {noreply, State}.
@@ -112,9 +106,15 @@ code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
 terminate(Reason, State) ->
-    ?WARNING_MSG("event=outgoing_global_distrib_socket_closed,peer='~p' conn_id=~ts reason=~p",
-                 [State#state.peer, State#state.conn_id, Reason]),
-    mongoose_metrics:update(global, ?GLOBAL_DISTRIB_OUTGOING_CLOSED(State#state.host), 1),
+    case Reason of
+        shutdown ->
+            ?LOG_INFO(#{what => gd_outgoing_socket_error,
+                        reason => Reason, peer => State#state.peer, conn_id => State#state.conn_id});
+        _ ->
+            ?LOG_ERROR(#{what => gd_outgoing_socket_error,
+                         reason => Reason, peer => State#state.peer, conn_id => State#state.conn_id})
+    end,
+    mongoose_instrument:execute(?GLOBAL_DISTRIB_OUTGOING_CLOSED, #{}, #{count => 1, host => State#state.host}),
     catch mod_global_distrib_transport:close(State#state.socket),
     ignore.
 
@@ -124,8 +124,8 @@ terminate(Reason, State) ->
 
 -spec opt(Key :: atom()) -> term().
 opt(Key) ->
-    mod_global_distrib_utils:opt(mod_global_distrib_sender, Key).
+    mod_global_distrib_utils:opt(mod_global_distrib, Key).
 
 gd_start(Server, ConnID) ->
-    Attrs = [{<<"server">>, Server}, {<<"conn_id">>, ConnID}],
+    Attrs = #{<<"server">> => Server, <<"conn_id">> => ConnID},
     exml:to_binary(#xmlel{name = <<"gd_start">>, attrs = Attrs}).

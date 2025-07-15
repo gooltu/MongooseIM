@@ -23,10 +23,14 @@
 -export([start_link/2]).
 -export([get_connection/1, ping_proc/1, get_state_info/1]).
 -export([force_refresh/1, close_disabled/1]).
--export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
+-export([init/1, handle_continue/2, handle_call/3, handle_cast/2,
+         handle_info/2, terminate/2, code_change/3]).
 
 %% Debug
 -export([get_enabled_endpoints/1, get_disabled_endpoints/1]).
+
+-ignore_xref([close_disabled/1, force_refresh/1, get_disabled_endpoints/1,
+              get_enabled_endpoints/1, get_state_info/1, start_link/2]).
 
 -type endpoint() :: mod_global_distrib_utils:endpoint().
 -type endpoint_pid_tuple() :: {endpoint(), pid()}.
@@ -55,7 +59,8 @@
           %% Listeners are notified only once and then this list is cleared.
           pending_endpoints_listeners = [] :: [pid()],
           %% Containts last result of get_endpoints
-          last_endpoints :: [endpoint()] | undefined
+          last_endpoints :: [endpoint()] | undefined,
+          conn_opts :: map()
          }).
 
 -type state() :: #state{}.
@@ -116,11 +121,12 @@ get_disabled_endpoints(Server) ->
 init([Server, Supervisor]) ->
     process_flag(trap_exit, true),
 
-    RefreshInterval = mod_global_distrib_utils:opt(mod_global_distrib_sender,
-                                                   endpoint_refresh_interval),
-    DisRefreshInterval = mod_global_distrib_utils:opt(mod_global_distrib_sender,
-                                                      endpoint_refresh_interval_when_empty),
-    GCInterval = mod_global_distrib_utils:opt(mod_global_distrib_sender, disabled_gc_interval),
+    HostType = mod_global_distrib_utils:host_type(),
+    ConnOpts = gen_mod:get_module_opt(HostType, mod_global_distrib_hosts_refresher, connections),
+    #{endpoint_refresh_interval := RefreshInterval,
+      endpoint_refresh_interval_when_empty := DisRefreshInterval,
+      disabled_gc_interval := GCInterval} = ConnOpts,
+
     State = #state{
                server = Server,
                supervisor = Supervisor,
@@ -130,16 +136,18 @@ init([Server, Supervisor]) ->
                pending_gets = queue:new(),
                refresh_interval = RefreshInterval,
                refresh_interval_when_disconnected = DisRefreshInterval,
-               gc_interval = GCInterval
+               gc_interval = GCInterval,
+               conn_opts = ConnOpts
               },
 
+    ?LOG_INFO(ls(#{what => gd_mgr_started}, State)),
+    {ok, State, {continue, initial_refresh}}.
+
+handle_continue(initial_refresh, State) ->
     State2 = refresh_connections(State),
     schedule_refresh(State2),
     schedule_gc(State2),
-
-    ?INFO_MSG("event=mgr_started,pid='~p',server='~p',supervisor='~p',refresh_interval=~p",
-              [self(), Server, Supervisor, RefreshInterval]),
-    {ok, State2}.
+    {noreply, State2}.
 
 handle_call(get_connection_pool, From, #state{ enabled = [],
                                                pending_gets = PendingGets } = State) ->
@@ -170,11 +178,11 @@ handle_call(get_state_info, _From, State) ->
     {reply, state_info(State), State}.
 
 handle_cast({call_timeout, FromPid, Msg}, State) ->
-    ?WARNING_MSG("event=mgr_timeout, caller_pid=~p, caller_msg=~p state_info=~1000p",
-                 [FromPid, Msg, state_info(State)]),
+    ?LOG_WARNING(ls(#{what => gd_mgr_call_timeout,
+                      caller_pid => FromPid, caller_msg => Msg}, State)),
     {noreply, State};
 handle_cast(Msg, State) ->
-    ?WARNING_MSG("event=unknown_msg,msg='~p'", [Msg]),
+    ?UNEXPECTED_CAST(Msg),
     {noreply, State}.
 
 handle_info(refresh, State) ->
@@ -186,10 +194,10 @@ handle_info(refresh, State) ->
         true ->
             ok;
         _ ->
-            ?INFO_MSG("event=gd_mgr_refresh refresh_interval=~p "
-                      "pending_endpoints_before=~p pending_endpoints_after=~p",
-                      [State#state.refresh_interval,
-                       State#state.pending_endpoints, State2#state.pending_endpoints])
+            ?LOG_INFO(ls(#{what => gd_mgr_refresh,
+                           text => <<"A list of pending_endpoints has changed in GD server manager">>,
+                           pending_endpoints_before => State#state.pending_endpoints,
+                           pending_endpoints_after => State2#state.pending_endpoints}, State))
     end,
     schedule_refresh(State2),
     {noreply, State2};
@@ -208,8 +216,9 @@ handle_info(disabled_gc, #state{ disabled = Disabled } = State) ->
         [] ->
             ok;
         _ ->
-            ?INFO_MSG("event=gd_mgr_disabled_gc stopped_endpoints=~p gc_interval=~p",
-                      [StoppedEndpoints, State#state.gc_interval])
+            ?LOG_INFO(ls(#{what => gd_mgr_disabled_gc,
+                           text => <<"GD server manager stops some inactive endpoints">>,
+                           stopped_endpoints => StoppedEndpoints}, State))
     end,
     schedule_gc(State),
     {noreply, State};
@@ -233,12 +242,14 @@ handle_info(process_pending_endpoint,
     State2 =
     case catch enable(Endpoint, State) of
         {ok, NState0} ->
-            ?INFO_MSG("event=endpoint_enabled,endpoint='~p',server='~s'",
-                      [Endpoint, State#state.server]),
+            ?LOG_INFO(ls(#{what => gd_endpoint_enabled,
+                           text => <<"GD server manager enables pending endpoint">>,
+                           endpoint => Endpoint}, State)),
             NState0;
         Error ->
-            ?ERROR_MSG("event=cannot_enable_endpoint,endpoint='~p',server='~s',error='~p'",
-                       [Endpoint, State#state.server, Error]),
+            ?LOG_ERROR(ls(#{what => gd_endpoint_enabling_failed,
+                            text => <<"GD server manager cannot enable endpoint">>,
+                            endpoint => Endpoint, reason => Error}, State)),
             State
     end,
 
@@ -252,12 +263,14 @@ handle_info(process_pending_endpoint,
     State2 =
     case catch disable(Endpoint, State) of
         {ok, NState0} ->
-            ?INFO_MSG("event=endpoint_disabled,endpoint='~p',server='~s'",
-                      [Endpoint, State#state.server]),
+            ?LOG_INFO(ls(#{what => gd_endpoint_disabled,
+                           text => <<"GD server manager disables pending endpoint">>,
+                           endpoint => Endpoint}, State)),
             NState0;
         Error ->
-            ?ERROR_MSG("event=cannot_disable_endpoint,endpoint='~p',server='~s',error='~p'",
-                       [Endpoint, State#state.server, Error]),
+            ?LOG_ERROR(ls(#{what => gd_endpoint_disabling_failed,
+                            text => <<"GD server manager cannot disable endpoint">>,
+                            endpoint => Endpoint, reason => Error}, State)),
             State
     end,
 
@@ -280,17 +293,17 @@ handle_info({'DOWN', MonitorRef, _Type, Pid, Reason}, #state{ enabled = Enabled,
             end
     end,
 
-    case Reason of
-        ItsFine when ItsFine == normal; ItsFine == shutdown ->
-            ?INFO_MSG("event=endpoint_closed,endpoint='~p',type=~p,reason='normal'",
-                      [Endpoint, Type]);
-        _Other ->
-            ?ERROR_MSG("event=endpoint_closed,endpoint='~p',type=~p,reason='~p'",
-                       [Endpoint, Type, Reason])
-    end,
+    Reason2 =
+        case Reason of
+            shutdown -> normal;
+            _Other -> Reason
+        end,
+    ?LOG_INFO(ls(#{what => gd_endpoint_closed,
+                   text => <<"Disconnected from a GD endpoint">>,
+                   type => Type, endpoint => Endpoint, reason => Reason2}, State)),
     {noreply, NState};
 handle_info(Msg, State) ->
-    ?WARNING_MSG("event=unknown_msg,msg='~p'", [Msg]),
+    ?UNEXPECTED_INFO(Msg),
     {noreply, State}.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -361,19 +374,20 @@ pick_connection_pool(Enabled) ->
 -spec refresh_connections(State :: state()) -> state().
 refresh_connections(#state{ server = Server, pending_endpoints = PendingEndpoints,
                             last_endpoints = LastEndpoints } = State) ->
-    ?DEBUG("event=refreshing_endpoints,server='~s'", [Server]),
-    {ok, NewEndpoints} = get_endpoints(Server),
+    ?LOG_DEBUG(ls(#{what => gd_refreshing_endpoints}, State)),
+    NewEndpoints = get_endpoints(Server),
     case NewEndpoints of
         LastEndpoints ->
             nothing_new;
         _ ->
-            ?INFO_MSG("event=endpoints_change old_endpoints=~p new_endpoints=~p",
-                      [LastEndpoints, NewEndpoints])
+            ?LOG_INFO(ls(#{what => gd_endpoints_change,
+                           old_endpoints => LastEndpoints,
+                           new_endpoints => NewEndpoints}, State))
     end,
-    ?DEBUG("event=fetched_endpoints,server='~s',result='~p'", [Server, NewEndpoints]),
+    ?LOG_DEBUG(ls(#{what => gd_fetched_endpoints, fetched_endpoints => NewEndpoints}, State)),
 
     NPendingEndpoints = resolve_pending(NewEndpoints, State#state.enabled),
-    log_endpoints_changes(Server, NPendingEndpoints),
+    log_endpoints_changes(Server, NPendingEndpoints, State),
 
     case PendingEndpoints of
         [] -> maybe_schedule_process_endpoint(NPendingEndpoints);
@@ -386,20 +400,19 @@ refresh_connections(#state{ server = Server, pending_endpoints = PendingEndpoint
         [] ->
             no_log;
         _ ->
-            ?DEBUG("event=endpoints_update_scheduled,server='~s',new_changes=~p,pending_changes=~p",
-                   [Server, length(NPendingEndpoints), length(FinalPendingEndpoints)])
+            ?LOG_DEBUG(ls(#{what => gd_endpoints_update_scheduled,
+                            new_changes => NPendingEndpoints,
+                            pending_changes => FinalPendingEndpoints,
+                            new_changes_length => length(NPendingEndpoints),
+                            pending_changes_length => length(FinalPendingEndpoints)},
+                          State))
     end,
     State#state{ pending_endpoints = FinalPendingEndpoints, last_endpoints = NewEndpoints }.
 
--spec get_endpoints(Server :: jid:lserver()) -> {ok, [mod_global_distrib_utils:endpoint()]}.
+-spec get_endpoints(Server :: jid:lserver()) -> [mod_global_distrib_utils:endpoint()].
 get_endpoints(Server) ->
-    {ok, EndpointsToResolve} =
-    case ejabberd_config:get_local_option({global_distrib_addr, Server}) of
-        undefined -> mod_global_distrib_mapping:endpoints(Server);
-        Endpoints -> {ok, Endpoints}
-    end,
-    Resolved = mod_global_distrib_utils:resolve_endpoints(EndpointsToResolve),
-    {ok, Resolved}.
+    EndpointsToResolve = mod_global_distrib_mapping:endpoints(Server),
+    mod_global_distrib_utils:resolve_endpoints(EndpointsToResolve).
 
 -spec resolve_pending(NewEndpointList :: [mod_global_distrib_utils:endpoint()],
                       OldEnabled :: [endpoint_pid_tuple()]) ->
@@ -415,20 +428,22 @@ resolve_pending([MaybeToEnable | RNewEndpoints], OldEnabled) ->
     end.
 
 -spec log_endpoints_changes(Server :: jid:lserver(),
-                            EndpointsChanges :: endpoints_changes()) -> any().
-log_endpoints_changes(Server, []) ->
-    ?DEBUG("event=endpoints_changes,server='~s',to_enable='[]',to_disable='[]'", [Server]);
-log_endpoints_changes(Server, EndpointsChanges) ->
-    ?INFO_MSG("event=endpoints_changes,server='~s',to_enable='~p',to_disable='~p'",
-              [Server, [ E || {enable, E} <- EndpointsChanges ],
-                       [ E || {disable, E} <- EndpointsChanges ]]).
+                            EndpointsChanges :: endpoints_changes(), term()) -> any().
+log_endpoints_changes(Server, [], State) ->
+    ?LOG_DEBUG(ls(#{what => gd_same_endpoints, server => Server,
+                    text => <<"No endpoint changes">>}, State));
+log_endpoints_changes(Server, EndpointsChanges, State) ->
+    ?LOG_INFO(ls(#{what => gd_endpoints_changes, server => Server,
+                   to_enable => [ E || {enable, E} <- EndpointsChanges ],
+                   to_disable => [ E || {disable, E} <- EndpointsChanges ]}, State)).
 
 -spec enable(Endpoint :: endpoint(), State :: state()) -> {ok, state()} | {error, any()}.
 enable(Endpoint, #state{ disabled = Disabled, supervisor = Supervisor,
-                         enabled = Enabled, server = Server } = State) ->
+                         enabled = Enabled, server = Server, conn_opts = ConnOpts } = State) ->
     case lists:keytake(Endpoint, #endpoint_info.endpoint, Disabled) of
         false ->
-            case catch mod_global_distrib_server_sup:start_pool(Supervisor, Endpoint, Server) of
+            case catch mod_global_distrib_server_sup:start_pool(Supervisor, Endpoint,
+                                                                Server, ConnOpts) of
                 {ok, ConnPoolRef, ConnPoolPid} ->
                     MonitorRef = monitor(process, ConnPoolPid),
                     EndpointInfo = #endpoint_info{
@@ -457,8 +472,9 @@ stop_disabled(Endpoint, State) ->
         ok ->
             ok;
         Error ->
-            ?ERROR_MSG("event=cannot_close_disabled_connection,endpoint='~p',error='~p'",
-                       [Endpoint, Error])
+            ?LOG_ERROR(ls(#{what => gd_cannot_close_disabled_connection,
+                            reason => Error, endpoint => Endpoint},
+                          State))
     end.
 
 state_info(#state{
@@ -474,15 +490,19 @@ state_info(#state{
           pending_endpoints_listeners = PendingEndpointsListeners,
           last_endpoints = LastEndpoints
          }) ->
-    [{server, Server},
-     {supervisor, Supervisor},
-     {enabled, Enabled},
-     {disabled, Disabled},
-     {pending_endpoints, PendingEndpoints},
-     {pending_gets, PendingGets},
-     {refresh_interval, RefreshInterval},
-     {refresh_interval_when_disconnected, DisRefreshInterval},
-     {gc_interval, GCInterval},
-     {pending_endpoints_listeners, PendingEndpointsListeners},
-     {last_endpoints, LastEndpoints}].
+    #{server => Server,
+      supervisor => Supervisor,
+      enabled => Enabled,
+      disabled => Disabled,
+      pending_endpoints => PendingEndpoints,
+      pending_gets => PendingGets,
+      refresh_interval => RefreshInterval,
+      refresh_interval_when_disconnected => DisRefreshInterval,
+      gc_interval => GCInterval,
+      pending_endpoints_listeners => PendingEndpointsListeners,
+      last_endpoints => LastEndpoints}.
 
+
+%% Log State
+ls(LogMeta, State) ->
+    maps:merge(state_info(State), LogMeta).

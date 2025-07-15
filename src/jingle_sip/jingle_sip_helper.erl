@@ -28,29 +28,29 @@
     exml:element().
 jingle_element(CallID, Action, Children) ->
     #xmlel{name = <<"jingle">>,
-           attrs = [{<<"xmlns">>, ?JINGLE_NS},
-                    {<<"action">>, Action},
-                    {<<"sid">>, CallID}],
+           attrs = #{<<"xmlns">> => ?JINGLE_NS,
+                     <<"action">> => Action,
+                     <<"sid">> => CallID},
            children = Children}.
 
 -spec jingle_iq(ToBinary :: jid:literal_jid(), FromBinary :: jid:literal_jid(), exml:element()) ->
     exml:element().
 jingle_iq(ToBinary, FromBinary, JingleEl) ->
     #xmlel{name = <<"iq">>,
-           attrs = [{<<"from">>, FromBinary},
-                    {<<"to">>, ToBinary},
-                    {<<"id">>, uuid:uuid_to_string(uuid:get_v4(), binary_standard)},
-                    {<<"type">>, <<"set">>}],
+           attrs = #{<<"from">> => FromBinary,
+                     <<"to">> => ToBinary,
+                     <<"id">> => uuid:uuid_to_string(uuid:get_v4(), binary_standard),
+                     <<"type">> => <<"set">>},
            children = [JingleEl]}.
 
 -spec maybe_rewrite_to_phone(mongoose_acc:t()) -> jid:jid().
 maybe_rewrite_to_phone(Acc) ->
-    Server = mongoose_acc:lserver(Acc),
+    HostType = mongoose_acc:host_type(Acc),
     #jid{luser = ToUser} = JID = mongoose_acc:to_jid(Acc),
-    ToRewrite = gen_mod:get_module_opt(Server, mod_jingle_sip, username_to_phone, []),
+    ToRewrite = gen_mod:get_module_opt(HostType, mod_jingle_sip, username_to_phone),
     case lists:keyfind(ToUser, 1, ToRewrite) of
         {ToUser, PhoneNumber} ->
-            JID#jid{user = PhoneNumber, luser = PhoneNumber};
+            JID#jid{luser = PhoneNumber};
         _ ->
             JID
     end.
@@ -64,11 +64,15 @@ maybe_rewrite_from_phone(_, Username) ->
     Username.
 
 try_to_rewrite_from_phone(Server, PhoneNumber) ->
-    ToRewrite = gen_mod:get_module_opt(Server, mod_jingle_sip, username_to_phone, []),
-    case lists:keyfind(PhoneNumber, 2, ToRewrite) of
-        {ToUser, PhoneNumber} ->
-            ToUser;
-        _ ->
+    case mongoose_domain_api:get_host_type(Server) of
+        {ok, HostType} ->
+            ToRewrite = gen_mod:get_module_opt(HostType, mod_jingle_sip, username_to_phone),
+            case lists:keyfind(PhoneNumber, 2, ToRewrite) of
+                {ToUser, PhoneNumber} ->
+                    ToUser;
+                _ ->
+                    PhoneNumber
+            end;
+        {error, not_found} ->
             PhoneNumber
     end.
-

@@ -1,408 +1,248 @@
 -module(mongoose_config_SUITE).
--author("mikhail uvarov").
--compile([export_all]).
+-compile([export_all, nowarn_export_all]).
+
 -include_lib("eunit/include/eunit.hrl").
 
+-import(ejabberd_helper, [start_ejabberd_with_config/2,
+                          use_config_file/2,
+                          copy/2,
+                          data/2]).
 
-all() -> [
-    does_pattern_match_case,
-    flat_state_case,
-    parse_config_with_underscore_pattern_case,
-    node_specific_options_presents_case,
-    node_specific_options_missing_case,
-    states_to_reloading_context_case,
-    auth_method_and_cluster_reload_case,
-    no_duplicate_options_case,
-    get_config_diff_case,
-    flat_module_subopts_case,
-    expand_opts_case,
-    expand_module_subopts_case,
-    parse_config_with_required_files_case
-].
+all() ->
+    [{group, opts},
+     {group, cluster}].
 
-init_per_suite(C) ->
+groups() ->
+    [
+     {opts, [get_opt,
+             lookup_opt,
+             get_path,
+             lookup_path,
+             set_short_path,
+             set_long_path,
+             unset_path,
+             load_from_file]},
+     {cluster, [], [cluster_load_from_file]}
+    ].
+
+init_per_suite(Config) ->
+    mnesia:start(), %% TODO Remove this call when possible (We still need it for s2s)
     {ok, _} = application:ensure_all_started(jid),
-    C.
+    mongoose_config:set_opts(#{}),
+    Config.
 
-end_per_suite(C) -> C.
-init_per_testcase(_TC, C) -> C.
-end_per_testcase(_TC, C) -> C.
-
-
-%% TESTS
-
-%% Check each pattern with cases that match or not
-does_pattern_match_case(_C) ->
-    [check_case(Case) || Case <- match_cases()],
+end_per_suite(_Config) ->
+    mongoose_config:erase_opts(),
+    mnesia:stop(),
+    mnesia:delete_schema([node()]),
+    [ok = application:stop(App) || App <- [prometheus_cowboy, prometheus_httpd, prometheus]],
     ok.
 
-check_case(Case=#{pattern := Pattern, matches := Matches}) ->
-    [check_match(Match, Pattern) || Match <- Matches],
-    [check_nomatch(Match, Pattern) || Match <- maps:get(nomatches, Case, [])],
+init_per_testcase(_TestCase, Config) ->
+    Config.
+
+end_per_testcase(_TestCase, _Config) ->
     ok.
 
-check_match(Subject, Pattern) ->
-    Match = mongoose_config_flat:does_pattern_match(Subject, Pattern),
-    case Match of
-        true ->
-            ok;
-        false ->
-            ct:fail(#{issue => check_match_failed,
-                      subject => Subject,
-                      pattern => Pattern})
+init_per_group(cluster, Config) ->
+    start_slave_node(Config);
+init_per_group(_GroupName, Config) ->
+    Config.
+
+end_per_group(cluster, Config) ->
+    stop_slave_node(Config),
+    ok;
+end_per_group(_GroupName, _Config) ->
+    ok.
+
+%%
+%% Tests
+%%
+
+get_opt(_Config) ->
+    ?assertError({badkey, get_me}, mongoose_config:get_opt(get_me)),
+    ?assertEqual(default_value, mongoose_config:get_opt(get_me, default_value)),
+    mongoose_config:set_opt(get_me, you_got_me),
+    ?assertEqual(you_got_me, mongoose_config:get_opt(get_me)),
+    mongoose_config:set_opt(get_me, you_got_me_again),
+    ?assertEqual(you_got_me_again, mongoose_config:get_opt(get_me)),
+    ?assertEqual(you_got_me_again, mongoose_config:get_opt(get_me, default_value)),
+    mongoose_config:unset_opt(get_me),
+    ?assertError({badkey, get_me}, mongoose_config:get_opt(get_me)),
+    ?assertEqual(default_value, mongoose_config:get_opt(get_me, default_value)).
+
+lookup_opt(_Config) ->
+    ?assertEqual({error, not_found}, mongoose_config:lookup_opt(look_me_up)),
+    mongoose_config:set_opt(look_me_up, here_i_am),
+    ?assertEqual({ok, here_i_am}, mongoose_config:lookup_opt(look_me_up)),
+    mongoose_config:unset_opt(look_me_up),
+    ?assertEqual({error, not_found}, mongoose_config:lookup_opt(look_me_up)).
+
+get_path(_Config) ->
+    ?assertError({badkey, root}, mongoose_config:get_opt([root])),
+    ?assertError({badkey, root}, mongoose_config:get_opt([root, branch])),
+    mongoose_config:set_opt(root, #{branch => leaf}),
+    ?assertEqual(#{branch => leaf}, mongoose_config:get_opt([root])),
+    ?assertEqual(leaf, mongoose_config:get_opt([root, branch])),
+    ?assertError({badmap, leaf}, mongoose_config:get_opt([root, branch, leaf])),
+    mongoose_config:unset_opt(root),
+    ?assertError({badkey, root}, mongoose_config:get_opt([root])).
+
+lookup_path(_Config) ->
+    ?assertEqual({error, not_found}, mongoose_config:lookup_opt([basement])),
+    ?assertEqual({error, not_found}, mongoose_config:lookup_opt([basement, floor])),
+    mongoose_config:set_opt(basement, #{floor => roof}),
+    ?assertEqual({ok, #{floor => roof}}, mongoose_config:lookup_opt([basement])),
+    ?assertEqual({ok, roof}, mongoose_config:lookup_opt([basement, floor])),
+    ?assertError({badmap, roof}, mongoose_config:lookup_opt([basement, floor, roof])),
+    mongoose_config:unset_opt(basement),
+    ?assertEqual({error, not_found}, mongoose_config:lookup_opt([basement])).
+
+set_short_path(_Config) ->
+    mongoose_config:set_opt([a], 1),
+    ?assertEqual(1, mongoose_config:get_opt(a)),
+    mongoose_config:set_opt([a], 2),
+    ?assertEqual(2, mongoose_config:get_opt(a)),
+    ?assertError({badmap, 2}, mongoose_config:set_opt([a, b], c)),
+    ?assertEqual(2, mongoose_config:get_opt(a)).
+
+set_long_path(_Config) ->
+    ?assertError({badkey, one}, mongoose_config:set_opt([one, two, three], 4)),
+    mongoose_config:set_opt([one], #{}),
+    ?assertError({badkey, two}, mongoose_config:set_opt([one, two, three], 4)),
+    mongoose_config:set_opt([one, two], #{}),
+    mongoose_config:set_opt([one, two, three], 4),
+    ?assertEqual(#{two => #{three => 4}}, mongoose_config:get_opt(one)),
+    mongoose_config:set_opt([one, two], 3),
+    ?assertEqual(#{two => 3}, mongoose_config:get_opt(one)).
+
+unset_path(_Config) ->
+    mongoose_config:set_opt(foo, #{bar => #{baz => boom}}),
+    ?assertEqual(#{bar => #{baz => boom}}, mongoose_config:get_opt(foo)),
+    ?assertError({badmap, boom}, mongoose_config:unset_opt([foo, bar, baz, boom])),
+    mongoose_config:unset_opt([foo, bar, baz]),
+    ?assertEqual(#{bar => #{}}, mongoose_config:get_opt(foo)), % empty map is not removed
+    mongoose_config:unset_opt([foo, bar, baz]), % no error for a non-existing key
+    ?assertEqual(#{bar => #{}}, mongoose_config:get_opt(foo)),
+    mongoose_config:unset_opt([foo]),
+    ?assertError({badkey, foo}, mongoose_config:get_opt(foo)),
+    ?assertError({badkey, foo}, mongoose_config:unset_opt([foo, bar])),
+    mongoose_config:unset_opt([foo]). % no error for a non-existing key
+
+load_from_file(Config) ->
+    use_config_file(Config, "mongooseim.minimal.toml"),
+    ok = mongoose_config:start(),
+    Opts = mongoose_config:get_opts(),
+    check_loaded_config(Opts),
+
+    ok = mongoose_config:stop(),
+    check_removed_config(),
+
+    %% Try to stop it again
+    {error, not_started} = mongoose_config:stop().
+
+cluster_load_from_file(Config) ->
+    SlaveNode = slave_node(Config),
+    copy(data(Config, "mongooseim.minimal.toml"), data(Config, "mongooseim.toml")),
+
+    %% Start clustered MongooseIM and check the loaded config
+    {ok, _} = start_ejabberd_with_config(Config, "mongooseim.toml"),
+    {ok, _} = start_remote_ejabberd_with_config(SlaveNode, Config, "mongooseim.toml"),
+    maybe_join_cluster(SlaveNode),
+    check_loaded_config(mongoose_config:get_opts()),
+    check_loaded_config(rpc:call(SlaveNode, mongoose_config, get_opts, [])),
+
+    ok = mongooseim:stop(),
+    stop_remote_ejabberd(SlaveNode),
+    check_removed_config().
+
+%%
+%% Helpers
+%%
+
+check_loaded_config(Opts) ->
+    ?assertEqual(minimal_config_opts(), Opts).
+
+check_removed_config() ->
+    ?assertError(badarg, mongoose_config:get_opts()).
+
+minimal_config_opts() ->
+    #{default_server_domain => <<"localhost">>,
+      hide_service_name => false,
+      host_types => [],
+      hosts => [<<"localhost">>],
+      internal_databases => #{mnesia => #{}},
+      language => <<"en">>,
+      listen => [],
+      loglevel => warning,
+      outgoing_pools => [],
+      rdbms_server_type => generic,
+      registration_timeout => 600,
+      routing_modules => mongoose_router:default_routing_modules(),
+      services => #{},
+      sm_backend => mnesia,
+      component_backend => mnesia,
+      s2s_backend => mnesia,
+      {auth, <<"localhost">>} => config_parser_helper:default_auth(),
+      {modules, <<"localhost">>} => #{},
+      {replaced_wait_timeout, <<"localhost">>} => 2000,
+      {s2s, <<"localhost">>} => config_parser_helper:default_config([s2s]),
+      instrumentation => config_parser_helper:default_config([instrumentation])}.
+
+start_slave_node(Config) ->
+    SlaveNode = do_start_slave_node(),
+    [{slave_node, SlaveNode}|Config].
+
+do_start_slave_node() ->
+    Opts = [{monitor_master, true},
+            {boot_timeout, 15}, %% in seconds
+            {init_timeout, 10}, %% in seconds
+            {startup_timeout, 10}], %% in seconds
+    {ok, SlaveNode} = ct_slave:start(slave_name(), Opts),
+    rpc:call(SlaveNode, mnesia, start, []), %% TODO remove this call when possible
+    {ok, CWD} = file:get_cwd(),
+    ok = rpc:call(SlaveNode, file, set_cwd, [CWD]),
+    %% Tell the remote node where to find the SUITE code
+    %% Be aware, that P1 likes to put there stuff into
+    %% /usr/lib/erlang/lib/
+    %% So add_paths is NOT enough here
+    ok = rpc:call(SlaveNode, code, add_pathsa, [lists:reverse(code_paths())]),
+    SlaveNode.
+
+stop_slave_node(Config) ->
+    ct_slave:stop(slave_node(Config)),
+    ok.
+
+slave_node(Config) ->
+    get_required_config(slave_node, Config).
+
+get_required_config(Key, Config) ->
+    case proplists:get_value(Key, Config) of
+        undefined ->
+            ct:fail({get_required_config_failed, Key});
+        Value ->
+            Value
     end.
 
-check_nomatch(Subject, Pattern) ->
-    Match = mongoose_config_flat:does_pattern_match(Subject, Pattern),
-    case Match of
-        false ->
+slave_name() ->
+    'mim_slave'.
+
+start_remote_ejabberd_with_config(RemoteNode, C, ConfigFile) ->
+    rpc:call(RemoteNode, ejabberd_helper, start_ejabberd_with_config, [C, ConfigFile]).
+
+stop_remote_ejabberd(SlaveNode) ->
+    rpc:call(SlaveNode, mongooseim, stop, []).
+
+code_paths() ->
+    [filename:absname(Path) || Path <- code:get_path()].
+
+maybe_join_cluster(SlaveNode) ->
+    Result = rpc:call(SlaveNode, mongoose_server_api, join_cluster,
+                      [atom_to_list(node())]),
+    case Result of
+        {ok, _} ->
             ok;
-        true ->
-            ct:fail(#{issue => check_nomatch_failed,
-                      subject => Subject,
-                      pattern => Pattern})
+        {already_joined, _} ->
+            ok
     end.
 
-match_cases() ->
-    [
-        #{pattern => '_',
-          matches => [
-            1, {}, [1]
-          ]},
-
-        #{pattern => [{'_', <<"host">>}],
-          matches => [
-            [{test, <<"host">>}]
-          ],
-          nomatches => [
-            [{test, <<"host2">>}],
-            [{test, <<"host">>}, key2]
-          ]
-         }
-
-    ].
-
-
-flat_state_case(_C) ->
-    State = mongoose_config_parser:parse_terms(cool_mod_mam_config()),
-    ?assertEqual(cool_mod_mam_config_flat(),
-                 mongoose_config_reload:state_to_flat_local_opts(State)).
-
-cool_mod_mam_config() ->
-    [{hosts, ["localhost"]},
-     {modules, [{mod_mam, [{pool, cool_pool}]}]}].
-
-cool_mod_mam_config_flat() ->
-    [{[h,<<"localhost">>,modules],'FLAT'},
-     {[h,<<"localhost">>,module,mod_mam],'FLAT'},
-     {[h,<<"localhost">>,module_opt,mod_mam,pool],cool_pool}].
-
-flat_module_subopts_case(_C) ->
-    State = mongoose_config_parser:parse_terms(gd_config()),
-    FlatOpts = mongoose_config_reload:state_to_flat_local_opts(State),
-    NumConnsKey = [h,<<"localhost">>,module_subopt,mod_global_distrib,
-                   connections,num_of_connections],
-    ConnsKey = [h,<<"localhost">>,module_opt,mod_global_distrib,
-                connections],
-    RedisServerKey = [h,<<"localhost">>,module_subopt,mod_global_distrib,
-                redis,server],
-    ?assertEqual(22, proplists:get_value(NumConnsKey, FlatOpts)),
-    ?assertEqual('FLAT', proplists:get_value(ConnsKey, FlatOpts)),
-    ?assertEqual("172.16.0.3", proplists:get_value(RedisServerKey, FlatOpts)),
-    ok.
-
-expand_opts_case(_C) ->
-    State = mongoose_config_parser:parse_terms(cool_mod_mam_config()),
-    FlatOpts = mongoose_config_reload:state_to_flat_local_opts(State),
-    ExpandedOpts = mongoose_config_flat:expand_all_opts(FlatOpts),
-    CatOpts = mongoose_config_reload:state_to_categorized_options(State),
-    ?assertEqual(maps:get(local_config, CatOpts),
-                 maps:get(local_config, ExpandedOpts)),
-    ?assertEqual(maps:get(host_config, CatOpts),
-                 maps:get(host_config, ExpandedOpts)),
-    ok.
-
-expand_module_subopts_case(_C) ->
-    State = mongoose_config_parser:parse_terms(gd_config()),
-    FlatOpts = mongoose_config_reload:state_to_flat_local_opts(State),
-    ExpandedOpts = mongoose_config_flat:expand_all_opts(FlatOpts),
-    CatOpts = mongoose_config_reload:state_to_categorized_options(State),
-    ?assertEqual(maps:get(local_config, CatOpts),
-                 maps:get(local_config, ExpandedOpts)),
-    ?assertEqual(maps:get(host_config, CatOpts),
-                 maps:get(host_config, ExpandedOpts)),
-    ok.
-
-gd_config() ->
-    [{hosts, ["localhost"]},
-     {modules, [
-
-         {mod_global_distrib, [
-             {global_host, "example.com"},
-             {local_host, "datacenter1.example.com"},
-             {connections, [
-                   {endpoints, [{"172.16.0.2", 5555}]},
-                   {num_of_connections, 22},
-                   {tls_opts, [
-                         {certfile, "/home/user/dc1.pem"},
-                         {cafile, "/home/user/ca.pem"}
-                        ]}
-                  ]},
-             {cache, [
-                   {domain_lifetime_seconds, 60}
-                  ]},
-             {bounce, [
-                   {resend_after_ms, 300},
-                   {max_retries, 3}
-                  ]},
-             {redis, [
-                   {pool_size, 24},
-                   {server, "172.16.0.3"}
-                  ]}
-            ]}
-
-      ]}
-    ].
-
-auth_config() ->
-    [{hosts, ["localhost", "anonymous.localhost"]},
-     {auth_method, internal},
-     {host_config,"anonymous.localhost",
-       [{auth_method,anonymous}]}].
-
-auth_config_states() ->
-    [auth_config_node1_config_v1()].
-
-auth_config_node1_config_v1() ->
-    Terms = auth_config(),
-    #{mongoose_node => mim1,
-      config_file => "/etc/mongooseim.cfg",
-      loaded_categorized_options => terms_to_categorized_options(Terms),
-      ondisc_config_terms => Terms,
-      missing_files => [], required_files => []}.
-
-auth_host_local_config() ->
-    Terms = auth_config(),
-    CatOpts = terms_to_categorized_options(Terms),
-    maps:get(host_config, CatOpts).
-
-auth_config_state() ->
-    Terms = auth_config(),
-    mongoose_config_parser:parse_terms(Terms).
-
-%% Check that underscore is not treated as a config macro by config parser
-parse_config_with_underscore_pattern_case(_C) ->
-    mongoose_config_parser:parse_terms(node_specific_cool_mod_mam_config()).
-
-%% Check that we can convert state into node_specific_options list
-node_specific_options_presents_case(_C) ->
-    State = mongoose_config_parser:parse_terms(node_specific_cool_mod_mam_config()),
-    NodeOpts = mongoose_config_parser:state_to_global_opt(node_specific_options, State, missing),
-    ?assertEqual([ [h,'_',module_opt,mod_mam,pool] ],
-                 NodeOpts).
-
-%% Check that we would not crash if node_specific_options is not defined
-node_specific_options_missing_case(_C) ->
-    State = mongoose_config_parser:parse_terms(cool_mod_mam_config()),
-    NodeOpts = mongoose_config_parser:state_to_global_opt(node_specific_options, State, missing),
-    ?assertEqual(missing, NodeOpts).
-
-node_specific_cool_mod_mam_config() ->
-    [{hosts, ["localhost"]},
-     {node_specific_options, [ [h,'_',module_opt,mod_mam,pool] ]},
-     {modules, [{mod_mam, [{pool, cool_pool}]}]}].
-
-
-terms_to_categorized_options(Terms) ->
-    State = mongoose_config_parser:parse_terms(Terms),
-    mongoose_config_reload:state_to_categorized_options(State).
-
-states_to_reloading_context_case(_C) ->
-    Context = mongoose_config_reload:states_to_reloading_context(example_config_states()),
-%   ct:pal("Context ~p", [Context]),
-    ok.
-
-%% Check that auth_method is treated correctly
-auth_method_and_cluster_reload_case(_C) ->
-    Context = mongoose_config_reload:states_to_reloading_context(auth_config_states()),
-%   ct:pal("Auth context ~p", [Context]),
-    ok.
-
-no_duplicate_options_case(_C) ->
-    HostOpts = auth_host_local_config(),
-    %% Check that there are no duplicates
-    %% Bad case example:
-    %% HostOpts =
-    %%  [{local_config,{auth_method,<<"localhost">>},internal},
-    %%   {local_config,{auth_method,<<"anonymous.localhost">>},internal},
-    %%   {local_config,{auth_method,<<"anonymous.localhost">>},anonymous}]
-    ?assertEqual({local_config,{auth_method,<<"anonymous.localhost">>},anonymous},
-                 lists:keyfind({auth_method,<<"anonymous.localhost">>}, 2,
-                               HostOpts)),
-    ?assertEqual({local_config,{auth_method,<<"anonymous.localhost">>},anonymous},
-                 lists:keyfind({auth_method,<<"anonymous.localhost">>}, 2,
-                               lists:reverse(HostOpts))),
-    ok.
-
-%% ejabberd_config:config_states/0 example
-%% Password was modified on both nodes
-example_config_states() ->
-    [config_node1_config_v2(),
-     config_node2_config_v2()].
-
-%% node1_config_v1 configuration both in memory and on disc
-config_node1_config_v1() ->
-    Terms = node1_config_v1(),
-    #{mongoose_node => mim1,
-      config_file => "/etc/mongooseim.cfg",
-      loaded_categorized_options => terms_to_categorized_options(Terms),
-      ondisc_config_terms => Terms,
-      missing_files => [], required_files => []}.
-
-%% node2_config_v1 configuration both in memory and on disc
-config_node2_config_v1() ->
-    Terms = node2_config_v1(),
-    #{mongoose_node => mim2,
-      config_file => "/etc/mongooseim.cfg",
-      loaded_categorized_options => terms_to_categorized_options(Terms),
-      ondisc_config_terms => Terms,
-      missing_files => [], required_files => []}.
-
-%% node1_config_v1 configuration in memory
-%% node1_config_v2 configuration on disc
-config_node1_config_v2() ->
-    Terms_v1 = node1_config_v1(),
-    Terms_v2 = node1_config_v2(),
-    #{mongoose_node => mim1,
-      config_file => "/etc/mongooseim.cfg",
-      loaded_categorized_options => terms_to_categorized_options(Terms_v1),
-      ondisc_config_terms => Terms_v2,
-      missing_files => [], required_files => []}.
-
-%% node2_config_v1 configuration in memory
-%% node2_config_v2 configuration on disc
-config_node2_config_v2() ->
-    Terms_v1 = node2_config_v1(),
-    Terms_v2 = node2_config_v2(),
-    #{mongoose_node => mim2,
-      config_file => "/etc/mongooseim.cfg",
-      loaded_categorized_options => terms_to_categorized_options(Terms_v1),
-      ondisc_config_terms => Terms_v2,
-      missing_files => [], required_files => []}.
-
-node1_config_v1() ->
-    [
-        {hosts, ["localhost"]},
-        {node_specific_options,
-         [
-            [h,'_',module_opt,mod_mam,pool],
-            [h,'_',module_opt,mod_mam_muc,pool]
-         ]},
-        {modules,
-         [
-            {mod_mam,
-             [
-                {pool, node1_pool},
-                {iqdisc, parallel},
-                {password, <<"secret">>}
-             ]},
-            {mod_mam_muc, [{pool, node1_pool}]}
-         ]}
-    ].
-
-node1_config_v2() ->
-    %% Different more secure password was applied in version 2
-    [
-        {hosts, ["localhost"]},
-        {node_specific_options,
-         [
-            [h,'_',module_opt,mod_mam,pool],
-            [h,'_',module_opt,mod_mam_muc,pool]
-         ]},
-        {modules,
-         [
-            {mod_mam,
-             [
-                {pool, node1_pool},
-                {iqdisc, parallel},
-                {password, <<"secret123">>}
-             ]},
-            {mod_mam_muc, [{pool, node1_pool}]}
-         ]}
-    ].
-
-node2_config_v1() ->
-    %% Pools are different for different nodes
-    [
-        {hosts, ["localhost"]},
-        {node_specific_options,
-         [
-            [h,'_',module_opt,mod_mam,pool],
-            [h,'_',module_opt,mod_mam_muc,pool]
-         ]},
-        {modules,
-         [
-            {mod_mam,
-             [
-                {pool, node2_pool},
-                {iqdisc, parallel},
-                {password, <<"secret">>}
-             ]},
-            {mod_mam_muc, [{pool, node1_pool}]}
-         ]}
-    ].
-
-node2_config_v2() ->
-    %% Pools are different for different nodes
-    %% Different more secure password was applied in version 2
-    [
-        {hosts, ["localhost"]},
-        {node_specific_options,
-         [
-            [h,'_',module_opt,mod_mam,pool],
-            [h,'_',module_opt,mod_mam_muc,pool]
-         ]},
-        {modules,
-         [
-            {mod_mam,
-             [
-                {pool, node2_pool},
-                {iqdisc, parallel},
-                {password, <<"secret123">>}
-             ]},
-            {mod_mam_muc, [{pool, node1_pool}]}
-         ]}
-    ].
-
-
-get_config_diff_case(_C) ->
-    %% Calculate changes to node1 reload_local to transit from v1 to v2
-    Terms_v1 = node1_config_v1(),
-    Terms_v2 = node1_config_v2(),
-    CatOptions = terms_to_categorized_options(Terms_v1),
-    State = mongoose_config_parser:parse_terms(Terms_v2),
-    Diff = mongoose_config_reload:get_config_diff(State, CatOptions),
-    #{local_hosts_changes := #{ to_reload := ToReload }} = Diff,
-    [{ {modules,<<"localhost">>}, OldModules, NewModules }] = ToReload,
-    ?assertEqual(<<"secret">>, get_module_opt(mod_mam, password, OldModules)),
-    ?assertEqual(<<"secret123">>, get_module_opt(mod_mam, password, NewModules)),
-    ok.
-
-get_module_opt(Module, Key, Modules) ->
-    {Module, Opts} = lists:keyfind(Module, 1, Modules),
-    proplists:get_value(Key, Opts).
-
-
-config_with_required_files() ->
-    [
-        {hosts, ["localhost"]},
-        {s2s_certfile, "priv/ssl/fake_server.pem"},
-        {domain_certfile, "localhost", "priv/ssl/localhost_server.pem"}
-    ].
-
-parse_config_with_required_files_case(_C) ->
-    State = mongoose_config_parser:parse_terms(config_with_required_files()),
-    ?assertEqual(["priv/ssl/localhost_server.pem",
-                  "priv/ssl/fake_server.pem"],
-                 mongoose_config_parser:state_to_required_files(State)),
-    ok.

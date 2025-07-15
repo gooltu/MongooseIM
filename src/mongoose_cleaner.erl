@@ -10,8 +10,9 @@
          handle_call/3,
          handle_cast/2,
          handle_info/2,
-         terminate/2,
-         code_change/3]).
+         terminate/2]).
+
+-ignore_xref([start_link/0]).
 
 -include("mongoose.hrl").
 
@@ -24,31 +25,35 @@
 %%% API
 %%%===================================================================
 
+-spec start_link() -> gen_server:start_ret().
 start_link() ->
-    gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
+    gen_server:start_link({local, ?SERVER}, ?MODULE, noargs, []).
 
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
 
-init([]) ->
+init(noargs) ->
     case net_kernel:monitor_nodes(true) of
         ok ->
             {ok, #state{}};
         Error ->
-            ?ERROR_MSG("can't monitor nodes: ~p~n", [Error]),
+            ?LOG_ERROR(#{what => cleaner_monitor_failed,
+                         text => <<"mongoose_cleaner failed to monitor nodes">>,
+                         reason => Error}),
             {stop, Error}
     end.
 
 handle_call(_Request, _From, State) ->
-    Reply = ok,
-    {reply, Reply, State}.
+    {reply, ok, State}.
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
 handle_info({nodedown, Node}, State) ->
-    ?WARNING_MSG("node=~p down", [Node]),
+    ?LOG_WARNING(#{what => cleaner_nodedown,
+                   text => <<"mongoose_cleaner received nodenown event">>,
+                   down_node => Node}),
     cleanup_modules(Node),
     {noreply, State};
 handle_info(_Info, State) ->
@@ -57,28 +62,34 @@ handle_info(_Info, State) ->
 terminate(_Reason, _State) ->
     ok.
 
-code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.
-
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
 
 cleanup_modules(Node) ->
-    LockRequest = {?NODE_CLEANUP_LOCK(Node), self()},
+    LockKey = ?NODE_CLEANUP_LOCK(Node),
+    LockRequest = {LockKey, self()},
     C = fun () -> run_node_cleanup(Node) end,
     Nodes = [node() | nodes()],
-    Retries = 1,
+    Retries = 10,
     case global:trans(LockRequest, C, Nodes, Retries) of
         aborted ->
-            ?DEBUG("could not get ~p~n", [?NODE_CLEANUP_LOCK(Node)]),
-            {ok, aborted};
+            ?LOG_WARNING(#{what => cleaner_trans_aborted,
+                           text => <<"mongoose_cleaner failed to get the global lock, run cleanup anyway">>,
+                           remote_node => Node, lock_key => LockKey, retries => Retries}),
+            C();
         Result ->
-            {ok, Result}
+            Result
     end.
 
 run_node_cleanup(Node) ->
-    {Elapsed, RetVal} = timer:tc(ejabberd_hooks, run_fold, [node_cleanup, #{}, [Node]]),
-    ?WARNING_MSG("cleanup took=~pms, result: ~p~n",
-                 [erlang:round(Elapsed / 1000), RetVal]),
+    {Elapsed, RetVal} = timer:tc(fun() ->
+            mongoose_hooks:node_cleanup(Node),
+            [mongoose_hooks:node_cleanup_for_host_type(HostType, Node) || HostType <- ?ALL_HOST_TYPES],
+            ok
+        end),
+    ?LOG_NOTICE(#{what => cleaner_done,
+                  text => <<"Finished cleaning after dead node">>,
+                  duration => erlang:round(Elapsed / 1000),
+                  down_node => Node, result => RetVal}),
     RetVal.

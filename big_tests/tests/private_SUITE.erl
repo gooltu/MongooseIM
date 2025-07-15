@@ -14,11 +14,13 @@
 %% limitations under the License.
 %%==============================================================================
 -module(private_SUITE).
--compile(export_all).
+-compile([export_all, nowarn_export_all]).
 
 -include_lib("exml/include/exml.hrl").
 -include_lib("escalus/include/escalus.hrl").
 -include_lib("common_test/include/ct.hrl").
+
+-import(config_parser_helper, [mod_config_with_auto_backend/2]).
 
 %%--------------------------------------------------------------------
 %% Suite configuration
@@ -44,10 +46,18 @@ negative_test_cases() ->
 suite() ->
     escalus:suite().
 
-init_per_suite(Config) ->
-    escalus:init_per_suite(Config).
+init_per_suite(Config0) ->
+    HostType = domain_helper:host_type(),
+    Config1 = dynamic_modules:save_modules(HostType, Config0),
+    dynamic_modules:ensure_modules(HostType, create_config()),
+    escalus:init_per_suite(Config1).
+
+create_config() ->
+    [{mod_private,
+      mod_config_with_auto_backend(mod_private, #{iqdisc => one_queue})}].
 
 end_per_suite(Config) ->
+    dynamic_modules:restore_modules(Config),
     escalus:end_per_suite(Config).
 
 init_per_group(_GroupName, Config) ->
@@ -153,7 +163,7 @@ missing_ns(Config) ->
 my_banana(NS) ->
     #xmlel{
         name = <<"my_element">>,
-        attrs = [{<<"xmlns">>, NS}],
+        attrs = #{<<"xmlns">> => NS},
         children = [#xmlel{name = <<"banana">>}]}.
 
 check_body(Stanza, Names) ->
@@ -166,4 +176,3 @@ check_body_rec(Element, [Name | Names]) ->
     [Child] = Element#xmlel.children,
     Name = Child#xmlel.name,
     check_body_rec(Child, Names).
-

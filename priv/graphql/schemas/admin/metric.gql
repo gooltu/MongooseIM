@@ -1,0 +1,124 @@
+"""
+Result of a metric
+"""
+enum MetricType {
+  "Collects values over a sliding window of 60s and returns appropriate statistical values"
+  histogram
+  "Returns a number"
+  counter
+  """
+  Provides 2 values: total event count and a value in 60s window.
+  Dividing one value by 60 provides an average per-second value over last minute.
+  """
+  spiral
+  "Consists of value and time in milliseconds elapsed from the last metric update"
+  gauge
+}
+
+"Type of metric result"
+union MetricResult = HistogramMetric | CounterMetric | SpiralMetric | GaugeMetric
+
+type HistogramMetric {
+  "Metric name"
+  name: [String]
+  "Metric type"
+  type: MetricType
+  "The number of values used in the calculation"
+  n: Int
+  "Mean value"
+  mean: Int
+  "Min value"
+  min: Int
+  "Max value"
+  max: Int
+  "Median value"
+  median: Int
+  "50th percentile"
+  p50: Int
+  "75th percentile"
+  p75: Int
+  "90th percentile"
+  p90: Int
+  "95th percentile"
+  p95: Int
+  "99th percentile"
+  p99: Int
+  "99.9th percentile"
+  p999: Int
+}
+
+type CounterMetric {
+  "Metric name"
+  name: [String]
+  "Metric type"
+  type: MetricType
+  "The metric value"
+  value: Int
+  "Time since last reset"
+  ms_since_reset: Int
+}
+
+type GaugeMetric {
+  "Metric name"
+  name: [String]
+  "Metric type"
+  type: MetricType
+  "The metric value"
+  value: Int
+}
+
+type SpiralMetric {
+  "Metric name"
+  name: [String]
+  "Metric type"
+  type: MetricType
+  "One minute value"
+  one: Int
+  "Total value"
+  count: Int
+}
+
+type MetricDictEntry {
+  "The name of the metric key (i.e. one, count, value)"
+  key: String
+  "Metric value"
+  value: Int
+}
+
+type MetricDictResult {
+  "Metric name"
+  name: [String]
+  "A list of keys and values"
+  dict: [MetricDictEntry]
+}
+
+type MetricNodeResult {
+  node: String
+  result: [MetricDictResult]
+}
+
+"""
+Allow admin to get the metric values. Only works with Exometer enabled.
+"""
+type MetricAdminQuery @protected{
+    """
+    Match metrics using a name pattern and return the metric values.
+    Return all metrics if the name is not provided.
+    Name is a list of name segments or an underscore (i.e. path).
+    """
+    getMetrics(name: [String]): [MetricResult]
+      @protected(type: GLOBAL)
+    """
+    Get metrics without using graphql unions.
+    Optionally returns only specified keys
+    (i.e. keys: ["one"] only returns key "one", but not key "count")
+    """
+    getMetricsAsDicts(name: [String], keys: [String]): [MetricDictResult]
+      @protected(type: GLOBAL)
+    """
+    Gather metrics from multiple nodes.
+    Optionally returns only from specified nodes.
+    """
+    getClusterMetricsAsDicts(name: [String], keys: [String], nodes: [String]): [MetricNodeResult]
+      @protected(type: GLOBAL)
+}

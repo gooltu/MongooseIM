@@ -51,6 +51,41 @@
          path_to_node/1, can_fetch_item/2, is_subscribed/1,
          should_delete_when_owner_removed/0, remove_user/2]).
 
+-define(MOD_PUBSUB_DB_BACKEND, mod_pubsub_db_backend).
+-ignore_xref([
+    {?MOD_PUBSUB_DB_BACKEND, create_node, 2},
+    {?MOD_PUBSUB_DB_BACKEND, del_item, 2},
+    {?MOD_PUBSUB_DB_BACKEND, get_states, 2},
+    {?MOD_PUBSUB_DB_BACKEND, remove_items, 3},
+    {?MOD_PUBSUB_DB_BACKEND, get_state, 2},
+    {?MOD_PUBSUB_DB_BACKEND, del_node, 1},
+    {?MOD_PUBSUB_DB_BACKEND, get_affiliation, 2},
+    {?MOD_PUBSUB_DB_BACKEND, get_states_by_bare, 1},
+    {?MOD_PUBSUB_DB_BACKEND, get_states_by_bare_and_full, 1},
+    {?MOD_PUBSUB_DB_BACKEND, get_item, 2},
+    {?MOD_PUBSUB_DB_BACKEND, get_node_entity_subscriptions, 2},
+    {?MOD_PUBSUB_DB_BACKEND, delete_subscription, 2},
+    {?MOD_PUBSUB_DB_BACKEND, add_subscription, 5},
+    {?MOD_PUBSUB_DB_BACKEND, del_items, 2},
+    {?MOD_PUBSUB_DB_BACKEND, get_states, 1},
+    {?MOD_PUBSUB_DB_BACKEND, get_states_by_lus, 1},
+    {?MOD_PUBSUB_DB_BACKEND, get_items, 2},
+    {?MOD_PUBSUB_DB_BACKEND, delete_subscription, 3},
+    {?MOD_PUBSUB_DB_BACKEND, delete_all_subscriptions, 2},
+    {?MOD_PUBSUB_DB_BACKEND, set_item, 1},
+    {?MOD_PUBSUB_DB_BACKEND, set_affiliation, 3},
+    {?MOD_PUBSUB_DB_BACKEND, delete_node, 1},
+    {?MOD_PUBSUB_DB_BACKEND, find_nodes_by_affiliated_user, 1},
+    {?MOD_PUBSUB_DB_BACKEND, dirty, 2},
+    {?MOD_PUBSUB_DB_BACKEND, delete_user_subscriptions, 1},
+    {?MOD_PUBSUB_DB_BACKEND, remove_all_items, 1},
+    {?MOD_PUBSUB_DB_BACKEND, get_node_subscriptions, 1},
+    {?MOD_PUBSUB_DB_BACKEND, get_idxs_of_own_nodes_with_pending_subs, 1},
+    {?MOD_PUBSUB_DB_BACKEND, add_item, 3},
+    {?MOD_PUBSUB_DB_BACKEND, update_subscription, 4},
+    can_fetch_item/2, is_subscribed/1, set_subscriptions/4
+]).
+
 based_on() ->  none.
 
 init(_Host, _ServerHost, _Opts) ->
@@ -111,7 +146,8 @@ create_node_permission(Host, ServerHost, _Node, _ParentNode, Owner, Access) ->
         {<<"">>, Host, <<"">>} ->
             true; % pubsub service always allowed
         _ ->
-            acl:match_rule(ServerHost, Access, Owner) =:= allow
+            {ok, HostType} = mongoose_domain_api:get_domain_host_type(ServerHost),
+            acl:match_rule(HostType, ServerHost, Access, Owner) =:= allow
     end,
     {result, Allowed}.
 
@@ -339,7 +375,7 @@ publish_item(_ServerHost, Nidx, Publisher, PublishModel, MaxItems, ItemId, ItemP
         true ->
             case MaxItems > 0 of
                true ->
-                   Now = os:timestamp(),
+                   Now = os:system_time(microsecond),
                    Item = make_pubsub_item(Nidx, ItemId, Now, SubKey, GenKey,
                                            Payload, Publisher, ItemPublisher),
                    Items = [ItemId | GenState#pubsub_state.items -- [ItemId]],
@@ -461,7 +497,8 @@ get_entity_affiliations(Host, #jid{} = Owner) ->
     get_entity_affiliations(Host, jid:to_lower(Owner));
 get_entity_affiliations(Host, LOwner) ->
     {ok, States} = mod_pubsub_db_backend:get_states_by_bare(LOwner),
-    NodeTree = mod_pubsub:tree(Host),
+    HT = mod_pubsub:host_to_host_type(Host),
+    NodeTree = mod_pubsub:tree(HT),
     Reply = lists:foldl(fun (#pubsub_state{stateid = {_, N}, affiliation = A}, Acc) ->
                                 case gen_pubsub_nodetree:get_node(NodeTree, N) of
                                     #pubsub_node{nodeid = {Host, _}} = Node -> [{Node, A} | Acc];
@@ -493,7 +530,8 @@ get_entity_subscriptions(Host, Owner) ->
                      {ok, States0} = mod_pubsub_db_backend:get_states_by_bare_and_full(LOwner),
                      States0
              end,
-    NodeTree = mod_pubsub:tree(Host),
+    HT = mod_pubsub:host_to_host_type(Host),
+    NodeTree = mod_pubsub:tree(HT),
     Reply = lists:foldl(fun (PubSubState, Acc) ->
                                 get_entity_subscriptions_loop(NodeTree, PubSubState, Acc)
                         end,
@@ -552,7 +590,8 @@ set_subscriptions(Nidx, LOwner, Subscription, SubId) ->
 get_pending_nodes(Host, Owner) ->
     LOwner = jid:to_lower(Owner),
     {ok, Nidxs} = mod_pubsub_db_backend:get_idxs_of_own_nodes_with_pending_subs(LOwner),
-    NodeTree = mod_pubsub:tree(Host),
+    HT = mod_pubsub:host_to_host_type(Host),
+    NodeTree = mod_pubsub:tree(HT),
     {result,
      lists:foldl(fun(N, Acc) ->
                          case gen_pubsub_nodetree:get_node(NodeTree, N) of
@@ -686,7 +725,7 @@ make_subid() ->
     mongoose_bin:gen_from_timestamp().
 
 remove_user(LUser, LServer) ->
-    mod_pubsub_db_backend:dirty(fun() -> 
+    mod_pubsub_db_backend:dirty(fun() ->
                           LJID = {LUser, LServer, <<>>},
                           mod_pubsub_db_backend:delete_user_subscriptions(LJID),
                           NodesAndAffs = mod_pubsub_db_backend:find_nodes_by_affiliated_user(LJID),

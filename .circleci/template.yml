@@ -1,0 +1,1123 @@
+version: 2.1
+
+references:
+  # Latest OTP release version number (on the right): https://www.erlang.org/downloads
+  # Available cimg-erlang images: https://hub.docker.com/r/erlangsolutions/erlang/tags?name=cimg
+  # You could need to trigger a pipeline to create a Docker image:
+  # https://github.com/esl/cimg-erlang#trigger-build-using-trigger-pipeline-on-circleci
+  - &LATEST_OTP_VERSION 27.3.4
+  - &OTP26 erlangsolutions/erlang:cimg-26.2.5.12
+  - &OTP27 erlangsolutions/erlang:cimg-27.3.4
+  - &ENTRYPOINT ["/bin/sh", "-c", "eval ${INSTALL_DEPS_CMD:-echo} && echo __INJECT_FILES__ | eval ${BASE32DEC:-base32 --decode} | bash"]
+  # Caches created via the save_cache step are stored for up to 15 days
+  - &CERT_KEY certs-cache-{{ checksum "certs_cache_key" }}-v3
+  - &DEPS_CACHE_KEY deps-cache-{{ checksum "rebar.lock" }}-{{ checksum "big_tests/rebar.lock" }}-__REBAR_PLUGINS_HASH__-{{ checksum "otp_version" }}-v5
+  - &BUILD_CACHE_KEY build-cache-{{ .Branch }}-{{ .Revision }}-{{ checksum "otp_version" }}-v6
+
+# list of references to be used inside executors block
+containers:
+  - &mysql_container
+    image: mysql:__MYSQL_VERSION__
+    environment:
+      - SQL_TEMP_DIR: /tmp/sql
+      - MYSQL_ROOT_PASSWORD: secret
+      - MYSQL_DATABASE: mongooseim
+      - MYSQL_USER: mongooseim
+      - MYSQL_PASSWORD: mongooseim_secret
+      - OLD_ENTRYPOINT: "./entrypoint.sh mysqld"
+      - ENV_FILE_CFG_PATH: "/etc/mysql/conf.d/mysql.cnf"
+      - ENV_FILE_CFG_DATA: "__MYSQL_CNF__"
+      - ENV_FILE_SQL_PATH: "/docker-entrypoint-initdb.d/mysql.sql"
+      - ENV_FILE_SQL_DATA: "__MYSQL_SQL__"
+      - ENV_FILE_SH_PATH: "/docker-entrypoint-initdb.d/docker-setup-mysql.sh"
+      - ENV_FILE_SH_DATA: "__MYSQL_SETUP__"
+      - ENV_FILE_CERT_PATH: "/tmp/sql/fake_cert.pem"
+      - ENV_FILE_CERT_DATA: "__MIM_CERT__"
+      - ENV_FILE_KEY_PATH: "/tmp/sql/fake_key.pem"
+      - ENV_FILE_KEY_DATA: "__MIM_KEY__"
+    entrypoint: *ENTRYPOINT
+  - &pgsql_container
+    image: postgres:__PGSQL_VERSION__
+    environment:
+      - SQL_TEMP_DIR: /tmp/sql
+      - POSTGRES_PASSWORD: password
+      - OLD_ENTRYPOINT: "docker-entrypoint.sh postgres"
+      - ENV_FILE_CFG_PATH: "/tmp/sql/postgresql.conf"
+      - ENV_FILE_CFG_DATA: "__PGSQL_CNF__"
+      - ENV_FILE_SQL_PATH: "/tmp/sql/pg.sql"
+      - ENV_FILE_SQL_DATA: "__PGSQL_SQL__"
+      - ENV_FILE_HBA_PATH: "/tmp/sql/pg_hba.conf"
+      - ENV_FILE_HBA_DATA: "__PGSQL_HBA__"
+      - ENV_FILE_SH_PATH: "/docker-entrypoint-initdb.d/docker-setup-postgres.sh"
+      - ENV_FILE_SH_DATA: "__PGSQL_SETUP__"
+      - ENV_FILE_CERT_PATH: "/tmp/sql/fake_cert.pem"
+      - ENV_FILE_CERT_DATA: "__MIM_CERT__"
+      - ENV_FILE_KEY_PATH: "/tmp/sql/fake_key.pem"
+      - ENV_FILE_KEY_DATA: "__MIM_KEY__"
+    entrypoint: *ENTRYPOINT
+  - &cockroachdb_container
+    image: cockroachdb/cockroach:__COCKROACHDB_VERSION__
+    environment:
+      - COCKROACH_DATABASE: mongooseim
+      - OLD_ENTRYPOINT: "chmod 777 /start.sh && /start.sh"
+      - ENV_FILE_SETUP_PATH: "/start.sh"
+      - ENV_FILE_SETUP_DATA: "__COCKROACHDB_SETUP__"
+      - ENV_FILE_SQL_PATH: "/docker-entrypoint-initdb.d/init.sql"
+      - ENV_FILE_SQL_DATA: "__COCKROACHDB_SQL__"
+      - ENV_FILE_USER_PATH: "/docker-entrypoint-initdb.d/create_user.sql"
+      - ENV_FILE_USER_DATA: "__COCKROACHDB_USER_SQL__"
+      - ENV_FILE_CACERT_PATH: "/tmp/ca.key"
+      - ENV_FILE_CACERT_DATA: "__DB_CAKEY__"
+      - ENV_FILE_CAKEY_PATH: "/tmp/ca.crt"
+      - ENV_FILE_CAKEY_DATA: "__DB_CACERT__"
+      - ENV_FILE_CERT_PATH: "/tmp/client.mongooseim.crt"
+      - ENV_FILE_CERT_DATA: "__MIM_CERT__"
+      - ENV_FILE_KEY_PATH: "/tmp/client.mongooseim.key"
+      - ENV_FILE_KEY_DATA: "__MIM_KEY__"
+    entrypoint: *ENTRYPOINT
+  - &ldap_container
+    image: osixia/openldap:__LDAP_VERSION__
+    environment:
+      - LDAP_DOMAIN: "esl.com"
+      - LDAP_ADMIN_PASSWORD: "mongooseim_secret"
+      - LDAP_ORGANISATION: "Erlang Solutions"
+      - LDAP_TLS_CRT_FILENAME: cert.pem
+      - LDAP_TLS_KEY_FILENAME: key.pem
+      - LDAP_TLS_CA_CRT_FILENAME: cacert.pem
+      - LDAP_TLS_DH_PARAM_FILENAME: dh_server.pem
+      - OLD_ENTRYPOINT: "/init_script.sh && /container/tool/run --copy-service"
+      - ENV_FILE_SH_PATH: "/init_script.sh"
+      - ENV_FILE_SH_DATA: "__LDAP_SETUP__"
+      - ENV_FILE_SH_MODE: 755
+      - ENV_FILE_SCHEMA_PATH: "/container/service/slapd/assets/config/bootstrap/ldif/custom/init_entries.ldif"
+      - ENV_FILE_SCHEMA_DATA: "__LDAP_SCHEMA__"
+      - ENV_FILE_CERT_PATH: "/container/service/slapd/assets/certs/cert.pem"
+      - ENV_FILE_CERT_DATA: "__MIM_CERT__"
+      - ENV_FILE_KEY_PATH: "/container/service/slapd/assets/certs/key.pem"
+      - ENV_FILE_KEY_DATA: "__MIM_KEY__"
+      - ENV_FILE_CACERT_PATH: "/container/service/slapd/assets/certs/cacert.pem"
+      - ENV_FILE_CACERT_DATA: "__DB_CACERT__"
+      - ENV_FILE_DHSERVER_PATH: "/container/service/slapd/assets/certs/dh_server.pem"
+      - ENV_FILE_DHSERVER_DATA: "__MIM_DHSERVER__"
+    entrypoint: *ENTRYPOINT
+  - &mssql_container
+    image: mcr.microsoft.com/mssql/server:__MSSQL_VERSION__
+    environment:
+      - ACCEPT_EULA: Y
+      - SA_PASSWORD: "mongooseim_secret+ESL123"
+      - DB_NAME: mongooseim
+      - SCHEMA_READY_PORT: 1434
+        # We are not running as root in this container,
+        # so we can only write into some directories (in this case, /tmp)
+      - SQL_FILE: "/tmp/mongoose.sql"
+      - OLD_ENTRYPOINT: "{ /tmp/docker-setup-mssql.sh& } && /opt/mssql/bin/sqlservr"
+      - ENV_FILE_SQL_PATH: "/tmp/mongoose.sql"
+      - ENV_FILE_SQL_DATA: "__MSSQL_SQL__"
+      - ENV_FILE_SH_PATH: "/tmp/docker-setup-mssql.sh"
+      - ENV_FILE_SH_DATA: "__MSSQL_SETUP__"
+      - ENV_FILE_SH_MODE: 755
+    entrypoint: *ENTRYPOINT
+  - &redis_container
+    image: cimg/redis:__REDIS_VERSION__
+  - &rabbit_container
+    image: rabbitmq:__RMQ_VERSION__
+  - &minio_container
+    image: minio/minio:__MINIO_VERSION__
+    environment:
+      - MINIO_ACCESS_KEY: "AKIAIAOAONIULXQGMOUA"
+      - MINIO_SECRET_KEY: "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"
+    command: ["server", "/data"]
+  - &elasticsearch_container
+    image: docker.elastic.co/elasticsearch/elasticsearch:__ELASTICSEARCH_VERSION__
+    environment:
+      - ES_JAVA_OPTS: "-Xms500m -Xmx500m"
+      - http.host: 0.0.0.0
+      - transport.host: 127.0.0.1
+      - xpack.security.enabled: false
+  - &cassandra_container
+    image: cassandra:__CASSA_VERSION__
+    environment:
+      - SCHEMA_READY_PORT: 9242
+      - HEAP_NEWSIZE: 64M
+      - MAX_HEAP_SIZE: 128M
+      - OLD_ENTRYPOINT: "/entry.sh"
+      - ENV_FILE_CERT_PATH: "/ssl/mongooseim/cert.pem"
+      - ENV_FILE_CERT_DATA: "__MIM_CERT__"
+      - ENV_FILE_KEY_PATH: "/ssl/mongooseim/privkey.pem"
+      - ENV_FILE_KEY_DATA: "__MIM_PRIV_KEY__"
+      - ENV_FILE_CACERT_PATH: "/ssl/ca/cacert.pem"
+      - ENV_FILE_CACERT_DATA: "__DB_CACERT__"
+      - ENV_FILE_CASSA_ENTRY_PATH: "/entry.sh"
+      - ENV_FILE_CASSA_ENTRY_DATA: "__CASSA_ENTRY__"
+      - ENV_FILE_CASSA_ENTRY_MODE: 755
+      - ENV_FILE_CASSA_MIM_CQL_PATH: "/schemas/mim.cql"
+      - ENV_FILE_CASSA_MIM_CQL_DATA: "__CASSA_MIM_SQL__"
+      - ENV_FILE_CASSA_TEST_CQL_PATH: "/schemas/test.cql"
+      - ENV_FILE_CASSA_TEST_CQL_DATA: "__CASSA_TEST_SQL__"
+      # Cassandra does not have base32, but has python
+      - BASE32DEC: "__PYTHON2_BASE32_DEC__"
+    entrypoint: *ENTRYPOINT
+  - &cassandra_proxy_container
+    image: emicklei/zazkia
+    environment:
+      - OLD_ENTRYPOINT: "./zazkia -v -f /data/zazkia-routes.json"
+      - ENV_FILE_CFG_PATH: "/data/zazkia-routes.json"
+      - ENV_FILE_CFG_DATA: "__CASSA_PROXY_CNF__"
+      # base32 (coreutils) is missing on Alpine
+      - INSTALL_DEPS_CMD: "apk update && apk add bash coreutils"
+    entrypoint: *ENTRYPOINT
+
+executors:
+  otp_26:
+    docker:
+      - image: *OTP26
+    resource_class: medium+
+  otp_27:
+    docker:
+      - image: *OTP27
+    resource_class: medium+
+  otp_26_redis:
+    docker:
+      - image: *OTP26
+      - *redis_container
+  otp_27_redis:
+    docker:
+      - image: *OTP27
+      - *redis_container
+  otp_27_redis_minio_rmq:
+    docker:
+      - image: *OTP27
+      - *redis_container
+      - *minio_container
+      - *rabbit_container
+  otp_27_mysql_redis:
+    docker:
+      - image: *OTP27
+      - *redis_container
+      - *mysql_container
+      - *rabbit_container
+  otp_26_pgsql_redis:
+    docker:
+      - image: *OTP26
+      - *redis_container
+      - *pgsql_container
+  otp_27_pgsql_redis:
+    docker:
+      - image: *OTP27
+      - *redis_container
+      - *pgsql_container
+  otp_27_cockroachdb_redis:
+    docker:
+      - image: *OTP27
+      - *redis_container
+      - *cockroachdb_container
+  otp_26_ldap_redis:
+    docker:
+      - image: *OTP26
+      - *redis_container
+      - *ldap_container
+  otp_27_ldap_redis:
+    docker:
+      - image: *OTP27
+      - *redis_container
+      - *ldap_container
+  otp_27_mssql_redis:
+    docker:
+      - image: *OTP27
+      - *redis_container
+      - *mssql_container
+  otp_27_elasticsearch_cassandra:
+    docker:
+      - image: *OTP27
+      - *redis_container
+      - *elasticsearch_container
+      - *cassandra_container
+      - *cassandra_proxy_container
+  otp_27_arm64:
+    docker:
+      - image: *OTP27
+    resource_class: arm.medium
+  otp_27_redis_arm64:
+    docker:
+      - image: *OTP27
+      - *redis_container
+    resource_class: arm.medium
+commands:
+  fetch_build_packages:
+    steps:
+      - run:
+          name: Install packages necessary for building
+          command: |
+            tools/circle-install-packages.sh \
+            'libssl-dev unixodbc-dev unixodbc tdsodbc rsync zlib1g-dev'
+  maybe_build_deps_and_cache:
+    steps:
+      - restore_cache:
+          name: Maybe restore all rebar3 dependencies
+          key: *DEPS_CACHE_KEY
+      - run:
+          name: Get and compile deps
+          command: |
+            tools/configure with-all
+            tools/build-deps.sh
+      - run:
+          name: Get and compile big_tests deps
+          command: |
+            tools/build-test-deps.sh
+      - save_cache:
+          name: Cache built dependencies
+          key: *DEPS_CACHE_KEY
+          paths:
+            - ~/project/_build/default/
+            - ~/project/big_tests/_build/default/
+  cache_prod_build:
+    parameters:
+      arch:
+        type: string
+    steps:
+      - run:
+          name: Create prod tarball
+          command: |
+            export BUILD_PATH=_build/prod/rel/mongooseim
+            tar czh --transform="s,${BUILD_PATH},mongooseim,S" \
+              -f mongooseim-<<parameters.arch>>.tar.gz ${BUILD_PATH}
+      - save_cache:
+          key: *BUILD_CACHE_KEY
+          paths: ~/project/mongooseim-<<parameters.arch>>.tar.gz
+  restore_prod_build:
+    parameters:
+      arch:
+        type: string
+    steps:
+      - run:
+          echo $OTP_VERSION-<<parameters.arch>> > otp_version
+      - restore_cache:
+          key: *BUILD_CACHE_KEY
+  persist_workspace:
+    steps:
+      - run: git gc
+      - persist_to_workspace:
+          root: ~/project/
+          paths: ["*"]
+  restore_workspace:
+    steps:
+      - attach_workspace: {at: ~/project}
+  run_coverage_analysis:
+    steps:
+      - run:
+          name: Coverage
+          when: on_success
+          command: |
+            echo "Success!"
+            ./rebar3 codecov analyze
+            tools/circle-upload-codecov.sh
+  run_small_tests:
+    steps:
+      - restore_workspace
+      - run:
+          name: Wait for redis
+          command: |
+            tools/wait-for-it.sh -p 6379
+      - run:
+          name: Run Small Tests
+          command: |
+            tools/test.sh -p small_tests -s true -e true
+  run_docker_smoke_test:
+    steps:
+      - checkout
+      - run:
+          name: Smoke testing
+          command: |
+            source tools/circleci-prepare-mongooseim-docker.sh
+            ./smoke_test.sh
+  upload_results_to_aws:
+    steps:
+      - run:
+          name: Upload results
+          when: always
+          command: |
+              tools/prepare-log-dir.sh
+              if [ -n "${AWS_SECRET_ACCESS_KEY}" ]; then tools/circleci-upload-to-s3.sh; fi
+  report_failed_test_cases_to_ga4:
+    steps:
+      - when:
+          condition:
+            equal: [ master, << pipeline.git.branch >> ]
+          steps:
+            - run:
+                name: Report failed test cases to GA4
+                when: always
+                command: |
+                  tools/gh-report-failing-testcases-to-ga4.sh
+  publish_github_comment:
+    steps:
+      - run:
+          name: Publish a comment to GitHub
+          when: always
+          command: |
+              tools/circle-publish-github-comment.sh
+
+  maybe_prepare_minio:
+    steps:
+      - run:
+          name: Install minio client, prepare minio
+          environment:
+            - MINIO_HOSTNAME: "mongooseim-minio"
+            - MINIO_ACCESS_KEY: "AKIAIAOAONIULXQGMOUA"
+            - MINIO_SECRET_KEY: "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"
+            - MINIO_BUCKET: "mybucket"
+          command: |
+            if [[ "$DB" == *minio* ]]; then
+                curl -sSL https://dl.minio.io/client/mc/release/linux-amd64/archive/mc.__MINIO_MC_VERSION__ -o ./mc
+                chmod +x ./mc
+                ./mc config host add ${MINIO_HOSTNAME} http://127.0.0.1:9000 ${MINIO_ACCESS_KEY} ${MINIO_SECRET_KEY}
+                ./mc mb ${MINIO_HOSTNAME}/${MINIO_BUCKET}
+                ./mc policy set download "${MINIO_HOSTNAME}/${MINIO_BUCKET}"
+            fi
+
+  maybe_prepare_ldap:
+    steps:
+      - run:
+          name: Change port in test.config
+          command: |
+            if [[ "$DB" == *ldap* ]]; then
+              sed -i "s/connection.port = 3636/connection.port = 636/g" big_tests/test.config
+            fi
+
+  maybe_setup_elasticsearch:
+    steps:
+      - run:
+          name: Maybe create ElasticSearch schema
+          command: |
+            if [[ "$DB" == *elasticsearch* ]]; then
+              tools/setup-elasticsearch.sh
+            fi
+
+  maybe_prepare_odbc:
+    steps:
+      - run:
+          name: Install odbc.ini and packages
+          command: |
+            if [[ "$DB" == *mssql* ]]; then
+                sudo ./tools/retry.sh apt-get update
+                sudo ./tools/retry.sh apt-get -y install unixodbc tdsodbc
+                ./tools/install_odbc_ini.sh
+            fi
+
+  prepare_etc_hosts:
+    steps:
+      - run:
+          name: Prepare /etc/hosts
+          command: |
+            echo '127.0.0.1 muc.localhost' | sudo tee -a /etc/hosts
+            echo '127.0.0.1 localhost.bis' | sudo tee -a /etc/hosts
+            echo '127.0.0.1 localhost' | sudo tee -a /etc/hosts
+  # Certs are initialized during setup phase
+  # We are not allowed to regenerate them
+  restore_certs:
+    steps:
+      - run:
+          name: Prepare cache key
+          command: echo "__CERTS_CACHE_KEY__" > certs_cache_key
+      - restore_cache:
+          name: Restore certificates
+          key: *CERT_KEY
+      - run:
+          name: Continue if certificate cache restored
+          command: test -f tools/ssl/mongooseim/key.pem
+  prepare_for_cache:
+    steps:
+      - run:
+          name: Prepare for cache
+          command: bash -c 'echo $OTP_VERSION-$ARCH > otp_version'
+
+jobs:
+  # #########################
+  # jobs in docker containers
+  docker_image:
+    parallelism: 1
+    executor: << parameters.executor >>
+    parameters:
+      executor:
+        type: executor
+    steps:
+      - checkout
+      - setup_remote_docker
+      - restore_prod_build: {arch: amd64}
+      - restore_prod_build: {arch: arm64}
+      - run:
+          name: Execute Docker image build and upload
+          command: tools/circle-build-and-push-docker.sh
+
+  docker_smoke_test:
+    executor: << parameters.executor >>
+    parameters:
+      executor:
+        type: executor
+    steps:
+      - setup_remote_docker
+      - run_docker_smoke_test
+
+  docs_build_deploy:
+    parallelism: 1
+    docker:
+      - image: cimg/python:3.11.0-node
+    steps:
+      - restore_workspace
+      - add_ssh_keys
+      - run:
+          name: Build GraphQL static docs
+          command: |
+            npm install --global cheerio@1.0.0-rc.12 spectaql
+            npx spectaql -t doc/graphql-api -f admin-graphql-doc.html doc/graphql-api/Admin-GraphQL_spectaql.yml
+            npx spectaql -C -J -t doc/graphql-api -f user-graphql-doc.html doc/graphql-api/User-GraphQL_spectaql.yml
+      - run:
+          name: Test that docs build
+          command: |
+            pip3 install mkdocs
+            pip3 install mkdocs-material
+            pip3 install mkdocs-include-markdown-plugin
+            mkdocs build --strict
+      - when:
+          condition:
+            or:
+              - equal: [ master, << pipeline.git.branch >> ]
+              - << pipeline.git.tag >>
+          steps:
+            - run:
+                name: Configure Git
+                command: |
+                  git config --global user.email "mongoose-im@erlang-solutions.com"
+                  git config --global user.name "mongooseim"
+            - run:
+                name: Generate image tag
+                command: |
+                  set -x
+                  if [ -n "$CIRCLE_TAG" ]; then
+                      DOCS_TAG="$CIRCLE_TAG"
+                  elif [ "$CIRCLE_BRANCH" == "master" ]; then
+                      DOCS_TAG="latest"
+                  else
+                      DOCS_TAG=`echo $CIRCLE_BRANCH | sed 's,/,_,g'`
+                  fi
+                  env | sort
+                  echo "export DOCS_TAG=$DOCS_TAG" >> $BASH_ENV
+            - run:
+                name: Build latest
+                command: |
+                  ssh-keyscan github.com >> ~/.ssh/known_hosts
+                  git fetch git@github.com:esl/MongooseDocs.git gh-pages:gh-pages
+                  pip3 install mike
+                  mike deploy $DOCS_TAG --remote git@github.com:esl/MongooseDocs.git --branch gh-pages --push
+
+  build_in_docker:
+    executor: << parameters.executor >>
+    parameters:
+      executor:
+        type: executor
+      build_prod:
+        type: boolean
+        description: When enabled, prod release will be generated besides the dev ones
+        default: false
+      arch:
+        type: string
+        description: Target architecture
+        default: amd64
+    parallelism: 1
+    environment:
+      SKIP_RELEASE: 1
+      SKIP_COV: 0
+      SKIP_CERT_BUILD: 1
+    steps:
+      - checkout
+      - prepare_for_cache
+      - restore_certs
+      - fetch_build_packages
+      - maybe_build_deps_and_cache
+      - run: ./rebar3 compile
+      - run:
+          name: Generate development releases
+          command: ./tools/build-releases.sh
+      - when:
+          condition: << parameters.build_prod >>
+          steps:
+            - run: make rel
+            - cache_prod_build: {arch: << parameters.arch >>}
+            - run:
+                name: Generate DOAP, JSON and Markdown files with supported XEPs
+                command: make xeplist
+      - run:
+          name: Build Big Tests
+          command: tools/build-tests.sh
+      - persist_workspace
+
+  small_tests_in_docker:
+    executor: << parameters.executor >>
+    parameters:
+      executor:
+        type: executor
+    parallelism: 1
+    environment:
+      PRESET: small_tests
+      SKIP_AUTO_COMPILE: true
+    steps:
+      - run_small_tests
+      - run_coverage_analysis
+      - upload_results_to_aws
+      - publish_github_comment
+
+  big_tests_in_docker:
+    executor: << parameters.executor >>
+    parallelism: 1
+    parameters:
+      executor:
+        type: executor
+      spec:
+        type: string
+        default: default.spec
+      preset:
+        type: enum
+        enum: [internal_mnesia, mysql_redis, odbc_mssql_mnesia, ldap_mnesia,
+               elasticsearch_and_cassandra_mnesia, pgsql_mnesia, pgsql_cets,
+               cockroachdb_cets]
+        description: Preset to run
+        default: internal_mnesia
+      db:
+        type: string
+        description: Database to use
+        default: mnesia
+      tls_dist:
+        type: boolean
+        description: Erlang distribution with TLS enabled
+        default: false
+      store_results:
+        type: boolean
+        description: Collect and store test results in JUnit XML format for Insights
+        default: true
+    environment:
+      TESTSPEC: <<parameters.spec>>
+      PRESET: <<parameters.preset>>
+      DB: <<parameters.db>>
+      TLS_DIST: <<parameters.tls_dist>>
+      STORE_RESULTS: <<parameters.store_results>>
+      SKIP_AUTO_COMPILE: true
+      KEEP_COVER_RUNNING: 1
+    steps:
+      - restore_workspace
+      - run:
+          name: Wait for databases
+          command: ./tools/circle-wait-for-db.sh
+      - maybe_prepare_minio
+      - maybe_prepare_odbc
+      - maybe_prepare_ldap
+      - maybe_setup_elasticsearch
+      - prepare_etc_hosts
+      - run:
+          name: Run Big Tests
+          command: |
+            if $STORE_RESULTS; then
+              ./tools/test.sh -p $PRESET -h cth_surefire -s false
+            else
+              ./tools/test.sh -p $PRESET -s false
+            fi
+          no_output_timeout: 40m
+      - when:
+          condition: <<parameters.store_results>>
+          steps:
+            - run:
+                when: always
+                name: Copy test results for Insights
+                command: |
+                  cp big_tests/ct_report/*/junit_report.xml .
+            - store_test_results:
+                when: always
+                path: junit_report.xml
+      - run_coverage_analysis
+      - run:
+          name: Build Failed - Logs
+          when: on_fail
+          command: |
+            echo "Failure!"
+            if [ -s _build/mim1/rel/mongooseim/log/crash.log ]; then cat _build/mim1/rel/mongooseim/log/crash.log; fi
+            tail -100 _build/mim1/rel/mongooseim/log/mongooseim.log.1
+      - upload_results_to_aws
+      - publish_github_comment
+      - report_failed_test_cases_to_ga4
+
+  dialyzer:
+    executor: << parameters.executor >>
+    parameters:
+      executor:
+        type: executor
+    parallelism: 1
+    steps:
+      - restore_workspace
+      - run:
+          name: Run Dialyzer
+          command: |
+            ./tools/test.sh -p dialyzer_only -s false
+
+  xref:
+    executor: << parameters.executor >>
+    parameters:
+      executor:
+        type: executor
+    parallelism: 1
+    steps:
+      - restore_workspace
+      - run:
+          name: Run Xref
+          command: |
+            ./tools/test.sh -p xref_only -s false
+  edoc:
+    executor: << parameters.executor >>
+    parameters:
+      executor:
+        type: executor
+    parallelism: 1
+    steps:
+      - restore_workspace
+      - run:
+          name: Run Edoc
+          command: |
+            ./tools/test.sh -p edoc_only -s false
+
+  package:
+    parallelism: 1
+    executor: << parameters.executor >>
+    parameters:
+      executor:
+        type: executor
+      platform:
+        type: enum
+        enum: [debian-bookworm, debian-bullseye, debian-buster, ubuntu-plucky, ubuntu-noble, ubuntu-jammy, ubuntu-focal, rockylinux-9, rockylinux-8, almalinux-9, almalinux-8]
+        description: Platform type
+      otp_version:
+        type: string
+        description: Version of Erlang/OTP to use
+        default: *LATEST_OTP_VERSION
+    environment:
+      pkg_PLATFORM: <<parameters.platform>>
+      pkg_OTP_VERSION: <<parameters.otp_version>>
+      PRESET: pkg
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Build package
+          command: |
+            ./tools/test.sh -p pkg -s false
+      - run:
+          name: Verify package architecture
+          command: |
+            ./tools/circle-install-packages.sh rpm
+            ./tools/pkg/verify_arch.sh
+      - run:
+          name: Publish package
+          command: |
+            if [ -n "${CIRCLE_TAG}" ]; then tools/circle-install-packages.sh gh; fi
+            ./tools/pkg/publish.sh
+
+filters:
+  - &all_tags
+    tags:
+      only: /^\d+\.\d+\.\d+([a-z0-9\-\+])*/
+  - &all_tags_and_master
+    <<: *all_tags
+    branches:
+      only: master
+
+workflows:
+  version: 2
+  build_and_test:
+    jobs:
+      # ============================================
+      # ============= IN DOCKER EXECUTORS =============
+      # ============= DOCUMENTATION =============
+      - docs_build_deploy:
+          name: build_and_deploy_docs
+          context: mongooseim-org
+          requires:
+            - otp_27_docker
+          filters: &release_tags
+            tags:
+              only: /^\d+\.\d+\.\d+/
+      # ============= PACKAGES =============
+      - package:
+          name: debian-bookworm
+          executor: otp_27
+          platform: debian-bookworm
+          context: mongooseim-org
+          filters: *all_tags_and_master
+      - package:
+          name: debian-bookworm-arm64
+          executor: otp_27_arm64
+          platform: debian-bookworm
+          context: mongooseim-org
+          filters: *all_tags_and_master
+      - package:
+          name: debian-bullseye
+          executor: otp_27
+          platform: debian-bullseye
+          context: mongooseim-org
+          filters: *all_tags_and_master
+      - package:
+          name: debian-bullseye-arm64
+          executor: otp_27_arm64
+          platform: debian-bullseye
+          context: mongooseim-org
+          filters: *all_tags_and_master
+      - package:
+          name: debian-buster
+          executor: otp_27
+          platform: debian-buster
+          context: mongooseim-org
+          filters: *all_tags_and_master
+      - package:
+          name: debian-buster-arm64
+          executor: otp_27_arm64
+          platform: debian-buster
+          context: mongooseim-org
+          filters: *all_tags_and_master
+      - package:
+          name: ubuntu-plucky
+          executor: otp_27
+          platform: ubuntu-plucky
+          context: mongooseim-org
+          filters: *all_tags_and_master
+      - package:
+          name: ubuntu-plucky-arm64
+          executor: otp_27_arm64
+          platform: ubuntu-plucky
+          context: mongooseim-org
+          filters: *all_tags_and_master
+      - package:
+          name: ubuntu-noble
+          executor: otp_27
+          platform: ubuntu-noble
+          context: mongooseim-org
+          filters: *all_tags_and_master
+      - package:
+          name: ubuntu-noble-arm64
+          executor: otp_27_arm64
+          platform: ubuntu-noble
+          context: mongooseim-org
+          filters: *all_tags_and_master
+      - package:
+          name: ubuntu-jammy
+          executor: otp_27
+          platform: ubuntu-jammy
+          context: mongooseim-org
+          filters: *all_tags_and_master
+      - package:
+          name: ubuntu-jammy-arm64
+          executor: otp_27_arm64
+          platform: ubuntu-jammy
+          context: mongooseim-org
+          filters: *all_tags_and_master
+      - package:
+          name: ubuntu-focal
+          executor: otp_27
+          platform: ubuntu-focal
+          context: mongooseim-org
+          filters: *all_tags_and_master
+      - package:
+          name: ubuntu-focal-arm64
+          executor: otp_27_arm64
+          platform: ubuntu-focal
+          context: mongooseim-org
+          filters: *all_tags_and_master
+      - package:
+          name: rockylinux-9
+          executor: otp_27
+          platform: rockylinux-9
+          context: mongooseim-org
+          filters: *all_tags_and_master
+      - package:
+          name: rockylinux-9-arm64
+          executor: otp_27_arm64
+          platform: rockylinux-9
+          context: mongooseim-org
+          filters: *all_tags_and_master
+      - package:
+          name: rockylinux-8
+          executor: otp_27
+          platform: rockylinux-8
+          context: mongooseim-org
+          filters: *all_tags_and_master
+      - package:
+          name: rockylinux-8-arm64
+          executor: otp_27_arm64
+          platform: rockylinux-8
+          context: mongooseim-org
+          filters: *all_tags_and_master
+      - package:
+          name: almalinux-9
+          executor: otp_27
+          platform: almalinux-9
+          context: mongooseim-org
+          filters: *all_tags_and_master
+      - package:
+          name: almalinux-9-arm64
+          executor: otp_27_arm64
+          platform: almalinux-9
+          context: mongooseim-org
+          filters: *all_tags_and_master
+      - package:
+          name: almalinux-8
+          executor: otp_27
+          platform: almalinux-8
+          context: mongooseim-org
+          filters: *all_tags_and_master
+      - package:
+          name: almalinux-8-arm64
+          executor: otp_27_arm64
+          platform: almalinux-8
+          context: mongooseim-org
+          filters: *all_tags_and_master
+      # ======== BASE DOCKER BUILDS ========
+      - build_in_docker:
+          name: otp_27_docker
+          executor: otp_27
+          context: mongooseim-org
+          build_prod: true
+          filters: *all_tags
+      - build_in_docker:
+          name: otp_26_docker
+          executor: otp_26
+          context: mongooseim-org
+          build_prod: false
+          filters: *all_tags
+      - build_in_docker:
+          name: otp_27_docker_arm64
+          executor: otp_27_arm64
+          context: mongooseim-org
+          build_prod: true
+          arch: arm64
+          filters: *all_tags
+      # ============= DIALYZER =============
+      - dialyzer:
+          name: dialyzer_26
+          executor: otp_26
+          context: mongooseim-org
+          requires:
+            - otp_26_docker
+          filters: *all_tags
+      - dialyzer:
+          name: dialyzer_27
+          executor: otp_27
+          context: mongooseim-org
+          requires:
+            - otp_27_docker
+          filters: *all_tags
+      # ============= XREF =============
+      - xref:
+          name: xref
+          executor: otp_27
+          context: mongooseim-org
+          requires:
+            - otp_27_docker
+          filters: *all_tags
+      # ============= EDOC =============
+      - edoc:
+          name: edoc
+          executor: otp_27
+          context: mongooseim-org
+          requires:
+            - otp_27_docker
+          filters: *all_tags
+      # ============= SMALL TESTS =============
+      - small_tests_in_docker:
+          name: small_tests_26
+          executor: otp_26_redis
+          context: mongooseim-org
+          requires:
+            - otp_26_docker
+          filters: *all_tags
+      - small_tests_in_docker:
+          name: small_tests_27
+          executor: otp_27_redis
+          context: mongooseim-org
+          requires:
+            - otp_27_docker
+          filters: *all_tags
+      - small_tests_in_docker:
+          name: small_tests_27_arm64
+          executor: otp_27_redis_arm64
+          context: mongooseim-org
+          requires:
+            - otp_27_docker_arm64
+          filters: *all_tags
+      # ============= BIG TESTS =============
+      - big_tests_in_docker:
+          name: internal_mnesia_27
+          executor: otp_27_redis_minio_rmq
+          context: mongooseim-org
+          preset: internal_mnesia
+          db: "mnesia minio"
+          tls_dist: true
+          requires:
+            - otp_27_docker
+          filters: *all_tags
+      - big_tests_in_docker:
+          name: cockroachdb_cets_27
+          executor: otp_27_cockroachdb_redis
+          context: mongooseim-org
+          preset: cockroachdb_cets
+          db: "mnesia cockroachdb cets"
+          requires:
+            - otp_27_docker
+          filters: *all_tags
+      - big_tests_in_docker:
+          name: pgsql_cets_27
+          executor: otp_27_pgsql_redis
+          context: mongooseim-org
+          preset: pgsql_cets
+          db: "mnesia postgres cets"
+          requires:
+            - otp_27_docker
+          filters: *all_tags
+      - big_tests_in_docker:
+          name: mysql_redis_27
+          executor: otp_27_mysql_redis
+          context: mongooseim-org
+          preset: mysql_redis
+          requires:
+            - otp_27_docker
+          filters: *all_tags
+      - big_tests_in_docker:
+          name: dynamic_domains_mysql_redis_27
+          spec: dynamic_domains.spec
+          executor: otp_27_mysql_redis
+          context: mongooseim-org
+          preset: mysql_redis
+          requires:
+            - otp_27_docker
+          filters: *all_tags
+      - big_tests_in_docker:
+          name: pgsql_mnesia_26
+          executor: otp_26_pgsql_redis
+          context: mongooseim-org
+          preset: pgsql_mnesia
+          requires:
+            - otp_26_docker
+          filters: *all_tags
+      - big_tests_in_docker:
+          name: pgsql_mnesia_27
+          executor: otp_27_pgsql_redis
+          context: mongooseim-org
+          preset: pgsql_mnesia
+          requires:
+            - otp_27_docker
+          filters: *all_tags
+      - big_tests_in_docker:
+          name: dynamic_domains_pgsql_mnesia_27
+          spec: dynamic_domains.spec
+          executor: otp_27_pgsql_redis
+          context: mongooseim-org
+          preset: pgsql_mnesia
+          requires:
+            - otp_27_docker
+          filters: *all_tags
+      - big_tests_in_docker:
+          name: dynamic_domains_pgsql_mnesia_26
+          spec: dynamic_domains.spec
+          executor: otp_26_pgsql_redis
+          context: mongooseim-org
+          preset: pgsql_mnesia
+          requires:
+            - otp_26_docker
+          filters: *all_tags
+      - big_tests_in_docker:
+          name: mssql_mnesia_27
+          executor: otp_27_mssql_redis
+          context: mongooseim-org
+          preset: odbc_mssql_mnesia
+          db: "mssql redis"
+          requires:
+            - otp_27_docker
+          filters: *all_tags
+      - big_tests_in_docker:
+          name: dynamic_domains_mssql_mnesia_27
+          spec: dynamic_domains.spec
+          executor: otp_27_mssql_redis
+          context: mongooseim-org
+          preset: odbc_mssql_mnesia
+          db: "mssql redis"
+          requires:
+            - otp_27_docker
+          filters: *all_tags
+      - big_tests_in_docker:
+          name: ldap_mnesia_26
+          executor: otp_26_ldap_redis
+          context: mongooseim-org
+          preset: ldap_mnesia
+          db: "ldap redis"
+          requires:
+            - otp_26_docker
+          filters: *all_tags
+      - big_tests_in_docker:
+          name: ldap_mnesia_27
+          executor: otp_27_ldap_redis
+          context: mongooseim-org
+          preset: ldap_mnesia
+          db: "ldap redis"
+          requires:
+            - otp_27_docker
+          filters: *all_tags
+      - big_tests_in_docker:
+          name: elasticsearch_and_cassandra_27
+          spec: mam.spec
+          executor: otp_27_elasticsearch_cassandra
+          context: mongooseim-org
+          preset: elasticsearch_and_cassandra_mnesia
+          db: "elasticsearch cassandra"
+          requires:
+            - otp_27_docker
+          filters: *all_tags
+      # ============= DOCKER IMAGE BUILD & UPLOAD =============
+      - docker_image:
+          name: docker_build_and_ship
+          executor: otp_27
+          context: mongooseim-org
+          requires:
+
+            - small_tests_26
+            - ldap_mnesia_26
+            - pgsql_mnesia_26
+            - dynamic_domains_pgsql_mnesia_26
+            - dialyzer_26
+
+            - small_tests_27
+            - internal_mnesia_27
+            - pgsql_cets_27
+            - cockroachdb_cets_27
+            - pgsql_mnesia_27
+            - mysql_redis_27
+            - mssql_mnesia_27
+            - ldap_mnesia_27
+            - elasticsearch_and_cassandra_27
+            - dynamic_domains_pgsql_mnesia_27
+            - dynamic_domains_mysql_redis_27
+            - dynamic_domains_mssql_mnesia_27
+            - dialyzer_27
+            - small_tests_27_arm64
+
+            - xref
+            - edoc
+
+          filters: *all_tags
+      - docker_smoke_test:
+          name: docker_smoke_test
+          executor: otp_27
+          context: mongooseim-org
+          requires:
+            - docker_build_and_ship
+          filters: *all_tags
+      - docker_smoke_test:
+          name: docker_smoke_test_arm64
+          executor: otp_27_arm64
+          context: mongooseim-org
+          requires:
+            - docker_build_and_ship
+          filters: *all_tags

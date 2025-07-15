@@ -9,13 +9,13 @@
 %%%            timestamp field added by mod_smart_markers.
 %%%
 %%%          * These packets are not going to mod_offline (notice the
-%%%            difference in priorities for the offline_message_hook handlers)
+%%%            difference in priorities for the offline_message hook handlers)
 %%%
 %%%          * The information about these chat markers is stored in DB,
 %%%            timestamp added by mod_smart_markers is important here!
 %%%
 %%%      2) After all the offline messages are inserted by mod_offline (notice
-%%%         the difference in priorities for the resend_offline_messages_hook
+%%%         the difference in priorities for the resend_offline_messages hook
 %%%         handlers), this module adds the latest chat markers as the last
 %%%         offline messages:
 %%%
@@ -30,91 +30,111 @@
 %%% @end
 %%%----------------------------------------------------------------------------
 -module(mod_offline_chatmarkers).
--xep([{xep, 160}, {version, "1.0"}]).
+-xep([{xep, 160}, {version, "1.0.1"}]).
 -behaviour(gen_mod).
 -behaviour(mongoose_module_metrics).
 
 %% gen_mod handlers
--export([start/2, stop/1, deps/2]).
+%% gen_mod API
+-export([start/2]).
+-export([stop/1]).
+-export([hooks/1]).
+-export([deps/2]).
+-export([supported_features/0]).
+-export([config_spec/0]).
 
 %% Hook handlers
--export([inspect_packet/4,
+-export([inspect_packet/3,
          remove_user/3,
          pop_offline_messages/3]).
 
--include("mongoose.hrl").
 -include("jlib.hrl").
 -include_lib("exml/include/exml.hrl").
-
-%% ------------------------------------------------------------------
-%% Backend callbacks
-
--callback init(Host :: jid:lserver(), Opts :: list()) -> ok.
--callback get(Jid :: jid:jid()) -> {ok, [{Thread :: undefined | binary(),
-                                          Room :: undefined | jid:jid(),
-                                          Timestamp :: integer()}]}.
-
-%%% Jid, Thread, and Room parameters serve as a composite database key. If
-%%% key is not available in the database, then it must be added with the
-%%% corresponding timestamp. Otherwise this function does nothing, the stored
-%%% timestamp for the composite key MUST remain unchanged!
--callback maybe_store(Jid :: jid:jid(), Thread :: undefined | binary(),
-                      Room :: undefined | jid:jid(), Timestamp :: integer()) -> ok.
--callback remove_user(Jid :: jid:jid()) -> ok.
+-include("mongoose_config_spec.hrl").
 
 %% gen_mod callbacks
 %% ------------------------------------------------------------------
 
--spec deps(_Host :: jid:server(), Opts :: proplists:proplist()) -> gen_mod:deps_list().
-deps(_,_)->
-    [{mod_smart_markers, hard}].
+-spec supported_features() -> [atom()].
+supported_features() ->
+    [dynamic_domains].
 
-start(Host, Opts) ->
-    gen_mod:start_backend_module(?MODULE, add_default_backend(Opts), [get, maybe_store]),
-    mod_offline_chatmarkers_backend:init(Host, Opts),
-    ejabberd_hooks:add(hooks(Host)),
+-spec deps(mongooseim:host_type(), gen_mod:module_opts()) -> gen_mod_deps:deps().
+deps(_, _)->
+    [].  %% TODO: this need to be marked as required-to-be-configured
+    % [{mod_smart_markers, [], hard}].
+
+-spec start(mongooseim:host_type(), gen_mod:module_opts()) -> ok.
+start(HostType, Opts) ->
+    mod_offline_chatmarkers_backend:init(HostType, Opts),
     ok.
 
-stop(Host) ->
-    ejabberd_hooks:delete(hooks(Host)),
+-spec stop(mongooseim:host_type()) -> ok.
+stop(_HostType) ->
     ok.
 
-hooks(Host) ->
+-spec hooks(mongooseim:host_type()) -> gen_hook:hook_list().
+hooks(HostType) ->
     DefaultHooks = [
-        {offline_message_hook, Host, ?MODULE, inspect_packet, 40},
-        {resend_offline_messages_hook, Host, ?MODULE, pop_offline_messages, 60},
-        {remove_user, Host, ?MODULE, remove_user, 50}
+        {offline_message, HostType, fun ?MODULE:inspect_packet/3, #{}, 40},
+        {resend_offline_messages, HostType, fun ?MODULE:pop_offline_messages/3, #{}, 60},
+        {remove_user, HostType, fun ?MODULE:remove_user/3, #{}, 50}
     ],
-    case gen_mod:get_module_opt(Host, ?MODULE, store_groupchat_messages, false) of
+    case gen_mod:get_module_opt(HostType, ?MODULE, store_groupchat_messages) of
         true ->
-            GroupChatHook = {offline_groupchat_message_hook,
-                             Host, ?MODULE, inspect_packet, 40},
+            GroupChatHook = {offline_groupchat_message,
+                             HostType, fun ?MODULE:inspect_packet/3, #{}, 40},
             [GroupChatHook | DefaultHooks];
         _ -> DefaultHooks
     end.
 
-remove_user(Acc, User, Server) ->
-    mod_offline_chatmarkers_backend:remove_user(jid:make(User, Server, <<"">>)),
-    Acc.
+-spec config_spec() -> mongoose_config_spec:config_section().
+config_spec() ->
+    #section{
+        items = #{<<"backend">> => #option{type = atom,
+                                           validate = {module, ?MODULE}},
+                  <<"store_groupchat_messages">> => #option{type = boolean}
+                 },
+        defaults = #{<<"store_groupchat_messages">> => false,
+                     <<"backend">> => rdbms
+                    }
+        }.
 
-pop_offline_messages(Acc, User, Server) ->
-    mongoose_acc:append(offline, messages, offline_chatmarkers(Acc, User, Server), Acc).
+-spec remove_user(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: mongoose_acc:t(),
+    Params :: map(),
+    Extra :: gen_hook:extra().
+remove_user(Acc, #{jid := #jid{luser = User, lserver = Server}}, #{host_type := HostType}) ->
+    mod_offline_chatmarkers_backend:remove_user(HostType, jid:make_bare(User, Server)),
+    {ok, Acc}.
 
-inspect_packet(Acc, From, To, Packet) ->
+-spec pop_offline_messages(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: mongoose_acc:t(),
+    Params :: map(),
+    Extra :: gen_hook:extra().
+pop_offline_messages(Acc, #{jid := JID}, _Extra) ->
+    {ok, mongoose_acc:append(offline, messages, offline_chatmarkers(Acc, JID), Acc)}.
+
+-spec inspect_packet(Acc, Params, Extra) -> {ok | stop, Acc} when
+    Acc :: mongoose_acc:t(),
+    Params :: map(),
+    Extra :: gen_hook:extra().
+inspect_packet(Acc, #{from := From, to := To, packet := Packet}, _Extra) ->
     case maybe_store_chat_marker(Acc, From, To, Packet) of
         true ->
             {stop, mongoose_acc:set(offline, stored, true, Acc)};
         false ->
-            Acc
+            {ok, Acc}
     end.
 
 maybe_store_chat_marker(Acc, From, To, Packet) ->
+    HostType = mongoose_acc:host_type(Acc),
     case mongoose_acc:get(mod_smart_markers, timestamp, undefined, Acc) of
         undefined -> false;
-        Timestamp when is_integer(Timestamp)->
+        Timestamp when is_integer(Timestamp) ->
             Room = get_room(Acc, From),
             Thread = get_thread(Packet),
-            mod_offline_chatmarkers_backend:maybe_store(To, Thread, Room, Timestamp),
+            mod_offline_chatmarkers_backend:maybe_store(HostType, To, Thread, Room, Timestamp),
             true
     end.
 
@@ -130,38 +150,38 @@ get_thread(El) ->
         _ -> undefined
     end.
 
-offline_chatmarkers(Acc, User, Server) ->
-    JID = jid:make(User, Server, <<"">>),
-    {ok, Rows} = mod_offline_chatmarkers_backend:get(JID),
-    mod_offline_chatmarkers_backend:remove_user(JID),
+offline_chatmarkers(Acc, JID) ->
+    HostType = mongoose_acc:host_type(Acc),
+    {ok, Rows} = mod_offline_chatmarkers_backend:get(HostType, JID),
+    mod_offline_chatmarkers_backend:remove_user(HostType, JID),
     lists:concat([process_row(Acc, JID, R) || R <- Rows]).
 
 process_row(Acc, Jid, {Thread, undefined, TS}) ->
-    ChatMarkers = mod_smart_markers:get_chat_markers(one2one, Jid, Thread, TS),
+    ChatMarkers = mod_smart_markers:get_chat_markers(Jid, Thread, TS),
     [build_one2one_chatmarker_msg(Acc, CM) || CM <- ChatMarkers];
 process_row(Acc, Jid, {Thread, Room, TS}) ->
-    ChatMarkers = mod_smart_markers:get_chat_markers(groupchat, Room, Thread, TS),
+    ChatMarkers = mod_smart_markers:get_chat_markers(Room, Thread, TS),
     [build_room_chatmarker_msg(Acc, Jid, CM) || CM <- ChatMarkers].
 
 build_one2one_chatmarker_msg(Acc, CM) ->
     #{from := From, to := To, thread := Thread,
       type := Type, id := Id, timestamp := TS} = CM,
     Children = thread(Thread) ++ marker(Type, Id),
-    Attributes = [{<<"from">>, jid:to_binary(From)},
-                  {<<"to">>, jid:to_binary(To)}],
+    Attributes = #{<<"from">> => jid:to_binary(From),
+                   <<"to">> => jid:to_binary(To)},
     Packet = #xmlel{name = <<"message">>, attrs = Attributes, children = Children},
     make_route_item(Acc, From, To, TS, Packet).
 
 build_room_chatmarker_msg(Acc, To, CM) ->
     #{from := FromUser, to := Room, thread := Thread,
       type := Type, id := Id, timestamp := TS} = CM,
-    FromUserBin = jid:to_binary(jid:to_lus(FromUser)),
+    FromUserBin = jid:to_bare_binary(FromUser),
     From = jid:make(Room#jid.luser, Room#jid.lserver, FromUserBin),
     FromBin = jid:to_binary(From),
     Children = thread(Thread) ++ marker(Type, Id),
-    Attributes = [{<<"from">>, FromBin},
-                  {<<"to">>, jid:to_binary(To)},
-                  {<<"type">>, <<"groupchat">>}],
+    Attributes = #{<<"from">> => FromBin,
+                   <<"to">> => jid:to_binary(To),
+                   <<"type">> => <<"groupchat">>},
     Packet = #xmlel{name = <<"message">>, attrs = Attributes, children = Children},
     make_route_item(Acc, From, To, TS, Packet).
 
@@ -173,18 +193,10 @@ make_route_item(Acc, From, To, TS, Packet) ->
 
 marker(Type, Id) ->
     [#xmlel{name = atom_to_binary(Type, latin1),
-        attrs = [{<<"xmlns">>, <<"urn:xmpp:chat-markers:0">>},
-                 {<<"id">>, Id}], children = []}].
+            attrs = #{<<"xmlns">> => <<"urn:xmpp:chat-markers:0">>,
+                      <<"id">> => Id}}].
 
 thread(undefined) -> [];
 thread(Thread) ->
-    [#xmlel{name     = <<"thread">>, attrs = [],
+    [#xmlel{name = <<"thread">>,
             children = [#xmlcdata{content = Thread}]}].
-
-add_default_backend(Opts) ->
-    case lists:keyfind(backend, 2, Opts) of
-        false ->
-            [{backend, rdbms} | Opts];
-        _ ->
-            Opts
-    end.

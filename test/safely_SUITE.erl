@@ -1,21 +1,20 @@
 -module(safely_SUITE).
--compile([export_all]).
+-compile([export_all, nowarn_export_all]).
 -include_lib("eunit/include/eunit.hrl").
 
 all() ->
-    [ handles_errors_like_catch,
-      handles_exits_like_catch,
+    [ handles_errors_similar_to_catch,
+      handles_exits_similar_to_errors,
       handles_throws_unlike_catch,
       handles_success_like_catch
     ].
 
-
-handles_errors_like_catch(_) ->
+handles_errors_similar_to_catch(_) ->
     {SafeRes, CatchRes} =
         %% These two must be on the same line for the stacktraces to be equal.
         {safely:apply(lists, min, [[]]),(catch apply(lists, min, [[]]))},
 
-    {'EXIT', {function_clause, SafeST}} = SafeRes,
+    {exception, #{class := error, reason := function_clause, stacktrace := SafeST}} = SafeRes,
     {'EXIT', {function_clause, CatchST}} = CatchRes,
 
     true = (hd(CatchST) == hd(SafeST)),
@@ -24,15 +23,15 @@ handles_errors_like_catch(_) ->
 
     true = (tl(CatchST) == tl(tl(SafeST))).
 
-handles_exits_like_catch(_) ->
+handles_exits_similar_to_errors(_) ->
     ExitF = fun() -> exit(i_quit) end,
-    {'EXIT', i_quit} = safely:apply(ExitF,[]),
+    {exception, #{class := exit, reason := i_quit, stacktrace := _S}} = safely:apply(ExitF,[]),
     {'EXIT', i_quit} = (catch apply(ExitF,[])),
     ok.
 
 handles_throws_unlike_catch(_) ->
     ThrowF = fun() -> throw(up) end,
-    {'EXIT', up} = safely:apply(ThrowF,[]),
+    {exception, #{class := throw, reason := up}} = safely:apply(ThrowF,[]),
     up = (catch apply(ThrowF,[])),
     ok.
 

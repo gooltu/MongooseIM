@@ -31,7 +31,7 @@
                              sip_reinvite_unsafe/2,
                              sip_bye/2,
                              sip_cancel/3,
-                             send_ringing_session_info/1,
+                             send_ringing_session_info/2,
                              invite_resp_callback/1
                              ]}).
 
@@ -44,12 +44,19 @@
 -export([sip_dialog_update/3]).
 -export([invite_resp_callback/1]).
 
+-ignore_xref([sip_bye/2, sip_cancel/3, sip_dialog_update/3, sip_info/2,
+              sip_invite/2, sip_reinvite/2]).
+
+%% nksip specs do not fully cover case when they return a parsing error
+-dialyzer({nowarn_function, [assert_sdp_record/2]}).
+
 sip_invite(Req, Call) ->
     try
         sip_invite_unsafe(Req, Call)
     catch Class:Reason:StackTrace ->
-            ?WARNING_MSG("Error parsing sip invite, class=~p, reason=~p, stacktrace=~p",
-                         [Class, Reason, StackTrace]),
+              ?LOG_WARNING(#{what => sip_invite_failed,
+                             text => <<"Error parsing sip invite">>, sip_req => Req,
+                             class => Class, reason => Reason, stacktrace => StackTrace}),
             {error, request_not_parsable}
     end.
 
@@ -57,8 +64,9 @@ sip_reinvite(Req, Call) ->
     try
         sip_reinvite_unsafe(Req, Call)
     catch Class:Reason:StackTrace ->
-            ?WARNING_MSG("Error parsing sip invite, class=~p, reason=~p, stacktrace=~p",
-                         [Class, Reason, StackTrace]),
+              ?LOG_WARNING(#{what => sip_reinvite_failed,
+                             text => <<"Error parsing sip reinvite">>, sip_req => Req,
+                             class => Class, reason => Reason, stacktrace => StackTrace}),
             {error, request_not_parsable}
     end.
 
@@ -71,6 +79,11 @@ sip_invite_unsafe(Req, _Call) ->
         false ->
             translate_and_deliver_invite(Req, FromJID, FromBinary, ToJID, ToBinary);
         _ ->
+            CallID = nksip_sipmsg:header(<<"call-id">>, Req),
+            ?LOG_INFO(#{what => sip_invite, reply => temporarily_unavailable,
+                        text => <<"Got SIP INVITE from NkSIP, but destination user is offline">>,
+                        from_jid => FromBinary, to_jid => ToBinary,
+                        call_id => CallID, sip_req => Req}),
             {reply, temporarily_unavailable}
     end.
 
@@ -81,6 +94,7 @@ translate_and_deliver_invite(Req, FromJID, FromBinary, ToJID, ToBinary) ->
     {ok, ReqID} = nksip_request:get_handle(Req),
 
     {CodecMap, SDP} = nksip_sdp_util:extract_codec_map(Body),
+    assert_sdp_record(Body, SDP),
 
     OtherEls = sip_to_jingle:parse_sdp_attributes(SDP#sdp.attributes),
 
@@ -88,7 +102,11 @@ translate_and_deliver_invite(Req, FromJID, FromBinary, ToJID, ToBinary) ->
 
     JingleEl = jingle_sip_helper:jingle_element(CallID, <<"session-initiate">>, ContentEls ++ OtherEls),
 
-    ok = mod_jingle_sip_backend:set_incoming_request(CallID, ReqID, FromJID, ToJID, JingleEl),
+    ok = mod_jingle_sip_session:set_incoming_request(CallID, ReqID, FromJID, ToJID, JingleEl),
+
+    ?LOG_INFO(#{what => sip_invite, text => <<"Got SIP INVITE from NkSIP">>,
+                from_jid => FromBinary, to_jid => ToBinary,
+                call_id => CallID, sip_req => Req}),
 
     IQEl = jingle_sip_helper:jingle_iq(ToBinary, FromBinary, JingleEl),
     Acc = mongoose_acc:new(#{ location => ?LOCATION,
@@ -101,7 +119,7 @@ translate_and_deliver_invite(Req, FromJID, FromBinary, ToJID, ToBinary) ->
     {reply, ringing}.
 
 sip_reinvite_unsafe(Req, _Call) ->
-    ?INFO_MSG("re-INVITE: ~p", [Req]),
+    ?LOG_INFO(#{what => sip_reinvite, sip_req => Req}),
     {FromJID, FromBinary} = get_user_from_sip_msg(from, Req),
     {ToJID, ToBinary} = get_user_from_sip_msg(to, Req),
 
@@ -109,12 +127,18 @@ sip_reinvite_unsafe(Req, _Call) ->
     Body = nksip_sipmsg:meta(body, Req),
 
     {CodecMap, SDP} = nksip_sdp_util:extract_codec_map(Body),
+    assert_sdp_record(Body, SDP),
     RemainingAttrs = SDP#sdp.attributes,
     OtherEls = sip_to_jingle:parse_sdp_attributes(RemainingAttrs),
 
     ContentEls = [sip_to_jingle:sdp_media_to_content_el(Media, CodecMap) || Media <- SDP#sdp.medias],
     Name = get_action_name_from_sdp(RemainingAttrs, <<"transport-info">>),
     JingleEl = jingle_sip_helper:jingle_element(CallID, Name, ContentEls ++ OtherEls),
+
+    ?LOG_INFO(#{what => sip_reinvite, text => <<"Got SIP re-INVITE from NkSIP">>,
+                from_jid => FromBinary, to_jid => ToBinary,
+                call_id => CallID, sip_req => Req}),
+
     IQEl = jingle_sip_helper:jingle_iq(ToBinary, FromBinary, JingleEl),
     Acc = mongoose_acc:new(#{ location => ?LOCATION,
                               lserver => FromJID#jid.lserver,
@@ -134,14 +158,7 @@ get_action_name_from_sdp(Attrs, Default) ->
 
 
 sip_info(Req, _Call) ->
-    {FromJID, FromBinary} = get_user_from_sip_msg(from, Req),
-    {ToJID, ToBinary} = get_user_from_sip_msg(to, Req),
-
-    CallID = nksip_sipmsg:header(<<"call-id">>, Req),
-    Body = nksip_sipmsg:meta(body, Req),
-
-    ?INFO_MSG("event=sip_info to=~p call_id=~p body:~n~s", [ToBinary, CallID, Body]),
-
+    ?LOG_INFO(#{what => sip_info, sip_req => Req}),
     noreply.
 
 sip_bye(Req, _Call) ->
@@ -159,7 +176,7 @@ sip_bye(Req, _Call) ->
                               from_jid => FromJID,
                               to_jid => ToJID }),
     maybe_route_to_all_sessions(FromJID, ToJID, Acc, IQEl),
-
+    ok = mod_jingle_sip_session:remove_session(CallID),
     {reply, ok}.
 
 sip_cancel(_InviteReq, Req, _Call) ->
@@ -177,7 +194,7 @@ sip_cancel(_InviteReq, Req, _Call) ->
                               from_jid => FromJID,
                               to_jid => ToJID }),
     maybe_route_to_all_sessions(FromJID, ToJID, Acc, IQEl),
-
+    ok = mod_jingle_sip_session:remove_session(CallID),
     {reply, ok}.
 
 sip_dialog_update(start, Dialog, Call) ->
@@ -186,15 +203,11 @@ sip_dialog_update(start, Dialog, Call) ->
     case Transaction#trans.class of
         uas ->
             {ok, CallID} = nksip_dialog:call_id(Dialog),
-            mod_jingle_sip_backend:set_incoming_handle(CallID, DialogHandle);
+            mod_jingle_sip_session:set_incoming_handle(CallID, DialogHandle);
 
         _ ->
             ok
     end,
-    noreply;
-sip_dialog_update(stop, Dialog, _) ->
-    {ok, CallID} = nksip_dialog:call_id(Dialog),
-
     noreply;
 sip_dialog_update(_, _, _) ->
     noreply.
@@ -211,9 +224,9 @@ sip_dialog_update(_, _, _) ->
 %% * 603 - used to decline the INVITE by the reciving side
 %% * all error responses between 400 and 700 result in genering session-terminate reason
 invite_resp_callback({resp, 180, SIPMsg, _Call}) ->
-    send_ringing_session_info(SIPMsg);
+    send_ringing_session_info(SIPMsg, 180);
 invite_resp_callback({resp, 183, SIPMsg, _Call}) ->
-    send_ringing_session_info(SIPMsg);
+    send_ringing_session_info(SIPMsg, 183);
 invite_resp_callback({resp, 200, SIPMsg, _Call}) ->
     {ToJID, ToBinary} = get_user_from_sip_msg(from, SIPMsg),
     {FromJID, FromBinary} = get_user_from_sip_msg(to, SIPMsg),
@@ -221,6 +234,7 @@ invite_resp_callback({resp, 200, SIPMsg, _Call}) ->
     Body = nksip_sipmsg:meta(body, SIPMsg),
     CallID = nksip_sipmsg:header(<<"call-id">>, SIPMsg),
     {CodecMap, SDP} = nksip_sdp_util:extract_codec_map(Body),
+    assert_sdp_record(Body, SDP),
     OtherEls = sip_to_jingle:parse_sdp_attributes(SDP#sdp.attributes),
 
 
@@ -233,7 +247,7 @@ invite_resp_callback({resp, 200, SIPMsg, _Call}) ->
                               element => IQEl,
                               from_jid => FromJID,
                               to_jid => ToJID }),
-    ok = mod_jingle_sip_backend:set_outgoing_accepted(CallID),
+    ok = mod_jingle_sip_session:set_outgoing_accepted(CallID),
     maybe_route_to_all_sessions(FromJID, ToJID, Acc, IQEl),
     ok;
 invite_resp_callback({resp, 487, _SIPMsg, _Call}) ->
@@ -272,25 +286,28 @@ invite_resp_callback({resp, ErrorCode, SIPMsg, _Call})
                               from_jid => FromJID,
                               to_jid => ToJID }),
     maybe_route_to_all_sessions(FromJID, ToJID, Acc, IQEl),
+    ok = mod_jingle_sip_session:remove_session(CallID),
     ok;
-
-
 invite_resp_callback(Data) ->
-    ?ERROR_MSG("Unknown SIP resp: ~p", [Data]).
+    ?LOG_ERROR(#{what => sip_unknown_response, sip_data => Data}).
 
-send_ringing_session_info(SIPMsg) ->
+send_ringing_session_info(SIPMsg, ErrorCode) ->
     %% SIP response contains the same headers as request
     %% That's why we need to switch `from` and `to` when preparing Jingle packet
     {ToJID, ToBinary} = get_user_from_sip_msg(from, SIPMsg),
     {FromJID, FromBinary} = get_user_from_sip_msg(to, SIPMsg),
 
     DialogHandle = nksip_sipmsg:meta(dialog_handle, SIPMsg),
-    CallID = nksip_sipmsg:header(<<"call-id">>, SIPMsg),
+    {SrvId, DialogId, CallID} = nksip_dialog_lib:parse_handle(DialogHandle),
+    ?LOG_INFO(#{what => sip_invite_resp_callback, error_code => ErrorCode,
+                call_id => CallID, sip_req => SIPMsg,
+                dialog_id => DialogId, server_id => SrvId,
+                from_jid => FromBinary, to_binary => ToBinary}),
 
-    mod_jingle_sip_backend:set_outgoing_handle(CallID, DialogHandle, FromJID, ToJID),
+    mod_jingle_sip_session:set_outgoing_handle(CallID, DialogHandle, FromJID, ToJID),
 
     RingingEl = #xmlel{name = <<"ringing">>,
-                       attrs = [{<<"xmlns">>, <<"urn:xmpp:jingle:apps:rtp:info:1">>}]},
+                       attrs = #{<<"xmlns">> => <<"urn:xmpp:jingle:apps:rtp:info:1">>}},
     JingleEl = jingle_sip_helper:jingle_element(CallID, <<"session-info">>, [RingingEl]),
     IQEl = jingle_sip_helper:jingle_iq(ToBinary, FromBinary, JingleEl),
     Acc = mongoose_acc:new(#{ location => ?LOCATION,
@@ -320,7 +337,7 @@ path_to_res(Other) ->
 make_session_terminate_reason_el(ErrorCode, #sipmsg{class = {resp, ErrorCode, Binary}}) ->
     Reason = #xmlel{name = <<"general-error">>},
     Details = #xmlel{name = <<"sip-error">>,
-                     attrs = [{<<"code">>, integer_to_binary(ErrorCode)}],
+                     attrs = #{<<"code">> => integer_to_binary(ErrorCode)},
                      children = [#xmlcdata{content = Binary}]},
     #xmlel{name = <<"reason">>,
            children = [Reason, Details]}.
@@ -332,3 +349,8 @@ maybe_route_to_all_sessions(From, To, Acc, Packet) ->
               ejabberd_router:route(From, jid:replace_resource(To, R), Acc, Packet)
       end, PResources).
 
+
+assert_sdp_record(_Body, #sdp{}) ->
+    ok;
+assert_sdp_record(Body, SDP) ->
+    error({assert_sdp_record, Body, SDP}).

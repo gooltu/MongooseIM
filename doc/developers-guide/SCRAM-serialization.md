@@ -16,13 +16,13 @@ The SCRAM format can vary depending on the SHA algorithms that are used for SCRA
 Salt and iteration count is common for different SHA types.
 Stored Key and Server Key are specific to a given SHA and are following a SHA prefix that is indicating which SHA they belong to.
 
-In order to learn more about the meaning of the Stored Key, Server Key, Salt and Iteration Count, please check [the SCRAM specification](https://tools.ietf.org/html/rfc5802).
+In order to learn more about the meaning of the Stored Key, Server Key, Salt and Iteration Count, please check [the SCRAM specification][the SCRAM specification].
 
 ### Example
 
 * *Password:* `padthai`
 * *Erlang map:*
-```
+```erlang
 #{iteration_count => 4096,
   sha =>
       #{salt => <<"QClQsw/sfPEnwj4AEp6E1w==">>,
@@ -75,10 +75,19 @@ The SCRAM format that was used can be seen below.
 * `<salt>` - Base64-encoded Salt
 * `<iteration count>` - Iteration Count formatted as a human-readable integer
 
-In order to learn more about the meaning of the Stored Key, Server Key, Salt and Iteration Count, please check [the SCRAM specification](https://tools.ietf.org/html/rfc5802).
+In order to learn more about the meaning of the Stored Key, Server Key, Salt and Iteration Count, please check [the SCRAM specification][the SCRAM specification].
 
 ### Example
 
 * *Password:* `misio`
 * *Erlang record:* `#scram{ storedkey = <<"tmi5IE+9pceRV/jkPLFHEaVY33c=">>, serverkey = <<"MiWNa8T3dniVDwmh77ufJ41fpAQ=">>, salt = <<"inKXODlSY5y5SCsLxibi0w==">>, iterationcount = 4096 }`
 * *Serialized password:* `==SCRAM==,tmi5IE+9pceRV/jkPLFHEaVY33c=,MiWNa8T3dniVDwmh77ufJ41fpAQ=,inKXODlSY5y5SCsLxibi0w==,4096`
+
+[the SCRAM specification]: https://tools.ietf.org/html/rfc5802
+
+## Known issues
+### SCRAM hash calculation issue in MongooseIM 4.1.0–6.3.1
+
+If you are using MongooseIM 4.1.0 to 6.3.1 with SCRAM authentication and have OpenSSL >=3.4.1 installed, hashes for algorithms stronger than SHA-1 are calculated incorrectly.
+To fix this issue, you must upgrade to MongooseIM 6.3.2, which includes `fast_pbkdf2` version 2.0 with the bug fixed or downgrade OpenSSL to a version lower than 3.4.1.
+After applying one of these fixes, all affected users must reset their passwords, as the previously stored hashes are incorrect.

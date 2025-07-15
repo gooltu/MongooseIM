@@ -27,29 +27,34 @@
 -author('alexey@process-one.net').
 
 %% External exports
--behaviour(ejabberd_gen_auth).
+-behaviour(mongoose_gen_auth).
+
 -export([start/1,
          stop/1,
-         set_password/3,
+         set_password/4,
          authorize/1,
-         try_register/3,
-         dirty_get_registered_users/0,
-         get_vh_registered_users/1,
-         get_vh_registered_users/2,
-         get_vh_registered_users_number/1,
-         get_vh_registered_users_number/2,
-         get_password/2,
-         get_password_s/2,
-         does_user_exist/2,
-         remove_user/2,
-         supports_sasl_module/2
+         try_register/4,
+         get_registered_users/3,
+         get_registered_users_number/3,
+         get_password/3,
+         get_password_s/3,
+         does_user_exist/3,
+         remove_user/3,
+         remove_domain/2,
+         supports_sasl_module/2,
+         supported_features/0
         ]).
 
 -export([scram_passwords/0]).
 
 %% Internal
--export([check_password/3,
-         check_password/5]).
+-export([check_password/4,
+         check_password/6]).
+
+%% Utilities
+-export([dirty_get_registered_users/0]).
+
+-ignore_xref([dirty_get_registered_users/0, scram_passwords/0]).
 
 -include("mongoose.hrl").
 -include("scram.hrl").
@@ -72,28 +77,25 @@
 %%% API
 %%%----------------------------------------------------------------------
 
--spec start(Host :: jid:server()) -> ok.
-start(Host) ->
-    mnesia:create_table(passwd, [{disc_copies, [node()]},
-                                 {attributes, record_info(fields, passwd)},
-                                 {storage_properties,
-                                  [{ets, [{read_concurrency, true}]}]}
-                                  ]),
-    mnesia:create_table(reg_users_counter,
-                        [{ram_copies, [node()]},
-                         {attributes, record_info(fields, reg_users_counter)}]),
-    mnesia:add_table_copy(passwd, node(), disc_copies),
-    mnesia:add_table_copy(reg_users_counter, node(), ram_copies),
-    update_reg_users_counter_table(Host),
+-spec start(HostType :: mongooseim:host_type()) -> ok.
+start(HostType) ->
+    mongoose_mnesia:create_table(passwd,
+        [{disc_copies, [node()]},
+         {attributes, record_info(fields, passwd)},
+         {storage_properties, [{ets, [{read_concurrency, true}]}]}]),
+    mongoose_mnesia:create_table(reg_users_counter,
+        [{ram_copies, [node()]},
+         {attributes, record_info(fields, reg_users_counter)}]),
+    update_reg_users_counter_table(HostType),
     ok.
 
--spec stop(Host :: jid:server()) -> ok.
-stop(_Host) ->
+-spec stop(HostType :: mongooseim:host_type()) -> ok.
+stop(_HostType) ->
     ok.
 
 -spec update_reg_users_counter_table(Server :: jid:server()) -> any().
 update_reg_users_counter_table(Server) ->
-    Set = get_vh_registered_users(Server),
+    Set = get_users(Server),
     Size = length(Set),
     LServer = jid:nameprep(Server),
     F = fun() ->
@@ -101,20 +103,21 @@ update_reg_users_counter_table(Server) ->
         end,
     mnesia:sync_dirty(F).
 
--spec supports_sasl_module(jid:lserver(), cyrsasl:sasl_module()) -> boolean().
-supports_sasl_module(_Host, cyrsasl_plain) -> true;
-supports_sasl_module(Host, cyrsasl_digest) -> not mongoose_scram:enabled(Host);
-supports_sasl_module(Host, Mechanism) -> mongoose_scram:enabled(Host, Mechanism).
+-spec supports_sasl_module(mongooseim:host_type(), cyrsasl:sasl_module()) -> boolean().
+supports_sasl_module(_HostType, cyrsasl_plain) -> true;
+supports_sasl_module(HostType, cyrsasl_digest) -> not mongoose_scram:enabled(HostType);
+supports_sasl_module(HostType, Mechanism) -> mongoose_scram:enabled(HostType, Mechanism).
 
 -spec authorize(mongoose_credentials:t()) -> {ok, mongoose_credentials:t()}
                                            | {error, any()}.
 authorize(Creds) ->
     ejabberd_auth:authorize_with_check_password(?MODULE, Creds).
 
--spec check_password(LUser :: jid:luser(),
+-spec check_password(HostType :: mongooseim:host_type(),
+                     LUser :: jid:luser(),
                      LServer :: jid:lserver(),
                      Password :: binary()) -> boolean().
-check_password(LUser, LServer, Password) ->
+check_password(_HostType, LUser, LServer, Password) ->
     US = {LUser, LServer},
     case catch dirty_read_passwd(US) of
         [#passwd{password = Scram}] when is_map(Scram) orelse is_record(Scram, scram) ->
@@ -126,12 +129,13 @@ check_password(LUser, LServer, Password) ->
     end.
 
 
--spec check_password(LUser :: jid:luser(),
+-spec check_password(HostType :: mongooseim:host_type(),
+                     LUser :: jid:luser(),
                      LServer :: jid:lserver(),
                      Password :: binary(),
                      Digest :: binary(),
                      DigestGen :: fun()) -> boolean().
-check_password(LUser, LServer, Password, Digest, DigestGen) ->
+check_password(_HostType, LUser, LServer, Password, Digest, DigestGen) ->
     US = {LUser, LServer},
     case catch dirty_read_passwd(US) of
         [#passwd{password = Scram}] when is_record(Scram, scram) orelse is_map(Scram) ->
@@ -143,32 +147,30 @@ check_password(LUser, LServer, Password, Digest, DigestGen) ->
     end.
 
 
--spec set_password(LUser :: jid:luser(),
+-spec set_password(HostType :: mongooseim:host_type(),
+                   LUser :: jid:luser(),
                    LServer :: jid:lserver(),
                    Password :: binary()) -> ok | {error, not_allowed | invalid_jid}.
-set_password(LUser, LServer, Password) ->
+set_password(HostType, LUser, LServer, Password) ->
     US = {LUser, LServer},
     F = fun() ->
-        Password2 = case mongoose_scram:enabled(LServer) of
-                        true ->
-                            mongoose_scram:password_to_scram(LServer, Password, mongoose_scram:iterations(LServer));
-                        false -> Password
-                    end,
+        Password2 = get_scram(HostType, Password),
         write_passwd(#passwd{us = US, password = Password2})
     end,
     {atomic, ok} = mnesia:transaction(F),
     ok.
 
--spec try_register(LUser :: jid:luser(),
+-spec try_register(HostType :: mongooseim:host_type(),
+                   LUser :: jid:luser(),
                    LServer :: jid:lserver(),
                    Password :: binary()
                    ) -> ok | {error, exists | not_allowed}.
-try_register(LUser, LServer, Password) ->
+try_register(HostType, LUser, LServer, Password) ->
     US = {LUser, LServer},
     F = fun() ->
         case read_passwd(US) of
             [] ->
-                Password2 = get_scram(LServer, Password),
+                Password2 = get_scram(HostType, Password),
                 write_passwd(#passwd{us = US, password = Password2}),
                 mnesia:dirty_update_counter(reg_users_counter, LServer, 1),
                 ok;
@@ -182,7 +184,8 @@ try_register(LUser, LServer, Password) ->
         {atomic, exists} ->
             {error, exists};
         Result ->
-            ?ERROR_MSG("transaction_result=~p", [Result]),
+            ?LOG_ERROR(#{what => registration_error,
+                         user => LUser, server => LServer, reason => Result}),
             {error, not_allowed}
     end.
 
@@ -192,48 +195,44 @@ try_register(LUser, LServer, Password) ->
 dirty_get_registered_users() ->
     mnesia:dirty_all_keys(passwd).
 
-
--spec get_vh_registered_users(LServer :: jid:lserver()
-                             ) -> [jid:simple_bare_jid()].
-get_vh_registered_users(LServer) ->
+-spec get_users(LServer :: jid:lserver()) -> [jid:simple_bare_jid()].
+get_users(LServer) ->
     mnesia:dirty_select(
       passwd,
       [{#passwd{us = '$1', _ = '_'},
         [{'==', {element, 2, '$1'}, LServer}],
         ['$1']}]).
 
+get_registered_users(_, LServer, Opts) ->
+    get_users(LServer, Opts).
+
 -type query_keyword() :: from | to | limit | offset | prefix.
 -type query_value() :: integer() | binary().
--spec get_vh_registered_users(LServer :: jid:lserver(),
-                              Query :: [{query_keyword(), query_value()}]
-                              ) -> [jid:simple_bare_jid()].
-get_vh_registered_users(LServer, [{from, Start}, {to, End}])
+-spec get_users(LServer :: jid:lserver(),
+                Query :: [{query_keyword(), query_value()}]
+               ) -> [jid:simple_bare_jid()].
+get_users(LServer, [{from, Start}, {to, End}])
         when is_integer(Start) and is_integer(End) ->
-    get_vh_registered_users(LServer, [{limit, End-Start+1}, {offset, Start}]);
-get_vh_registered_users(LServer, [{limit, Limit}, {offset, Offset}])
+    get_users(LServer, [{limit, End-Start+1}, {offset, Start}]);
+get_users(LServer, [{limit, Limit}, {offset, Offset}])
         when is_integer(Limit) and is_integer(Offset) ->
-    get_vh_registered_users_within_interval(get_vh_registered_users(LServer),
-                                            Limit, Offset);
-get_vh_registered_users(LServer, [{prefix, Prefix}])
+    get_users_within_interval(get_users(LServer), Limit, Offset);
+get_users(LServer, [{prefix, Prefix}])
         when is_binary(Prefix) ->
-    Set = [{U, S} || {U, S} <- get_vh_registered_users(LServer),
-                    binary:part(U, 0, bit_size(Prefix)) =:= Prefix],
-    lists:keysort(1, Set);
-get_vh_registered_users(LServer, [{prefix, Prefix}, {from, Start}, {to, End}])
+    Users = matching_users(Prefix, get_users(LServer)),
+    lists:keysort(1, Users);
+get_users(LServer, [{prefix, Prefix}, {from, Start}, {to, End}])
         when is_binary(Prefix) and is_integer(Start) and is_integer(End) ->
-    get_vh_registered_users(LServer, [{prefix, Prefix}, {limit, End-Start+1}, {offset, Start}]);
-get_vh_registered_users(LServer, [{prefix, Prefix}, {limit, Limit}, {offset, Offset}])
+    get_users(LServer, [{prefix, Prefix}, {limit, End-Start+1}, {offset, Start}]);
+get_users(LServer, [{prefix, Prefix}, {limit, Limit}, {offset, Offset}])
         when is_binary(Prefix) and is_integer(Limit) and is_integer(Offset) ->
-    UsersWithTheGivenPrefix = [{U, S} || {U, S} <- get_vh_registered_users(LServer),
-                                      binary:part(U, 0, bit_size(Prefix)) =:= Prefix],
-    get_vh_registered_users_within_interval(UsersWithTheGivenPrefix, Limit, Offset);
-get_vh_registered_users(LServer, _) ->
-    get_vh_registered_users(LServer).
+    Users = matching_users(Prefix, get_users(LServer)),
+    get_users_within_interval(Users, Limit, Offset);
+get_users(LServer, _) ->
+    get_users(LServer).
 
-
--spec get_vh_registered_users_number(LServer :: jid:server()
-                                    ) -> non_neg_integer().
-get_vh_registered_users_number(LServer) ->
+-spec get_users_number(LServer :: jid:server()) -> non_neg_integer().
+get_users_number(LServer) ->
     Query = mnesia:dirty_select(
                 reg_users_counter,
                 [{#reg_users_counter{vhost = LServer, count = '$1'},
@@ -245,20 +244,23 @@ get_vh_registered_users_number(LServer) ->
         _ -> 0
     end.
 
+get_registered_users_number(_, LServer, Query) ->
+    get_users_number(LServer, Query).
 
--spec get_vh_registered_users_number(LServer :: jid:lserver(),
-                                     Query :: [{prefix, binary()}]
-                                     ) -> integer().
-get_vh_registered_users_number(LServer, [{prefix, Prefix}]) when is_binary(Prefix) ->
-    Set = [{U, S} || {U, S} <- get_vh_registered_users(LServer),
-                     binary:part(U, 0, bit_size(Prefix)) =:= Prefix],
-    length(Set);
-get_vh_registered_users_number(LServer, _) ->
-    get_vh_registered_users_number(LServer).
+-spec get_users_number(LServer :: jid:lserver(), Query :: [{prefix, binary()}]) -> integer().
+get_users_number(LServer, [{prefix, Prefix}]) when is_binary(Prefix) ->
+    length(matching_users(Prefix, get_users(LServer)));
+get_users_number(LServer, _) ->
+    get_users_number(LServer).
 
--spec get_password(LUser :: jid:luser(),
-                   LServer :: jid:lserver()) -> ejabberd_auth:passterm() | false.
-get_password(LUser, LServer) ->
+matching_users(Prefix, Users) ->
+    lists:filter(fun({U, _S}) ->
+                         binary:longest_common_prefix([U, Prefix]) =:= byte_size(Prefix)
+                 end, Users).
+
+-spec get_password(mongooseim:host_type(), jid:luser(), jid:lserver()) ->
+          ejabberd_auth:passterm() | false.
+get_password(_, LUser, LServer) ->
     US = {LUser, LServer},
     case catch dirty_read_passwd(US) of
         [#passwd{password = Scram}] when is_record(Scram, scram) ->
@@ -271,9 +273,8 @@ get_password(LUser, LServer) ->
             false
     end.
 
--spec get_password_s(LUser :: jid:luser(),
-                     LServer :: jid:lserver()) -> binary().
-get_password_s(LUser, LServer) ->
+-spec get_password_s(mongooseim:host_type(), jid:luser(), jid:lserver()) -> binary().
+get_password_s(_HostType, LUser, LServer) ->
     US = {LUser, LServer},
     case catch dirty_read_passwd(US) of
         [#passwd{password = Scram}] when is_record(Scram, scram) ->
@@ -286,10 +287,9 @@ get_password_s(LUser, LServer) ->
             <<"">>
     end.
 
--spec does_user_exist(LUser :: jid:luser(),
-                     LServer :: jid:lserver()
-                     ) -> boolean() | {error, atom()}.
-does_user_exist(LUser, LServer) ->
+-spec does_user_exist(mongooseim:host_type(), jid:luser(), jid:lserver()) ->
+          boolean() | {error, atom()}.
+does_user_exist(_HostType, LUser, LServer) ->
     US = {LUser, LServer},
     case catch dirty_read_passwd(US) of
         [] ->
@@ -303,10 +303,8 @@ does_user_exist(LUser, LServer) ->
 
 %% @doc Remove user.
 %% Note: it returns ok even if there was some problem removing the user.
--spec remove_user(LUser :: jid:luser(),
-                  LServer :: jid:lserver()
-                  ) -> ok | {error, not_allowed}.
-remove_user(LUser, LServer) ->
+-spec remove_user(mongooseim:host_type(), jid:luser(), jid:lserver()) -> ok | {error, not_allowed}.
+remove_user(_HostType, LUser, LServer) ->
     US = {LUser, LServer},
     F = fun() ->
                 mnesia:delete({passwd, US}),
@@ -316,15 +314,30 @@ remove_user(LUser, LServer) ->
     mnesia:transaction(F),
     ok.
 
+-spec remove_domain(mongooseim:host_type(), jid:lserver()) -> ok.
+remove_domain(_HostType, LServer) ->
+    Users = get_users(LServer),
+    F = fun() ->
+                lists:foreach(fun(User) ->
+                    mnesia:delete({passwd, User}),
+                    mnesia:dirty_update_counter(reg_users_counter,
+                                                LServer, -1)
+                end, Users)
+        end,
+    mnesia:transaction(F),
+    ok.
+
 -spec scram_passwords() -> {atomic, ok}.
 scram_passwords() ->
-    ?INFO_MSG("Converting the stored passwords into SCRAM bits", []),
+    ?LOG_INFO(#{what => <<"scram_passwords">>,
+                text => <<"Converting the stored passwords into SCRAM bits">>}),
     Fields = record_info(fields, passwd),
     {atomic, ok} = mnesia:transform_table(passwd, fun scramming_function/1, Fields).
 
 -spec scramming_function(passwd()) -> passwd().
 scramming_function(#passwd{us = {_, Server}, password = Password} = P) ->
-    Scram = mongoose_scram:password_to_scram(Server, Password, mongoose_scram:iterations(Server)),
+    {ok, HostType} = mongoose_domain_api:get_domain_host_type(Server),
+    Scram = mongoose_scram:password_to_scram(HostType, Password, mongoose_scram:iterations(HostType)),
     P#passwd{password = Scram}.
 
 -spec dirty_read_passwd(US :: jid:simple_bare_jid()) -> [passwd()].
@@ -343,19 +356,20 @@ write_passwd(#passwd{} = Passwd) ->
 write_counter(#reg_users_counter{} = Counter) ->
     mnesia:write(Counter).
 
--spec get_scram(jid:lserver(), binary()) -> mongoose_scram:scram() | binary().
-get_scram(LServer, Password) ->
-    case mongoose_scram:enabled(LServer) and is_binary(Password) of
+-spec get_scram(binary(), binary()) -> mongoose_scram:scram() | binary().
+get_scram(HostType, Password) ->
+    case mongoose_scram:enabled(HostType) and is_binary(Password) of
         true ->
-            mongoose_scram:password_to_scram(LServer, Password, mongoose_scram:iterations(LServer));
+            Iterations = mongoose_scram:iterations(HostType),
+            mongoose_scram:password_to_scram(HostType, Password, Iterations);
         false -> Password
     end.
 
--spec get_vh_registered_users_within_interval(list(), integer(), integer()) ->
-                                                    list().
-get_vh_registered_users_within_interval([], _Limit, _Offset) -> [];
-get_vh_registered_users_within_interval(Users, Limit, Offset) ->
-    Set = lists:keysort(1, Users),
-    Length = length(Set),
-    Start = min(1, max(Offset, Length)),
-    lists:sublist(Set, Start, Limit).
+-spec get_users_within_interval(list(), integer(), integer()) -> list().
+get_users_within_interval([], _Limit, _Offset) -> [];
+get_users_within_interval(Users, Limit, Offset) ->
+    SortedUsers = lists:keysort(1, Users),
+    lists:sublist(SortedUsers, Offset, Limit).
+
+-spec supported_features() -> [atom()].
+supported_features() -> [dynamic_domains].

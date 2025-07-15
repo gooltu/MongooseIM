@@ -34,23 +34,39 @@
          make_filter/3,
          get_state/2,
          case_insensitive_match/2,
-         get_mod_opt/2,
-         get_mod_opt/3,
-         get_mod_opt/4,
-         get_base/1,
-         get_deref_aliases/1,
-         get_uids/2,
-         get_user_filter/2,
+         deref_aliases/1,
+         process_user_filter/2,
          get_search_filter/1,
-         get_dn_filter_with_attrs/1,
          decode_octet_string/3,
          uids_domain_subst/2,
          singleton_value/1,
          maybe_list2b/1,
          maybe_b2list/1]).
 
--include("mongoose.hrl").
--include("eldap.hrl").
+-ignore_xref([decode_octet_string/3, generate_subfilter/1, make_filter/2, uids_domain_subst/2]).
+
+%% Used to be eldap:filter()
+-type filter() :: term().
+
+%% Used to be eldap:eldap_entry()
+-type eldap_entry() :: term().
+
+%% Used to be eldap:handle()
+-type handle() :: term().
+
+-export_type([handle/0,
+              filter/0,
+              eldap_entry/0]).
+
+-type dn() :: binary().
+-type deref() :: neverDerefAliases | derefInSearching
+                 | derefFindingBaseObj | derefAlways.
+%% Used to access mongoose_wpool
+-type eldap_id() :: {HostType :: mongooseim:host_type(), Tag :: mongoose_wpool:tag()}.
+
+-export_type([dn/0,
+              deref/0,
+              eldap_id/0]).
 
 %% @doc Generate an 'or' LDAP query on one or several attributes
 %% If there is only one attribute
@@ -175,7 +191,7 @@ match_filter_name({<<"%u">>, [Value | _]}, NewUIDs) when Value /= <<"">> ->
   end;
 match_filter_name({Name, [Value | _]}, _NewUIDs) when Value /= <<"">> ->
   case binary:match(Value, <<"*">>) of
-    nomatch -> [eldap:equalityMatch(Name, Value)];
+    nomatch -> [eldap:equalityMatch(maybe_b2list(Name), maybe_b2list(Value))];
     _ -> [eldap:substrings(maybe_b2list(Name),
       generate_substring_list(Value))]
   end;
@@ -183,30 +199,15 @@ match_filter_name(_, _) ->
   [].
 
 -spec case_insensitive_match(binary(), binary()) -> boolean().
-case_insensitive_match(X, Y) ->
-    X1 = string:to_lower(maybe_b2list(X)),
-    Y1 = string:to_lower(maybe_b2list(Y)),
-  case X1 == Y1 of
-    true -> true;
-    _-> false
-  end.
+case_insensitive_match(X, Y) when is_binary(X), is_binary(Y) ->
+    X1 = string:casefold(X),
+    Y1 = string:casefold(Y),
+    X1 =:= Y1.
 
-
--spec get_state(binary() | string(), atom()) -> any().
-get_state(Server, Module) ->
-    Proc = gen_mod:get_module_proc(Server, Module),
+-spec get_state(mongooseim:host_type(), atom()) -> any().
+get_state(HostType, Module) ->
+    Proc = gen_mod:get_module_proc(HostType, Module),
     gen_server:call(Proc, get_state).
-
-process_uids(Uids) ->
-    lists:map(
-      fun({U, P}) ->
-              {iolist_to_binary(U),
-               iolist_to_binary(P)};
-         ({U}) ->
-              {iolist_to_binary(U)};
-         (U) ->
-              {iolist_to_binary(U)}
-      end, lists:flatten(Uids)).
 
 
 %% @doc From the list of uids attribute: we look from alias domain (%d) and make
@@ -221,66 +222,15 @@ uids_domain_subst(Host, UIDs) ->
               end,
               UIDs).
 
--spec get_mod_opt(atom(), list()) -> any().
-get_mod_opt(Key, Opts) ->
-    get_mod_opt(Key, Opts, fun(Val) -> Val end).
+deref_aliases(never) -> neverDerefAliases;
+deref_aliases(searching) -> derefInSearching;
+deref_aliases(finding) -> derefFindingBaseObj;
+deref_aliases(always) -> derefAlways.
 
--spec get_mod_opt(atom(), list(), fun()) -> any().
-get_mod_opt(Key, Opts, F) ->
-    get_mod_opt(Key, Opts, F, undefined).
-
-
--spec get_mod_opt(atom(), list(), fun(), any()) -> any().
-get_mod_opt(Key, Opts, F, Default) ->
-    case gen_mod:get_opt(Key, Opts, Default) of
-        Default ->
-            Default;
-        Val ->
-            prepare_opt_val(Key, Val, F, Default)
-    end.
-
-
--type check_fun() :: fun((any()) -> any()) | {module(), atom()}.
--spec prepare_opt_val(any(), any(), check_fun(), any()) -> any().
-prepare_opt_val(Opt, Val, F, Default) ->
-    Res = case F of
-              {Mod, Fun} ->
-                  catch Mod:Fun(Val);
-              _ ->
-                  catch F(Val)
-          end,
-    case Res of
-        {'EXIT', _} ->
-            ?ERROR_MSG("Configuration problem:~n"
-                      "** Option: ~p~n"
-                      "** Invalid value: ~p~n"
-                      "** Using as fallback: ~p",
-                      [ Opt,
-                        Val,
-                        Default]),
-            Default;
-        _ ->
-            Res
-    end.
-
-get_base(Opts) ->
-    get_mod_opt(ldap_base, Opts, fun iolist_to_binary/1, <<"">>).
-
-get_deref_aliases(Opts) ->
-    get_mod_opt(ldap_deref, Opts, fun(never) -> neverDerefAliases;
-                                     (searching) -> derefInSearching;
-                                     (finding) -> derefFindingBaseObj;
-                                     (always) -> derefAlways
-                                  end, neverDerefAliases).
-
-get_uids(Host, Opts) ->
-    UIDsTemp = get_mod_opt(ldap_uids, Opts, fun process_uids/1, [{<<"uid">>, <<"%u">>}]),
-    uids_domain_subst(Host, UIDsTemp).
-
-get_user_filter(UIDs, Opts) ->
+process_user_filter(UIDs, RawUserFilter) ->
     SubFilter = generate_subfilter(UIDs),
-    case get_mod_opt(ldap_filter, Opts, fun check_filter/1, <<"">>) of
-        <<"">> ->
+    case RawUserFilter of
+        <<>> ->
             SubFilter;
         F ->
             <<"(&", SubFilter/binary, F/binary, ")">>
@@ -288,23 +238,6 @@ get_user_filter(UIDs, Opts) ->
 
 get_search_filter(UserFilter) ->
     eldap_filter:do_sub(UserFilter, [{<<"%u">>, <<"*">>}]).
-
-get_dn_filter_with_attrs(Opts) ->
-    get_mod_opt(ldap_dn_filter, Opts,
-                fun({DNF, DNFA}) ->
-                        NewDNFA = case DNFA of
-                                      undefined -> [];
-                                      _ -> [iolist_to_binary(A) || A <- DNFA]
-                                  end,
-                        NewDNF = check_filter(DNF),
-                        {NewDNF, NewDNFA}
-                end, {undefined, []}).
-
--spec check_filter(F :: iolist()) -> binary().
-check_filter(F) ->
-    NewF = iolist_to_binary(F),
-    {ok, _} = eldap_filter:parse(NewF),
-    NewF.
 
 -spec singleton_value(list()) -> {binary(), binary()} | false.
 singleton_value([{K, [V]}]) ->

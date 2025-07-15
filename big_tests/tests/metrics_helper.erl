@@ -1,38 +1,14 @@
 -module(metrics_helper).
 
--include_lib("common_test/include/ct.hrl").
-
--compile(export_all).
+-compile([export_all, nowarn_export_all]).
 
 -import(distributed_helper, [mim/0, mim2/0,
                              rpc/4]).
 
 %% We introduce a convention, where metrics-related suites use only 2 accounts
 %% but it depends on `all_metrics_are_global` flag, which duet it will be.
--define(WAIT_TIME, 500).
 -define(METRICS_GROUP_USERS, [alice, bob]).
 -define(ONLY_GLOBAL_METRICS_GROUP_USERS, [clusterguy, clusterbuddy]).
-
-get_counter_value(CounterName) ->
-    get_counter_value(ct:get_config({hosts, mim, domain}), CounterName).
-
-get_counter_value(Host, Metric) ->
-    case rpc(mim(), mongoose_metrics, get_metric_value, [Host, Metric]) of
-        {ok, [{count, Total}, {one, _}]} ->
-            {value, Total};
-        {ok, [{value, Value} | _]} when is_integer(Value) ->
-            {value, Value};
-        {ok, Value} ->
-            {value, Value};
-        _ ->
-            {error, unknown_counter}
-    end.
-
-assert_counter(Value, CounterName) ->
-    assert_counter(ct:get_config({hosts, mim, domain}), Value, CounterName).
-
-assert_counter(Host, Value, CounterName) ->
-    {value, Value} = get_counter_value(Host, CounterName).
 
 -spec prepare_by_all_metrics_are_global(Config :: list(), UseAllMetricsAreGlobal :: boolean()) ->
     list().
@@ -44,11 +20,11 @@ prepare_by_all_metrics_are_global(Config, true) ->
     Config2 = distributed_helper:add_node_to_cluster(mim2(), Config1),
     escalus:create_users(Config2, escalus:get_users(?ONLY_GLOBAL_METRICS_GROUP_USERS)).
 
--spec finalise_by_all_metrics_are_global(Config :: list(), UseAllMetricsAreGlobal :: boolean()) ->
+-spec finalize_by_all_metrics_are_global(Config :: list(), UseAllMetricsAreGlobal :: boolean()) ->
     list().
-finalise_by_all_metrics_are_global(Config, false) ->
+finalize_by_all_metrics_are_global(Config, false) ->
     escalus:delete_users(Config, escalus:get_users(?METRICS_GROUP_USERS));
-finalise_by_all_metrics_are_global(Config, true) ->
+finalize_by_all_metrics_are_global(Config, true) ->
     Config1 = lists:keydelete(all_metrics_are_global, 1, Config),
     %% TODO: Refactor once escalus becomes compatible with multiple nodes RPC
     distributed_helper:remove_node_from_cluster(mim2(), Config1),
@@ -61,19 +37,10 @@ all_metrics_are_global(Config) ->
         _ -> false
     end.
 
-make_global_group_name(GN) ->
-    list_to_atom(atom_to_list(GN) ++ "_all_metrics_are_global").
-
-make_global_groups_names(GroupsNames) ->
-    [{group, make_global_group_name(GN)} || GN <- GroupsNames].
-
-make_global_groups(Groups) ->
-    [{make_global_group_name(GN), Opts, Cases} || {GN, Opts, Cases} <- Groups].
-
 %% Converts legacy userspec format to the new one. In order for this function to work 100%
 %% correctly, the suite has to use (prepare|finalise)_by_all_metrics_are_global.
 %% This function is an abstraction over `all_metrics_are_global` true/false distinction.
-%% It automaticaly picks proper users and the suite provides only a number of resources
+%% It automatically picks proper users and the suite provides only a number of resources
 %% for user 1 and user 2.
 userspec(User1Count, Config) ->
     [User1ID, _] = user_ids(Config),
@@ -89,9 +56,7 @@ user_ids(Config) ->
         _ -> ?METRICS_GROUP_USERS
     end.
 
-wait_for_counter(ExpectedValue, Counter) ->
-        wait_for_counter(ct:get_config({hosts, mim, domain}), ExpectedValue, Counter).
-
-wait_for_counter(Host, ExpectedValue, Counter) ->
-        mongoose_helper:wait_until(fun() -> assert_counter(Host, ExpectedValue, Counter) end, {value, ExpectedValue},
-                                                                   #{name => Counter, time_left => ?WAIT_TIME, sleep_time => 20}).
+make_host_type_name(HT) when is_atom(HT) ->
+    HT;
+make_host_type_name(HT) when is_binary(HT) ->
+    binary:replace(HT, <<" ">>, <<"_">>, [global]).

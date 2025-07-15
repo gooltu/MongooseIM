@@ -16,17 +16,22 @@
 
 %% test cases
 -export([
+         can_start_with_cluster_id_in_cets_only/1,
          all_nodes_in_the_cluster_have_the_same_cluster_id/1,
          id_persists_after_restart/1,
          same_cluster_id_in_backend_and_mnesia/1,
          backed_up_id_if_rdbms_is_added/1,
-         cluster_id_is_restored_to_mnesia_from_rdbms_if_mnesia_lost/1
+         cluster_id_is_restored_to_mnesia_from_rdbms_if_mnesia_lost/1,
+         clean_start_and_two_nodes/1
         ]).
 
 -import(distributed_helper, [mim/0, mim2/0]).
 
+-import(domain_helper, [host_type/0]).
+
 all() ->
     [
+     {group, cets},
      {group, mnesia},
      {group, rdbms}
     ].
@@ -37,11 +42,13 @@ tests() ->
      id_persists_after_restart,
      same_cluster_id_in_backend_and_mnesia,
      backed_up_id_if_rdbms_is_added,
-     cluster_id_is_restored_to_mnesia_from_rdbms_if_mnesia_lost
+     cluster_id_is_restored_to_mnesia_from_rdbms_if_mnesia_lost,
+     clean_start_and_two_nodes
     ].
 
 groups() ->
     [
+     {cets, [], [can_start_with_cluster_id_in_cets_only]},
      {mnesia, [], [all_nodes_in_the_cluster_have_the_same_cluster_id]},
      {rdbms, [], tests()}
     ].
@@ -50,7 +57,7 @@ groups() ->
 %%% Overall setup/teardown
 %%%===================================================================
 init_per_suite(Config) ->
-    Config.
+    distributed_helper:require_rpc_nodes([mim]) ++ Config.
 
 end_per_suite(_Config) ->
     ok.
@@ -61,15 +68,15 @@ end_per_suite(_Config) ->
 group(_Groupname) ->
     [].
 
-init_per_group(mnesia, Config) ->
-    case not mongoose_helper:is_rdbms_enabled(domain()) of
-        true -> Config;
-        false -> {skip, require_no_rdbms}
-    end;
-init_per_group(_Groupname, Config) ->
-    case mongoose_helper:is_rdbms_enabled(domain()) of
+init_per_group(rdbms, Config) ->
+    case mongoose_helper:is_rdbms_enabled(host_type()) of
         true -> Config;
         false -> {skip, require_rdbms}
+    end;
+init_per_group(_, Config) ->
+    case not mongoose_helper:is_rdbms_enabled(host_type()) of
+        true -> Config;
+        false -> {skip, require_no_rdbms}
     end.
 
 end_per_group(_Groupname, _Config) ->
@@ -78,12 +85,19 @@ end_per_group(_Groupname, _Config) ->
 %%%===================================================================
 %%% Testcase specific setup/teardown
 %%%===================================================================
+init_per_testcase(can_start_with_cluster_id_in_cets_only, Config) ->
+    Config1 = ejabberd_node_utils:init(Config),
+    ejabberd_node_utils:backup_config_file(Config1),
+    Config1;
 init_per_testcase(all_nodes_in_the_cluster_have_the_same_cluster_id, Config) ->
     distributed_helper:add_node_to_cluster(mim2(), Config),
     Config;
 init_per_testcase(_TestCase, Config) ->
     Config.
 
+end_per_testcase(can_start_with_cluster_id_in_cets_only, Config) ->
+    ejabberd_node_utils:restore_config_file(Config),
+    ejabberd_node_utils:ensure_started_application(mongooseim);
 end_per_testcase(all_nodes_in_the_cluster_have_the_same_cluster_id, Config) ->
     distributed_helper:remove_node_from_cluster(mim2(), Config),
     Config;
@@ -93,6 +107,20 @@ end_per_testcase(_TestCase, _Config) ->
 %%%===================================================================
 %%% Individual Test Cases (from groups() definition)
 %%%===================================================================
+
+can_start_with_cluster_id_in_cets_only(_Config) ->
+    Toml = "[general]
+    hosts = [\"example.com\"]
+    default_server_domain = \"example.com\"
+    sm_backend = \"cets\"
+    s2s_backend = \"cets\"
+    component_backend = \"cets\"
+    [internal_databases.cets]
+    backend = \"file\"
+    node_list_file = \"etc/cets_disco.txt\"",
+    ejabberd_node_utils:replace_config_file(Toml),
+    ejabberd_node_utils:restart_application(mongooseim).
+
 all_nodes_in_the_cluster_have_the_same_cluster_id(_Config) ->
     {ok, ID_mim1} = mongoose_helper:successful_rpc(
                mim(), mongoose_cluster_id, get_cached_cluster_id, []),
@@ -143,6 +171,25 @@ cluster_id_is_restored_to_mnesia_from_rdbms_if_mnesia_lost(_Config) ->
                Node, mongoose_cluster_id, get_cached_cluster_id, []),
     ?assertEqual(FirstID, SecondID).
 
-
-domain() ->
-    ct:get_config({hosts, mim, domain}).
+clean_start_and_two_nodes(_Config) ->
+    {ok, MnesiaID} = mongoose_helper:successful_rpc(
+           mim(), mongoose_cluster_id, get_cached_cluster_id, []),
+    {ok, MnesiaID2} = mongoose_helper:successful_rpc(
+           mim2(), mongoose_cluster_id, get_cached_cluster_id, []),
+    %% Sanity check: IDs are in sync
+    ?assertEqual(MnesiaID, MnesiaID2),
+    %% Remove an old ID from anywhere
+    ok = mongoose_helper:successful_rpc(
+           mim(), mongoose_cluster_id, clean_table, []),
+    ok = mongoose_helper:successful_rpc(
+           mim(), mongoose_cluster_id, clean_cache, []),
+    ok = mongoose_helper:successful_rpc(
+           mim2(), mongoose_cluster_id, clean_cache, []),
+    {ok, AfterRestartID} = mongoose_helper:successful_rpc(
+           mim(), mongoose_cluster_id, start, []),
+    {ok, AfterRestartID2} = mongoose_helper:successful_rpc(
+           mim2(), mongoose_cluster_id, start, []),
+    %% We've created a new ID
+    ?assertNotEqual(AfterRestartID, MnesiaID),
+    %% Both nodes have the same ID
+    ?assertEqual(AfterRestartID, AfterRestartID2).

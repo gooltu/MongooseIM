@@ -9,19 +9,20 @@
 -behaviour(mongoose_module_metrics).
 %% cowboy_loop is a long polling handler
 -behaviour(cowboy_loop).
+%% Implements mongoose_http_handler, but we cannot add the option
+%% because we would get conflicting config_spec/0 callback warning.
+%% config_spec/0 is not called by mongoose_http_handler, because
+%% mod_bosh is not in a list of configurable HTTP handlers.
+%%-behaviour(mongoose_http_handler).
+
 -xep([{xep, 206}, {version, "1.4"}]).
--xep([{xep, 124}, {version, "1.11"}]).
-%% API
--export([get_inactivity/0,
-         set_inactivity/1,
-         get_max_wait/0,
-         set_max_wait/1,
-         get_server_acks/0,
-         set_server_acks/1]).
+-xep([{xep, 124}, {version, "1.11.2"}]).
 
 %% gen_mod callbacks
 -export([start/2,
-         stop/1]).
+         stop/1,
+         config_spec/0,
+         supported_features/0]).
 
 %% cowboy_loop_handler callbacks
 -export([init/2,
@@ -29,22 +30,25 @@
          terminate/3]).
 
 %% Hooks callbacks
--export([node_cleanup/2]).
+-export([node_cleanup/3]).
 
 %% For testing and debugging
 -export([get_session_socket/1, store_session/2]).
 
+%% mongoose_http_listener callbacks
+-export([instrumentation/0]).
+
 -export([config_metrics/1]).
+
+-ignore_xref([get_session_socket/1, store_session/2, instrumentation/0]).
 
 -include("mongoose.hrl").
 -include("jlib.hrl").
 -include_lib("exml/include/exml_stream.hrl").
 -include("mod_bosh.hrl").
+-include("mongoose_config_spec.hrl").
 
 -define(DEFAULT_MAX_AGE, 1728000).  %% 20 days in seconds
--define(DEFAULT_INACTIVITY, 30).  %% seconds
--define(DEFAULT_MAX_WAIT, infinity).  %% seconds
--define(DEFAULT_SERVER_ACKS, false).
 -define(DEFAULT_ALLOW_ORIGIN, <<"*">>).
 
 -export_type([session/0,
@@ -68,7 +72,7 @@
 -type headers_list() :: [{binary(), binary()}].
 
 %% Request State
--record(rstate, {req_sid}).
+-record(rstate, {req_sid, opts}).
 -type rstate() :: #rstate{}.
 -type req() :: cowboy_req:req().
 
@@ -81,91 +85,85 @@
               | {close, _}
               | {wrong_method, _}.
 
-%% Behaviour callbacks
-
--callback start(list()) -> any().
--callback create_session(mod_bosh:session()) -> any().
--callback delete_session(mod_bosh:sid()) -> any().
--callback get_session(mod_bosh:sid()) -> [mod_bosh:session()].
--callback get_sessions() -> [mod_bosh:session()].
--callback node_cleanup(Node :: atom()) -> any().
-
-%%--------------------------------------------------------------------
-%% API
-%%--------------------------------------------------------------------
-
--spec get_inactivity() -> pos_integer() | infinity.
-get_inactivity() ->
-    gen_mod:get_module_opt(?MYNAME, ?MODULE, inactivity, ?DEFAULT_INACTIVITY).
-
-
-%% @doc Return true if succeeded, false otherwise.
--spec set_inactivity(Seconds :: pos_integer() | infinity) -> boolean().
-set_inactivity(infinity) ->
-    gen_mod:set_module_opt(?MYNAME, ?MODULE, inactivity, infinity);
-set_inactivity(Seconds) when is_integer(Seconds), Seconds > 0 ->
-    gen_mod:set_module_opt(?MYNAME, ?MODULE, inactivity, Seconds).
-
-
--spec get_max_wait() -> pos_integer() | infinity.
-get_max_wait() ->
-    gen_mod:get_module_opt(?MYNAME, ?MODULE, max_wait, ?DEFAULT_MAX_WAIT).
-
-
-%% @doc Return true if succeeded, false otherwise.
--spec set_max_wait(Seconds :: pos_integer() | infinity) -> boolean().
-set_max_wait(infinity) ->
-    gen_mod:set_module_opt(?MYNAME, ?MODULE, max_wait, infinity);
-set_max_wait(Seconds) when is_integer(Seconds), Seconds > 0 ->
-    gen_mod:set_module_opt(?MYNAME, ?MODULE, max_wait, Seconds).
-
-
--spec get_server_acks() -> boolean().
-get_server_acks() ->
-    gen_mod:get_module_opt(?MYNAME, ?MODULE, server_acks, ?DEFAULT_SERVER_ACKS).
-
-
--spec set_server_acks(EnableServerAcks :: boolean()) -> boolean().
-set_server_acks(EnableServerAcks) ->
-    gen_mod:set_module_opt(?MYNAME, ?MODULE, server_acks, EnableServerAcks).
-
 %%--------------------------------------------------------------------
 %% gen_mod callbacks
 %%--------------------------------------------------------------------
 
--spec start(jid:server(), [option()]) -> any().
-start(_Host, Opts) ->
-    try
-        start_backend(Opts),
-        {ok, _Pid} = mod_bosh_socket:start_supervisor(),
-        ejabberd_hooks:add(node_cleanup, global, ?MODULE, node_cleanup, 50)
-    catch
-        error:{badmatch, ErrorReason} ->
-            ErrorReason
+-spec start(mongooseim:host_type(), gen_mod:module_opts()) -> ok.
+start(_HostType, Opts) ->
+    case mod_bosh_socket:is_supervisor_started() of
+        true ->
+            ok; % There is only one backend implementation (mnesia), so it is started globally
+        false ->
+            mod_bosh_backend:start(Opts),
+            {ok, _Pid} = mod_bosh_socket:start_supervisor(),
+            gen_hook:add_handlers(hooks())
     end.
 
-stop(_Host) ->
+-spec stop(mongooseim:host_type()) -> ok.
+stop(_HostType) ->
+    mod_bosh_socket:stop_supervisor(),
+    gen_hook:delete_handlers(hooks()),
     ok.
+
+-spec hooks() -> gen_hook:hook_list().
+hooks() ->
+    [{node_cleanup, global, fun ?MODULE:node_cleanup/3, #{}, 50}].
+
+%% mongoose_http_handler instrumentation
+-spec instrumentation() -> [mongoose_instrument:spec()].
+instrumentation() ->
+    [{mod_bosh_data_sent, #{},
+      #{metrics => #{byte_size => spiral}}},
+     {mod_bosh_data_received, #{},
+      #{metrics => #{byte_size => spiral}}}].
+
+-spec config_spec() -> mongoose_config_spec:config_section().
+config_spec() ->
+    #section{items = #{<<"backend">> => #option{type = atom,
+                                                validate = {module, mod_bosh}},
+                       <<"inactivity">> => #option{type = int_or_infinity,
+                                                   validate = positive},
+                       <<"max_wait">> => #option{type = int_or_infinity,
+                                                 validate = positive},
+                       <<"server_acks">> => #option{type = boolean},
+                       <<"max_pause">> => #option{type = integer,
+                                                  validate = positive}
+                      },
+             defaults = #{<<"backend">> => mnesia,
+                          <<"inactivity">> => 30, % seconds
+                          <<"max_wait">> => infinity, % seconds
+                          <<"server_acks">> => false,
+                          <<"max_pause">> => 120} % seconds
+            }.
+
+-spec supported_features() -> [atom()].
+supported_features() ->
+    [dynamic_domains].
+
 %%--------------------------------------------------------------------
 %% Hooks handlers
 %%--------------------------------------------------------------------
 
-node_cleanup(Acc, Node) ->
+-spec node_cleanup(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: map(),
+    Params :: #{node := node()},
+    Extra :: gen_hook:extra().
+node_cleanup(Acc, #{node := Node}, _) ->
     Res = mod_bosh_backend:node_cleanup(Node),
-    maps:put(?MODULE, Res, Acc).
+    {ok, maps:put(?MODULE, Res, Acc)}.
 
 %%--------------------------------------------------------------------
 %% cowboy_loop_handler callbacks
 %%--------------------------------------------------------------------
 
--type option() :: {atom(), any()}.
--spec init(req(), _Opts :: [option()]) -> {cowboy_loop, req(), rstate()}.
-init(Req, _Opts) ->
-    ?DEBUG("issue=bosh_init", []),
+-spec init(req(), mongoose_http_handler:options()) -> {cowboy_loop, req(), rstate()}.
+init(Req, Opts) ->
+    ?LOG_DEBUG(#{what => bosh_init, req => Req}),
     Msg = init_msg(Req),
     self() ! Msg,
     %% Upgrade to cowboy_loop behaviour to enable long polling
-    {cowboy_loop, Req, #rstate{}}.
+    {cowboy_loop, Req, #rstate{opts = Opts}}.
 
 
 %% ok return keep the handler looping.
@@ -174,7 +172,8 @@ init(Req, _Opts) ->
 info(accept_options, Req, State) ->
     Origin = cowboy_req:header(<<"origin">>, Req),
     Headers = ac_all(Origin),
-    ?DEBUG("OPTIONS response: ~p~n", [Headers]),
+    ?LOG_DEBUG(#{what => bosh_accept_options, headers => Headers,
+                 text => <<"Handle OPTIONS request in Bosh">>}),
     Req1 = cowboy_reply(200, Headers, <<>>, Req),
     {stop, Req1, State};
 info(accept_get, Req, State) ->
@@ -191,28 +190,30 @@ info(forward_body, Req, S) ->
     %%       but the session is identified inside the to-be-parsed element
     {ok, BodyElem} = exml:parse(Body),
     Sid = exml_query:attr(BodyElem, <<"sid">>, <<"missing">>),
-    ?DEBUG("issue=bosh_receive sid=~ts request_body=~p", [Sid, Body]),
+    ?LOG_DEBUG(#{what => bosh_receive, sid => Sid, request_body => Body}),
     %% Remember req_sid, so it can be used to print a debug message in bosh_reply
     forward_body(Req1, BodyElem, S#rstate{req_sid = Sid});
 info({bosh_reply, El}, Req, S) ->
     BEl = exml:to_binary(El),
-    ?DEBUG("issue=bosh_send sid=~ts req_sid=~ts reply_body=~p",
-           [exml_query:attr(El, <<"sid">>, <<"missing">>), S#rstate.req_sid, BEl]),
+    %% 'mod_bosh_data_sent' metric includes 'body' wrapping elements and resending attempts
+    mongoose_instrument:execute(mod_bosh_data_sent, #{}, #{byte_size => byte_size(BEl)}),
+    ?LOG_DEBUG(#{what => bosh_send, req_sid => S#rstate.req_sid, reply_body => BEl,
+                 sid => exml_query:attr(El, <<"sid">>, <<"missing">>)}),
     Headers = bosh_reply_headers(),
     Req1 = cowboy_reply(200, Headers, BEl, Req),
     {stop, Req1, S};
 
 info({close, Sid}, Req, S) ->
-    ?DEBUG("issue=bosh_close sid=~ts", [Sid]),
+    ?LOG_DEBUG(#{what => bosh_close, sid => Sid}),
     Req1 = cowboy_reply(200, [], <<>>, Req),
     {stop, Req1, S};
 info(no_body, Req, State) ->
-    ?DEBUG("issue=bosh_stop reason=missing_request_body req=~p", [Req]),
+    ?LOG_DEBUG(#{what => bosh_stop, reason => missing_request_body, req => Req}),
     Req1 = no_body_error(Req),
     {stop, Req1, State};
 info({wrong_method, Method}, Req, State) ->
-    ?DEBUG("issue=bosh_stop reason=wrong_request_method method=~p req=~p",
-           [Method, Req]),
+    ?LOG_DEBUG(#{what => bosh_stop, reason => wrong_request_method,
+                 method => Method, req => Req}),
     Req1 = method_not_allowed_error(Req),
     {stop, Req1, State};
 info(item_not_found, Req, S) ->
@@ -224,7 +225,7 @@ info(policy_violation, Req, S) ->
 
 
 terminate(_Reason, _Req, _State) ->
-    ?DEBUG("issue=bosh_terminate", []),
+    ?LOG_DEBUG(#{what => bosh_terminate}),
     ok.
 
 %%--------------------------------------------------------------------
@@ -248,11 +249,6 @@ init_msg(Req) ->
         _ ->
             {wrong_method, Method}
     end.
-
--spec start_backend([option()]) -> any().
-start_backend(Opts) ->
-    gen_mod:start_backend_module(mod_bosh, Opts, []),
-    mod_bosh_backend:start(Opts).
 
 -spec to_event_type(exml:element()) -> event_type().
 to_event_type(Body) ->
@@ -295,11 +291,11 @@ check_event_type_streamstrart(Body) ->
 
 -spec forward_body(req(), exml:element(), rstate())
             -> {ok, req(), rstate()} | {stop, req(), rstate()}.
-forward_body(Req, #xmlel{} = Body, S) ->
+forward_body(Req, #xmlel{} = Body, #rstate{opts = Opts} = S) ->
     Type = to_event_type(Body),
     case Type of
         streamstart ->
-            {SessionStarted, Req1} = maybe_start_session(Req, Body),
+            {SessionStarted, Req1} = maybe_start_session(Req, Body, Opts),
             case SessionStarted of
                 true ->
                     {ok, Req1, S};
@@ -314,8 +310,8 @@ forward_body(Req, #xmlel{} = Body, S) ->
                     handle_request(Socket, Type, Body),
                     {ok, Req, S};
                 {error, item_not_found} ->
-                    ?WARNING_MSG("issue=bosh_stop "
-                                 "reason=session_not_found sid=~ts", [Sid]),
+                    ?LOG_WARNING(#{what => bosh_stop, reason => session_not_found,
+                                   sid => Sid}),
                     Req1 = terminal_condition(<<"item-not-found">>, Req),
                     {stop, Req1, S}
             end
@@ -324,6 +320,8 @@ forward_body(Req, #xmlel{} = Body, S) ->
 
 -spec handle_request(pid(), event_type(), exml:element()) -> ok.
 handle_request(Socket, EventType, Body) ->
+    %% 'mod_bosh_data_received' metric includes 'body' wrapping elements
+    mongoose_instrument:execute(mod_bosh_data_received, #{}, #{byte_size => exml:xml_size(Body)}),
     mod_bosh_socket:handle_request(Socket, {EventType, self(), Body}).
 
 
@@ -337,59 +335,67 @@ get_session_socket(Sid) ->
     end.
 
 
--spec maybe_start_session(req(), exml:element()) ->
+-spec maybe_start_session(req(), exml:element(), map()) ->
     {SessionStarted :: boolean(), req()}.
-maybe_start_session(Req, Body) ->
-    Host = exml_query:attr(Body, <<"to">>),
-    case is_known_host(Host) of
-        true ->
-            maybe_start_session_on_known_host(Req, Body);
-        false ->
-            Req1 = terminal_condition(<<"host-unknown">>, Req),
-            {false, Req1}
+maybe_start_session(Req, Body, Opts) ->
+    Domain = exml_query:attr(Body, <<"to">>),
+    case mongoose_domain_api:get_domain_host_type(Domain) of
+        {ok, HostType} ->
+            case gen_mod:is_loaded(HostType, ?MODULE) of
+                true ->
+                    maybe_start_session_on_known_host(HostType, Req, Body, Opts);
+                false ->
+                    {false, terminal_condition(<<"host-unknown">>, Req)}
+            end;
+        {error, not_found} ->
+            {false, terminal_condition(<<"host-unknown">>, Req)}
     end.
 
-maybe_start_session_on_known_host(Req, Body) ->
+-spec maybe_start_session_on_known_host(mongooseim:host_type(), req(), exml:element(), map()) ->
+          {SessionStarted :: boolean(), req()}.
+maybe_start_session_on_known_host(HostType, Req, Body, Opts) ->
     try
-        maybe_start_session_on_known_host_unsafe(Req, Body)
+        maybe_start_session_on_known_host_unsafe(HostType, Req, Body, Opts)
     catch
-        error:Reason ->
+        error:Reason:Stacktrace ->
             %% It's here because something catch-y was here before
-            ?ERROR_MSG("issue=bosh_stop issue=undefined_condition reason=~p",
-                       [Reason]),
+            ?LOG_ERROR(#{what => bosh_stop, issue => undefined_condition,
+                         reason => Reason, stacktrace => Stacktrace}),
             Req1 = terminal_condition(<<"undefined-condition">>, [], Req),
             {false, Req1}
     end.
 
-maybe_start_session_on_known_host_unsafe(Req, Body) ->
+-spec maybe_start_session_on_known_host_unsafe(mongooseim:host_type(), req(), exml:element(), map()) ->
+          {SessionStarted :: boolean(), req()}.
+maybe_start_session_on_known_host_unsafe(HostType, Req, Body, Opts) ->
     %% Version isn't checked as it would be meaningless when supporting
     %% only a subset of the specification.
     {ok, NewBody} = set_max_hold(Body),
     Peer = cowboy_req:peer(Req),
     PeerCert = cowboy_req:cert(Req),
-    start_session(Peer, PeerCert, NewBody),
+    start_session(HostType, Peer, PeerCert, NewBody, Opts),
     {true, Req}.
 
-%% @doc Is the argument locally served host?
-is_known_host(Host) ->
-    Hosts = ejabberd_config:get_global_option(hosts),
-    lists:member(Host, Hosts).
-
--spec start_session(mongoose_transport:peer(), binary() | undefined, exml:element()) -> any().
-start_session(Peer, PeerCert, Body) ->
+-spec start_session(mongooseim:host_type(), mongoose_transport:peer(),
+                    binary() | undefined, exml:element(), map()) -> any().
+start_session(HostType, Peer, PeerCert, Body, Opts) ->
     Sid = make_sid(),
-    {ok, Socket} = mod_bosh_socket:start(Sid, Peer, PeerCert),
+    {ok, Socket} = mod_bosh_socket:start(HostType, Sid, Peer, PeerCert, Opts),
     store_session(Sid, Socket),
     handle_request(Socket, streamstart, Body),
-    ?DEBUG("issue=bosh_start_seassion sid=~ts", [Sid]).
+    ?LOG_DEBUG(#{what => bosh_start_session, sid => Sid}).
 
 -spec store_session(Sid :: sid(), Socket :: pid()) -> any().
 store_session(Sid, Socket) ->
     mod_bosh_backend:create_session(#bosh_session{sid = Sid, socket = Socket}).
 
+%% MUST be unique and unpredictable
+%% https://xmpp.org/extensions/xep-0124.html#security-sidrid
+%% Also, CETS requires to use node as a part of the key
+%% (but if the key is always random CETS is happy with that too)
 -spec make_sid() -> binary().
 make_sid() ->
-    sha:sha1_hex(term_to_binary(make_ref())).
+    binary:encode_hex(crypto:strong_rand_bytes(20), lowercase).
 
 %%--------------------------------------------------------------------
 %% HTTP errors
@@ -426,9 +432,9 @@ terminal_condition(Condition, Details, Req) ->
 -spec terminal_condition_body(binary(), [exml:element()]) -> binary().
 terminal_condition_body(Condition, Children) ->
     exml:to_binary(#xmlel{name = <<"body">>,
-                          attrs = [{<<"type">>, <<"terminate">>},
-                                   {<<"condition">>, Condition},
-                                   {<<"xmlns">>, ?NS_HTTPBIND}],
+                          attrs = #{<<"type">> => <<"terminate">>,
+                                    <<"condition">> => Condition,
+                                    <<"xmlns">> => ?NS_HTTPBIND},
                           children = Children}).
 
 %%--------------------------------------------------------------------
@@ -475,7 +481,10 @@ set_max_hold(Body) ->
 maybe_set_max_hold(1, Body) ->
     {ok, Body};
 maybe_set_max_hold(ClientHold, #xmlel{attrs = Attrs} = Body) when ClientHold > 1 ->
-    NewAttrs = lists:keyreplace(<<"hold">>, 1, Attrs, {<<"hold">>, <<"1">>}),
+    NewAttrs = case Attrs of
+                   #{<<"hold">> := _} -> Attrs#{<<"hold">> => <<"1">>};
+                   _ -> Attrs
+               end,
     {ok, Body#xmlel{attrs = NewAttrs}};
 maybe_set_max_hold(_, _) ->
     {error, invalid_hold}.
@@ -484,6 +493,6 @@ maybe_set_max_hold(_, _) ->
 cowboy_reply(Code, Headers, Body, Req) when is_list(Headers) ->
     cowboy_req:reply(Code, maps:from_list(Headers), Body, Req).
 
-config_metrics(Host) ->
-    OptsToReport = [{backend, mnesia}], %list of tuples {option, defualt_value}
-    mongoose_module_metrics:opts_for_module(Host, ?MODULE, OptsToReport).
+-spec config_metrics(mongooseim:host_type()) -> [{gen_mod:opt_key(), gen_mod:opt_value()}].
+config_metrics(HostType) ->
+    mongoose_module_metrics:opts_for_module(HostType, ?MODULE, [backend]).

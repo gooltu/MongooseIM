@@ -1,0 +1,318 @@
+[general]
+  loglevel = "warning"
+  hosts = [
+    "localhost",
+    "anonymous.localhost",
+    "localhost.bis"
+  ]
+  default_server_domain = "localhost"
+  registration_timeout = "infinity"
+  language = "en"
+  sm_backend = "mnesia"
+
+[internal_databases.mnesia]
+
+[internal_databases.cets]
+
+[[listen.http]]
+  port = 5280
+  transport.num_acceptors = 10
+  transport.max_connections = 1024
+
+  [[listen.http.handlers.mod_bosh]]
+    host = "_"
+    path = "/http-bind"
+
+  [[listen.http.handlers.mod_websockets]]
+    host = "_"
+    path = "/ws-xmpp"
+
+[[listen.http]]
+  port = 5285
+  transport.num_acceptors = 10
+  transport.max_connections = 1024
+  tls.certfile = "priv/cert.pem"
+  tls.keyfile = "priv/dc1.pem"
+  tls.password = ""
+  tls.verify_mode = "none"
+
+  [[listen.http.handlers.mongoose_admin_api]]
+    host = "localhost"
+    path = "/api"
+    username = "ala"
+    password = "makotaipsa"
+
+  [[listen.http.handlers.mod_bosh]]
+    host = "_"
+    path = "/http-bind"
+
+  [[listen.http.handlers.mod_websockets]]
+    host = "_"
+    path = "/ws-xmpp"
+    timeout = "infinity"
+    ping_rate = 120_000
+    max_stanza_size = 100
+
+[[listen.http]]
+  port = 8088
+  ip_address = "127.0.0.1"
+  transport.num_acceptors = 10
+  transport.max_connections = 1024
+
+  [[listen.http.handlers.mongoose_admin_api]]
+    host = "localhost"
+    path = "/api"
+
+[[listen.http]]
+  port = 8089
+  transport.num_acceptors = 10
+  transport.max_connections = 1024
+  protocol.compress = true
+  tls.certfile = "priv/cert.pem"
+  tls.keyfile = "priv/dc1.pem"
+  tls.password = ""
+  tls.verify_mode = "none"
+
+  [[listen.http.handlers.mongoose_client_api]]
+    host = "_"
+    path = "/api"
+
+[[listen.c2s]]
+  port = 5222
+  access = "c2s"
+  shaper = "normal"
+  max_stanza_size = 65536
+  tls.mode = "starttls"
+  tls.certfile = "priv/cert.pem"
+  tls.keyfile = "priv/dc1.pem"
+  tls.cacertfile = "priv/ca.pem"
+
+[[listen.c2s]]
+  port = 5223
+  access = "c2s"
+  shaper = "normal"
+  max_stanza_size = 65536
+
+[[listen.s2s]]
+  port = 5269
+  shaper = "fast"
+  max_stanza_size = 131072
+  tls.dhfile = "priv/dh.pem"
+  tls.certfile = "priv/cert.pem"
+  tls.cacertfile = "priv/ca.pem"
+
+[[listen.component]]
+  port = 8888
+  access = "all"
+  shaper = "fast"
+  ip_address = "127.0.0.1"
+  password = "secret"
+
+[[listen.component]]
+  port = 8666
+  access = "all"
+  conflict_behaviour = "kick_old"
+  shaper = "fast"
+  ip_address = "127.0.0.1"
+  password = "secret"
+
+[[listen.component]]
+  port = 8189
+  access = "all"
+  hidden_components = true
+  shaper = "fast"
+  ip_address = "127.0.0.1"
+  password = "secret"
+
+[auth]
+  password.format = "scram"
+  password.hash = ["sha256"]
+  password.scram_iterations = 64
+  sasl_external = ["standard"]
+
+  [auth.rdbms]
+
+[outgoing_pools.rdbms.default]
+  scope = "global"
+  workers = 5
+
+  [outgoing_pools.rdbms.default.connection]
+    driver = "pgsql"
+    host = "localhost"
+    database = "mongooseim"
+    username = "mongooseim"
+    password = "mongooseim_secret"
+    tls.required = true
+    tls.cacertfile = "priv/ca.pem"
+    tls.server_name_indication.enabled = false
+
+[services.service_mongoose_system_metrics]
+  initial_report = 300_000
+  periodic_report = 10_800_000
+
+[modules.mod_adhoc]
+
+[modules.mod_amp]
+
+[modules.mod_disco]
+  users_can_see_hidden_services = false
+
+[modules.mod_last]
+  backend = "rdbms"
+
+[modules.mod_stream_management]
+
+[modules.mod_offline]
+  backend = "rdbms"
+
+[modules.mod_privacy]
+  backend = "rdbms"
+
+[modules.mod_blocking]
+
+[modules.mod_private]
+  backend = "rdbms"
+
+[modules.mod_register]
+  welcome_message = {subject = "Hello", body = "I am MongooseIM"}
+  ip_access = [
+    {address = "127.0.0.0/8", policy = "allow"},
+    {address = "0.0.0.0/0", policy = "deny"}
+  ]
+  access = "register"
+
+[modules.mod_roster]
+  backend = "rdbms"
+
+[modules.mod_sic]
+
+[modules.mod_vcard]
+  backend = "rdbms"
+  host = "vjud.@HOST@"
+
+[modules.mod_bosh]
+
+[modules.mod_carboncopy]
+
+[instrumentation.exometer]
+
+[instrumentation.log]
+
+[shaper.normal]
+  max_rate = 1000
+
+[shaper.fast]
+  max_rate = 50_000
+
+[shaper.mam_shaper]
+  max_rate = 1
+
+[shaper.mam_global_shaper]
+  max_rate = 1000
+
+[acl]
+  local = [
+    {user_regexp = ""}
+  ]
+
+[access]
+  max_user_sessions = [
+    {acl = "all", value = 10}
+  ]
+
+  max_user_offline_messages = [
+    {acl = "admin", value = 5000},
+    {acl = "all", value = 100}
+  ]
+
+  local = [
+    {acl = "local", value = "allow"}
+  ]
+
+  c2s = [
+    {acl = "blocked", value = "deny"},
+    {acl = "all", value = "allow"}
+  ]
+
+  muc_admin = [
+    {acl = "admin", value = "allow"}
+  ]
+
+  muc_create = [
+    {acl = "local", value = "allow"}
+  ]
+
+  muc = [
+    {acl = "all", value = "allow"}
+  ]
+
+  register = [
+    {acl = "all", value = "allow"}
+  ]
+
+  mam_set_prefs = [
+    {acl = "all", value = "default"}
+  ]
+
+  mam_get_prefs = [
+    {acl = "all", value = "default"}
+  ]
+
+  mam_lookup_messages = [
+    {acl = "all", value = "default"}
+  ]
+
+  mam_set_prefs_shaper = [
+    {acl = "all", value = "mam_shaper"}
+  ]
+
+  mam_get_prefs_shaper = [
+    {acl = "all", value = "mam_shaper"}
+  ]
+
+  mam_lookup_messages_shaper = [
+    {acl = "all", value = "mam_shaper"}
+  ]
+
+  mam_set_prefs_global_shaper = [
+    {acl = "all", value = "mam_global_shaper"}
+  ]
+
+  mam_get_prefs_global_shaper = [
+    {acl = "all", value = "mam_global_shaper"}
+  ]
+
+  mam_lookup_messages_global_shaper = [
+    {acl = "all", value = "mam_global_shaper"}
+  ]
+
+[s2s]
+  default_policy = "allow"
+
+  [s2s.outgoing]
+    port = 5299
+
+    [[s2s.outgoing.address]]
+      host = "fed1"
+      ip_address = "127.0.0.1"
+
+[[host_config]]
+  host = "localhost"
+  [host_config.outgoing_pools.redis.global_distrib]
+    workers = 10
+
+[[host_config]]
+  host = "anonymous.localhost"
+  [host_config.auth.anonymous]
+    allow_multiple_connections = true
+    protocol = "both"
+  [host_config.outgoing_pools.rdbms.special]
+    workers = 5
+    connection.driver = "pgsql"
+    connection.host = "localhost"
+    connection.database = "mongooseim"
+    connection.username = "mongooseim"
+    connection.password = "mongooseim_secret"
+    connection.tls.required = true
+    connection.tls.cacertfile = "priv/ca.pem"
+    connection.tls.server_name_indication.enabled = false

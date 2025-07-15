@@ -14,25 +14,19 @@
 %% limitations under the License.
 %%==============================================================================
 %%%-------------------------------------------------------------------
-%%% @doc
-%% options and defaults:
-%%     * server - (required)
-%%     * path_prefix - ""
-%%     * request_timeout - 2000,
-%%     * http_opts - [] % passed to fusco
-%%%
-%%% @end
 %%% Created : 26. Jun 2018 13:07
 %%%-------------------------------------------------------------------
 -module(mongoose_http_client).
 -author("bartlomiej.gorny@erlang-solutions.com").
--include("mongoose.hrl").
 
 %% API
 -export([get/4, post/5]).
 
+-export_type([pool/0]).
+-type pool() :: atom().
+
 -spec get(Host :: jid:lserver() | global,
-          PoolTag :: atom(),
+          PoolTag :: pool(),
           Path :: binary(),
           Headers :: list()) ->
     {ok, {binary(), binary()}} | {error, any()}.
@@ -40,7 +34,7 @@ get(Host, PoolTag, Path, Headers) ->
     make_request(Host, PoolTag, Path, <<"GET">>, Headers, <<>>).
 
 -spec post(Host :: jid:lserver() | global,
-           PoolTag :: atom(),
+           PoolTag :: pool(),
            Path :: binary(),
            Headers :: list(),
            Query :: binary()) ->

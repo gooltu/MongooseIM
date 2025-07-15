@@ -4,9 +4,8 @@
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("escalus/include/escalus.hrl").
--include_lib("escalus/include/escalus_xmlns.hrl").
 -include_lib("exml/include/exml.hrl").
--include("inbox.hrl").
+-include_lib("eunit/include/eunit.hrl").
 -include("muc_light.hrl").
 
 -export([suite/0, all/0, groups/0]).
@@ -54,21 +53,15 @@
          remove_pubsub_push_node/1,
          remove_pubsub_pep_node/1
         ]).
--export([
-         data_is_not_retrieved_for_missing_user/1
-        ]).
 
--import(ejabberdctl_helper, [ejabberdctl/3]).
-
--import(distributed_helper, [mim/0,
-                             rpc/4]).
-
+-import(mongooseimctl_helper, [mongooseimctl/3]).
+-import(distributed_helper, [mim/0, subhost_pattern/1, rpc/4]).
 -import(muc_light_helper, [room_bin_jid/1]).
+-import(domain_helper, [host_type/0]).
+-import(config_parser_helper, [default_mod_config/1, mod_config/2]).
+-import(graphql_helper, [execute_command/4, get_ok_value/2]).
 
 -define(ROOM, <<"tt1">>).
-
--define(MUCLIGHTHOST, <<"muclight.@HOST@">>).
--define(MUCHOST, <<"muc.@HOST@">>).
 
 %% -------------------------------------------------------------
 %% Common Test stuff
@@ -80,7 +73,6 @@ suite() ->
 all() ->
     [
      {group, retrieve_personal_data},
-     {group, retrieve_negative},
      {group, remove_personal_data}
     ].
 
@@ -117,29 +109,22 @@ groups() ->
                                                dont_retrieve_other_user_private_xml,
                                                retrieve_multiple_private_xmls
                                               ]},
-     {retrieve_negative, [], [
-                              data_is_not_retrieved_for_missing_user
-                             ]},
      {retrieve_personal_data_mam, [], [
                                        {group, retrieve_personal_data_mam_rdbms},
-                                       {group, retrieve_personal_data_mam_riak},
                                        {group, retrieve_personal_data_mam_cassandra},
                                        {group, retrieve_personal_data_mam_elasticsearch}
                                       ]},
      {retrieve_personal_data_mam_rdbms, [], all_mam_testcases()},
-     {retrieve_personal_data_mam_riak, [], all_mam_testcases()},
      {retrieve_personal_data_mam_cassandra, [], all_mam_testcases()},
      {retrieve_personal_data_mam_elasticsearch, [], all_mam_testcases()},
      {remove_personal_data, [], removal_testcases()},
      {remove_personal_data_inbox, [], [remove_inbox, remove_inbox_muclight, remove_inbox_muc]},
      {remove_personal_data_mam, [], [
                                      {group, remove_personal_data_mam_rdbms},
-                                     {group, remove_personal_data_mam_riak},
                                      {group, remove_personal_data_mam_cassandra},
                                      {group, remove_personal_data_mam_elasticsearch}
                                     ]},
      {remove_personal_data_mam_rdbms, [], mam_removal_testcases()},
-     {remove_personal_data_mam_riak, [], mam_removal_testcases()},
      {remove_personal_data_mam_cassandra, [], mam_removal_testcases()},
      {remove_personal_data_mam_elasticsearch, [], mam_removal_testcases()},
      {remove_personal_data_pubsub, [], [
@@ -189,14 +174,16 @@ all_mam_testcases() ->
 
 init_per_suite(Config) ->
     #{node := MimNode} = distributed_helper:mim(),
-    Config1 = [{{ejabberd_cwd, MimNode}, get_mim_cwd()} | dynamic_modules:save_modules(domain(), Config)],
-    muc_helper:load_muc(muc_domain()),
-    escalus:init_per_suite(Config1).
+    Config1 = [{{ejabberd_cwd, MimNode}, get_mim_cwd()} | dynamic_modules:save_modules(host_type(), Config)],
+    muc_helper:load_muc(),
+    Config2 = graphql_helper:init_admin_cli(Config1),
+    escalus:init_per_suite(Config2).
 
 end_per_suite(Config) ->
     delete_files(),
-    dynamic_modules:restore_modules(domain(), Config),
     escalus_fresh:clean(),
+    graphql_helper:clean(),
+    dynamic_modules:restore_modules(Config),
     escalus:end_per_suite(Config).
 
 init_per_group(GN, Config) when GN =:= remove_personal_data_mam_rdbms;
@@ -205,9 +192,6 @@ init_per_group(GN, Config) when GN =:= remove_personal_data_mam_rdbms;
 init_per_group(GN, Config) when GN =:= retrieve_personal_data_pubsub;
                                 GN =:= remove_personal_data_pubsub ->
     [{group, GN} | Config];
-init_per_group(GN, Config) when GN =:= retrieve_personal_data_mam_riak;
-                                GN =:= remove_personal_data_mam_riak ->
-    try_backend_for_mam(Config, riak);
 init_per_group(GN, Config) when GN =:= retrieve_personal_data_mam_cassandra;
                                 GN =:= remove_personal_data_mam_cassandra->
     try_backend_for_mam(Config, cassandra);
@@ -218,22 +202,24 @@ init_per_group(retrieve_personal_data_inbox = GN, Config) ->
     init_inbox(GN, Config, muclight);
 init_per_group(remove_personal_data_inbox = GN, Config) ->
     init_inbox(GN, Config, muclight);
+init_per_group(retrieve_personal_data_private_xml, Config) ->
+    private_started(),
+    Config;
 init_per_group(_GN, Config) ->
     Config.
 
 end_per_group(_GN, Config) ->
     Config.
 
-try_backend_for_mam( Config,Backend) ->
+try_backend_for_mam(Config, Backend) ->
     case is_backend_enabled(Backend) of
         true -> [{mam_backend, Backend} | Config];
         false -> {skip, backend_is_not_configured}
     end.
 
-is_backend_enabled(rdbms)         -> mongoose_helper:is_rdbms_enabled(domain());
-is_backend_enabled(riak)          -> mam_helper:is_riak_enabled(domain());
-is_backend_enabled(cassandra)     -> mam_helper:is_cassandra_enabled(domain());
-is_backend_enabled(elasticsearch) -> mam_helper:is_elasticsearch_enabled(domain()).
+is_backend_enabled(rdbms)         -> mongoose_helper:is_rdbms_enabled(host_type());
+is_backend_enabled(cassandra)     -> mam_helper:is_cassandra_enabled(host_type());
+is_backend_enabled(elasticsearch) -> mam_helper:is_elasticsearch_enabled(host_type()).
 
 
 init_per_testcase(retrieve_logs = CN, Config) ->
@@ -241,7 +227,8 @@ init_per_testcase(retrieve_logs = CN, Config) ->
         false -> {skip, not_running_in_distributed};
         _ -> escalus:init_per_testcase(CN, Config)
     end;
-init_per_testcase(remove_offline = CN, Config) ->
+init_per_testcase(CN, Config) when CN =:= remove_offline;
+                                   CN =:= retrieve_offline ->
     offline_started(),
     escalus:init_per_testcase(CN, Config);
 init_per_testcase(CN, Config) when
@@ -253,19 +240,19 @@ init_per_testcase(CN, Config) when
     Config1;
 init_per_testcase(CN, Config) when CN =:= retrieve_inbox_muc;
                                    CN =:= remove_inbox_muc ->
-    muc_helper:load_muc(muc_domain()),
+    muc_helper:load_muc(),
     Config0 = init_inbox(CN, Config, muc),
     Config0;
 
 init_per_testcase(retrieve_vcard = CN, Config) ->
-    case vcard_update:is_vcard_ldap() of
+    case vcard_helper:is_vcard_ldap() of
         true ->
             {skip, skipped_for_simplicity_for_now}; % TODO: Fix the case for LDAP as well
         _ ->
             escalus:init_per_testcase(CN, Config)
     end;
 init_per_testcase(remove_vcard = CN, Config) ->
-    case vcard_update:is_vcard_ldap() of
+    case vcard_helper:is_vcard_ldap() of
         true ->
             {skip, skipped_for_simplicity_for_now}; % TODO: Fix the case for LDAP as well
         _ ->
@@ -290,22 +277,21 @@ init_per_testcase(CN, Config) when CN =:= retrieve_mam_muc;
         skip ->
             {skip, no_mam_backend_configured};
         Backend ->
-            dynamic_modules:restore_modules(domain(), Config),
+            dynamic_modules:restore_modules(Config),
             RequiredModules = mam_required_modules(CN, Backend),
-            dynamic_modules:ensure_modules(domain(), RequiredModules),
+            dynamic_modules:ensure_modules(host_type(), RequiredModules),
             ct:log("required modules: ~p~n", [RequiredModules]),
             escalus:init_per_testcase(CN, [{mam_modules, RequiredModules} | Config])
     end;
 init_per_testcase(remove_roster = CN, Config) ->
-    Backend = pick_enabled_backend(),
-    dynamic_modules:ensure_modules(domain(), [{mod_roster, [{backend, Backend}]}]),
+    roster_started(),
     escalus:init_per_testcase(CN, Config);
 init_per_testcase(CN, Config) ->
     GN = proplists:get_value(group, Config),
     IsPubSub = lists:member(GN, [retrieve_personal_data_pubsub, remove_personal_data_pubsub]),
     case IsPubSub of
         true ->
-            dynamic_modules:ensure_modules(domain(), pubsub_required_modules());
+            dynamic_modules:ensure_modules(host_type(), pubsub_required_modules());
         _ ->
             ok
     end,
@@ -315,7 +301,7 @@ init_per_testcase(CN, Config) ->
 end_per_testcase(CN, Config) when CN =:= retrieve_mam_muc_light;
                                   CN =:= retrieve_mam_pm_and_muc_light_interfere;
                                   CN =:= retrieve_mam_pm_and_muc_light_dont_interfere ->
-    muc_light_helper:clear_db(),
+    muc_light_helper:clear_db(host_type()),
     escalus:end_per_testcase(CN, Config);
 %% mod_inbox
 end_per_testcase(CN, Config) when
@@ -323,7 +309,7 @@ end_per_testcase(CN, Config) when
       CN =:= retrieve_inbox;
       CN =:= remove_inbox_muclight;
       CN =:= retrieve_inbox_muclight ->
-    muc_light_helper:clear_db(),
+    muc_light_helper:clear_db(host_type()),
     escalus:end_per_testcase(CN, Config);
 end_per_testcase(CN, Config) when CN =:= retrieve_inbox_muc;
                                   CN =:= remove_inbox_muc ->
@@ -335,86 +321,103 @@ end_per_testcase(CN, Config) ->
 
 init_inbox(CN, Config, GroupChatType) ->
     case (not ct_helper:is_ct_running())
-         orelse mongoose_helper:is_rdbms_enabled(domain()) of
+         orelse mongoose_helper:is_rdbms_enabled(host_type()) of
         true ->
-            dynamic_modules:ensure_modules(domain(), inbox_required_modules(GroupChatType)),
+            dynamic_modules:ensure_modules(host_type(), inbox_required_modules(GroupChatType)),
             escalus:init_per_testcase(CN, Config);
         false ->
             {skip, require_rdbms}
     end.
 inbox_required_modules(Type) ->
     GroupChatModules = groupchat_module(Type),
-    Inbox = {mod_inbox, [{aff_changes, true},
-                         {remove_on_kicked, true},
-                         {groupchat, [Type]},
-                         {markers, [displayed]}]},
-     GroupChatModules ++ [Inbox] .
+    InboxOpts = (inbox_helper:inbox_opts())#{groupchat => [Type]},
+    Inbox = {mod_inbox, InboxOpts},
+    GroupChatModules ++ [Inbox] .
 
 groupchat_module(muc) ->
     [];
 groupchat_module(muclight) ->
-    [{mod_muc_light,
-     [{host, binary_to_list(?MUCLIGHTHOST)},
-      {backend, mongoose_helper:mnesia_or_rdbms_backend()},
-      {rooms_in_rosters, true}]}].
+    [{mod_muc_light, mod_config(mod_muc_light,
+                                #{backend => mongoose_helper:mnesia_or_rdbms_backend(),
+                                  rooms_in_rosters => true})}].
 
-muclight_domain() ->
-    Domain = inbox_helper:domain(),
-    <<"muclight.", Domain/binary>>.
-
-mam_required_modules(CN, Backend) when CN =:= remove_mam_pm;
-                                       CN =:= retrieve_mam_pm->
-    [{mod_mam_meta, [{backend, Backend},
-                     {pm, [{archive_groupchats, false}]}]}];
-mam_required_modules(CN, Backend) when CN =:= retrieve_mam_pm_and_muc_light_dont_interfere;
-                                       CN =:= retrieve_mam_muc_light ->
-    [{mod_mam_meta, [{backend, Backend},
-                     {pm, [{archive_groupchats, false}]},
-                     {muc, [{host, "muclight.@HOST@"}]}]},
-     {mod_muc_light, [{host, "muclight.@HOST@"}]}];
+mam_required_modules(CN, Backend)
+        when CN =:= remove_mam_pm;
+             CN =:= retrieve_mam_pm ->
+    [{mod_mam, mam_helper:config_opts(#{backend => Backend, pm => #{}})}];
+mam_required_modules(CN, Backend)
+        when CN =:= retrieve_mam_pm_and_muc_light_dont_interfere;
+             CN =:= retrieve_mam_muc_light ->
+    HostPattern = subhost_pattern(muc_light_helper:muc_host_pattern()),
+    MucLightOpts = #{backend => mongoose_helper:mnesia_or_rdbms_backend()},
+    [{mod_mam, mam_helper:config_opts(#{backend => Backend,
+                                        pm => #{},
+                                        muc => #{host => HostPattern}})},
+     {mod_muc_light, mod_config(mod_muc_light, MucLightOpts)}];
 mam_required_modules(retrieve_mam_pm_and_muc_light_interfere, Backend) ->
-    [{mod_mam_meta, [{backend, Backend},
-                     {rdbms_message_format, simple}, %% ignored for any other than rdbms backend
-                     simple, %% used only by cassandra backend
-                     {pm, [{archive_groupchats, true}]},
-                     {muc, [{host, "muclight.@HOST@"}]}]},
-     {mod_muc_light, [{host, "muclight.@HOST@"}]}];
+    HostPattern = subhost_pattern(muc_light_helper:muc_host_pattern()),
+    MucLightOpts = #{backend => mongoose_helper:mnesia_or_rdbms_backend()},
+    [{mod_mam, mam_helper:config_opts(#{backend => Backend,
+                                        db_message_format => mam_message_xml,
+                                        pm => #{archive_groupchats => true},
+                                        muc => #{host => HostPattern}})},
+     {mod_muc_light, mod_config(mod_muc_light, MucLightOpts)}];
 mam_required_modules(CN, Backend) when CN =:= retrieve_mam_muc_private_msg;
-                                       CN =:= retrieve_mam_muc ->
-    [{mod_mam_meta, [{backend, Backend},
-                     {pm, [{archive_groupchats, false}]},
-                     {muc, [{host, "muc.@HOST@"}]}]},
-     {mod_muc, [{host, "muc.@HOST@"}]}];
+                                               CN =:= retrieve_mam_muc ->
+    HostPattern = subhost_pattern(muc_helper:muc_host_pattern()),
+    MucOpts = #{host => HostPattern,
+                online_backend => ct_helper:get_internal_database(),
+                backend => mongoose_helper:mnesia_or_rdbms_backend()},
+    [{mod_mam, mam_helper:config_opts(#{backend => Backend,
+                                        pm => #{},
+                                        muc => #{host => HostPattern}})},
+     {mod_muc, muc_helper:make_opts(MucOpts)}];
 mam_required_modules(retrieve_mam_muc_store_pm, Backend) ->
-    [{mod_mam_meta, [{backend, Backend},
-                     {pm, [{archive_groupchats, true}]},
-                     {muc, [{host, "muc.@HOST@"}]}]},
-     {mod_muc, [{host, "muc.@HOST@"}]}].
+    HostPattern = subhost_pattern(muc_helper:muc_host_pattern()),
+    MucOpts = #{host => HostPattern,
+                online_backend => ct_helper:get_internal_database(),
+                backend => mongoose_helper:mnesia_or_rdbms_backend()},
+    [{mod_mam, mam_helper:config_opts(#{backend => Backend,
+                                        pm => #{archive_groupchats => true},
+                                        muc => #{host => HostPattern}})},
+     {mod_muc, muc_helper:make_opts(MucOpts)}].
 
 pick_enabled_backend() ->
     BackendsList = [
-        {mam_helper:is_riak_enabled(domain()), riak},
-        {mongoose_helper:is_rdbms_enabled(domain()), rdbms}
+        {mongoose_helper:is_rdbms_enabled(host_type()), rdbms}
     ],
     proplists:get_value(true, BackendsList, mnesia).
 
+roster_required_modules() ->
+    Backend = pick_enabled_backend(),
+    [{mod_roster, roster_backend_opts(Backend)}].
+
+roster_backend_opts(Backend) ->
+    mod_config(mod_roster, #{backend => Backend}).
 
 vcard_required_modules() ->
-    [{mod_vcard, [{backend, pick_enabled_backend()}]}].
+    Backend = pick_enabled_backend(),
+    [{mod_vcard, mod_config(mod_vcard, vcard_backend_opts(Backend))}].
+
+vcard_backend_opts(Backend) ->
+    #{backend => Backend}.
 
 offline_required_modules() ->
-    [{mod_offline, [{backend, pick_enabled_backend()}]}].
+    [{mod_offline, mod_offline_config(pick_enabled_backend())}].
+
+mod_offline_config(Backend) ->
+    config_parser_helper:mod_config(mod_offline, #{backend => Backend}).
 
 pubsub_required_modules() ->
     pubsub_required_modules([<<"flat">>, <<"pep">>, <<"push">>]).
 pubsub_required_modules(Plugins) ->
-    [{mod_caps, []}, {mod_pubsub, [
-                                   {backend, mongoose_helper:mnesia_or_rdbms_backend()},
-                                   {host, "pubsub.@HOST@"},
-                                   {nodetree, <<"tree">>},
-                                   {plugins, Plugins}
-                                  ]
-                     }].
+    HostPattern = subhost_pattern("pubsub.@HOST@"),
+    PubsubConfig = mod_config(mod_pubsub, #{backend => mongoose_helper:mnesia_or_rdbms_backend(),
+                                            host => HostPattern,
+                                            nodetree => nodetree_tree,
+                                            plugins => Plugins}),
+    [{mod_caps, config_parser_helper:mod_config_with_auto_backend(mod_caps)},
+     {mod_pubsub, PubsubConfig}].
 
 is_mim2_started() ->
     #{node := Node} = distributed_helper:mim2(),
@@ -423,17 +426,23 @@ is_mim2_started() ->
         _ -> false
     end.
 
+roster_started() ->
+    dynamic_modules:ensure_modules(host_type(), roster_required_modules()).
+
 vcard_started() ->
-    dynamic_modules:ensure_modules(domain(), vcard_required_modules()).
+    dynamic_modules:ensure_modules(host_type(), vcard_required_modules()).
 
 offline_started() ->
-    dynamic_modules:ensure_modules(domain(), offline_required_modules()).
+    dynamic_modules:ensure_modules(host_type(), offline_required_modules()).
 
 private_required_modules() ->
-    [{mod_private, [{backend, pick_enabled_backend()}]}].
+    [{mod_private, create_private_config(pick_enabled_backend())}].
+
+create_private_config(Backend) ->
+    mod_config(mod_private, #{backend => Backend}).
 
 private_started() ->
-    dynamic_modules:ensure_modules(domain(), private_required_modules()).
+    dynamic_modules:ensure_modules(host_type(), private_required_modules()).
 
 %% -------------------------------------------------------------
 %% Test cases
@@ -467,7 +476,7 @@ remove_vcard(Config) ->
             = escalus:send_and_wait(Alice, escalus_stanza:vcard_update(AliceFields)),
         escalus:assert(is_iq_result, AliceSetResultStanza),
 
-        {0, _} = unregister(Alice, Config),
+        unregister(Alice, Config),
 
         assert_personal_data_via_rpc(Alice, [{vcard,["jid","vcard"],[]}])
 
@@ -477,7 +486,7 @@ remove_private(Config) ->
     escalus:fresh_story(Config, [{alice, 1}], fun(Alice) ->
         %% Add some private data for Alice
         Element = #xmlel{name = <<"item">>,
-                         attrs = [{<<"xmlns">>, <<"alice:private_remove:ns">>}],
+                         attrs = #{<<"xmlns">> => <<"alice:private_remove:ns">>},
                          children = [#xmlcdata{ content = <<"Something to declare">> }]},
         SetPrivateResult = escalus:send_and_wait(Alice,
                              escalus_stanza:private_set(Element)),
@@ -489,7 +498,7 @@ remove_private(Config) ->
                      <<"<item xmlns='alice:private_remove:ns'>Something to declare</item>">>}]}]),
 
         %% Remove Alice
-        {0, _} = unregister(Alice, Config),
+        unregister(Alice, Config),
 
         %% Expect Alice's data to be gone
         assert_personal_data_via_rpc(Alice, [{private, ["ns","xml"], []}])
@@ -507,7 +516,7 @@ dont_remove_other_user_private_xml(Config) ->
         send_and_assert_private_stanza(Bob, BobNS, BobContent),
 
         %% Remove Alice
-        {0, _} = unregister(Alice, Config),
+        unregister(Alice, Config),
 
         %% Expect Alice's data to be gone
         assert_personal_data_via_rpc(Alice, [{private, ["ns","xml"], []}]),
@@ -548,7 +557,7 @@ remove_multiple_private_xmls(Config) ->
           Alice, Config, "private", ExpectedHeader, ExpectedItems),
 
         %% Remove Alice
-        {0, _} = unregister(Alice, Config),
+        unregister(Alice, Config),
 
         %% Expect all of Alice's data to be gone
         assert_personal_data_via_rpc(Alice, [{private, ["ns","xml"], []}])
@@ -576,7 +585,7 @@ remove_roster(Config) ->
                          #{ "jid" => [{contains,  AliceU}, {contains, AliceS}] }
                         ],
 
-        {0, _} = unregister(Alice, Config),
+        unregister(Alice, Config),
 
         assert_personal_data_via_rpc(Alice, [{roster, expected_header(mod_roster), []}]),
         retrieve_and_validate_personal_data(
@@ -663,7 +672,7 @@ retrieve_mam_muc_private_msg(Config) ->
             muc_helper:enter_room(RoomCfg, [{Alice, <<"Nancy">>}, {Bob, <<"Sid">>}]),
 
             PMBody = <<"Hi, Bob!">>,
-            {PrivAddrAlice, _} = send_recieve_muc_private_message(
+            {PrivAddrAlice, _} = send_receive_muc_private_message(
                 Room, Domain, {Alice, <<"Nancy">>}, {Bob, <<"Sid">>}, PMBody),
 
             [mam_helper:wait_for_archive_size(User, 1) || User <- [Alice, Bob]],
@@ -712,7 +721,7 @@ retrieve_mam_muc_store_pm(Config) ->
             muc_helper:verify_message_received(RoomCfg, AllRoomMembers, <<"Sid">>, Body3),
 
             PMBody = <<"4Hi, Bob!">>,
-            {PrivAddrAlice, PrivAddrBob} = send_recieve_muc_private_message(
+            {PrivAddrAlice, PrivAddrBob} = send_receive_muc_private_message(
                 Room, Domain, {Alice, <<"Nancy">>}, {Bob, <<"Sid">>}, PMBody),
 
             mam_helper:wait_for_room_archive_size(Domain, Room, 3),
@@ -784,7 +793,7 @@ remove_mam_pm(Config) ->
                                 #{"message" => [{contains, Msg2}], "from" => [{jid, BobJID}]}
                             ],
 
-            {0, _} = unregister(Alice, Config),
+            unregister(Alice, Config),
 
             assert_personal_data_via_rpc(Alice, [{mam_pm, ExpectedHeader, []}]),
 
@@ -845,8 +854,8 @@ retrieve_mam_pm_and_muc_light_dont_interfere(Config) ->
 
             [mam_helper:wait_for_archive_size(User, 2) || User <- [Alice, Bob]],
 
-            false = mongoose_helper:successful_rpc(mod_mam_meta, get_mam_module_opt,
-                                                   [domain(), mod_mam, archive_groupchats, undefined]),
+            false = mongoose_helper:successful_rpc(gen_mod, get_module_opt,
+                                                   [host_type(), mod_mam_pm, archive_groupchats, undefined]),
 
             AliceDir = retrieve_all_personal_data(Alice, Config),
             BobDir = retrieve_all_personal_data(Bob, Config),
@@ -893,8 +902,8 @@ retrieve_mam_pm_and_muc_light_interfere(Config) ->
             [mam_helper:wait_for_archive_size(User, 5) || User <- [Alice, Bob]],
             mam_helper:wait_for_archive_size(Kate, 3),
 
-            true = mongoose_helper:successful_rpc(mod_mam_meta, get_mam_module_opt,
-                                                   [domain(), mod_mam, archive_groupchats, undefined]),
+            true = mongoose_helper:successful_rpc(gen_mod, get_module_opt,
+                                                   [host_type(), mod_mam_pm, archive_groupchats, undefined]),
 
             AliceDir = retrieve_all_personal_data(Alice, Config),
             BobDir = retrieve_all_personal_data(Bob, Config),
@@ -938,10 +947,10 @@ retrieve_offline(Config) ->
             %% Well, jid_to_lower works for any binary :)
             AliceU = escalus_utils:jid_to_lower(escalus_client:username(Alice)),
             AliceS = escalus_utils:jid_to_lower(escalus_client:server(Alice)),
-            mongoose_helper:wait_until(
+            wait_helper:wait_until(
               fun() ->
                       mongoose_helper:successful_rpc(mod_offline_backend, count_offline_messages,
-                                                     [AliceU, AliceS, 10])
+                                                     [host_type(), AliceU, AliceS, 10])
               end, 3),
 
             BobJid = escalus_client:full_jid(Bob),
@@ -954,7 +963,7 @@ retrieve_offline(Config) ->
                 #{ "packet" => [{contains, Body}],
                     "from" => binary_to_list(From),
                     "to" => binary_to_list(To),
-                    "timestamp" => [{validate, fun validate_datetime/1}]}
+                    "timestamp" => [{validate, fun time_helper:validate_datetime/1}]}
             end, Expected),
 
             retrieve_and_validate_personal_data(
@@ -973,13 +982,13 @@ remove_offline(Config) ->
             %% Well, jid_to_lower works for any binary :)
             AliceU = escalus_utils:jid_to_lower(escalus_client:username(Alice)),
             AliceS = escalus_utils:jid_to_lower(escalus_client:server(Alice)),
-            mongoose_helper:wait_until(
+            wait_helper:wait_until(
               fun() ->
                       mongoose_helper:successful_rpc(mod_offline_backend, count_offline_messages,
-                                                     [AliceU, AliceS, 10])
+                                                     [host_type(), AliceU, AliceS, 10])
               end, 3),
 
-            {0, _} = unregister(Alice, Config),
+            unregister(Alice, Config),
 
             assert_personal_data_via_rpc(
               Alice, [{offline, ["timestamp","from", "to", "packet"],[]}])
@@ -1071,7 +1080,7 @@ remove_pubsub_subscriptions(Config) ->
             pubsub_tools:create_node(Alice, Node, []),
             pubsub_tools:subscribe(Bob, Node, []),
 
-            {0, _} = unregister(Bob, Config),
+            unregister(Bob, Config),
 
             assert_personal_data_via_rpc(Bob,
                                          [{pubsub_payloads,["node_name","item_id","payload"],[]},
@@ -1095,7 +1104,7 @@ remove_pubsub_dont_remove_flat_pubsub_node(Config) ->
         Node1 = {_,NodeName} = pubsub_tools:pubsub_node_with_num(1),
         pubsub_tools:create_nodes([{Alice, Node1, []}]),
 
-        {0, _} = unregister(Alice, Config),
+        unregister(Alice, Config),
 
         assert_personal_data_via_rpc(Alice,
                                      [{pubsub_payloads,["node_name","item_id","payload"],[]},
@@ -1122,7 +1131,7 @@ remove_pubsub_push_node(Config) ->
         escalus:send(Bob, PublishIQ),
         escalus:assert(is_iq_result, escalus:wait_for_stanza(Bob)),
 
-        {0, _} = unregister(Alice, Config),
+        unregister(Alice, Config),
 
         assert_personal_data_via_rpc(Alice, [{pubsub_payloads,["node_name","item_id","payload"],[]},
                                              {pubsub_nodes,["node_name","type"],[]},
@@ -1138,7 +1147,7 @@ remove_pubsub_pep_node(Config) ->
                       {Alice, PepNode, []}
                      ]),
 
-        {0, _} = unregister(Alice, Config),
+        unregister(Alice, Config),
 
         assert_personal_data_via_rpc(Alice, [{pubsub_payloads,["node_name","item_id","payload"],[]},
                                              {pubsub_nodes,["node_name","type"],[]},
@@ -1153,7 +1162,7 @@ remove_pubsub_dont_remove_node_when_only_publisher(Config) ->
         AffChange = [{Bob, <<"publish-only">>}],
         pubsub_tools:set_affiliations(Alice, Node1, AffChange, []),
 
-        {0, _} = unregister(Bob, Config),
+        unregister(Bob, Config),
 
         assert_personal_data_via_rpc(Alice,
                                      [{pubsub_payloads,["node_name","item_id","payload"],[]},
@@ -1198,7 +1207,7 @@ remove_pubsub_all_data(Config) ->
         pubsub_tools:publish(Bob, BobToNode3, Node3, [{with_payload, {true, BinItem4}}]),
         pubsub_tools:receive_item_notification(Alice, BobToNode3, Node3, []),
 
-        {0, _} = unregister(Alice, Config),
+        unregister(Alice, Config),
 
         [{pubsub_payloads,["node_name","item_id","payload"], AlicePayloads},
          {pubsub_nodes,["node_name","type"], AliceNodes},
@@ -1266,7 +1275,7 @@ retrieve_all_pubsub_data(Config) ->
             [pubsub_payloads_row_map(NodeName1, "Item1", StringItem1),
              pubsub_payloads_row_map(NodeName2, "Item2", StringItem2)]),
 
-        dynamic_modules:ensure_modules(domain(), pubsub_required_modules()),
+        dynamic_modules:ensure_modules(host_type(), pubsub_required_modules()),
         Nodes = [{Alice, Node1}, {Alice, Node2}, {Bob, Node3}],
         [pubsub_tools:delete_node(User, Node, []) || {User, Node} <- Nodes]
       end).
@@ -1332,7 +1341,7 @@ retrieve_multiple_private_xmls(Config) ->
 retrieve_inbox_muclight(Config) ->
     escalus:fresh_story(Config, [{alice, 1}, {bob, 1}], fun(Alice, Bob) ->
         muc_light_helper:given_muc_light_room(?ROOM, Alice, [{Bob, member}]),
-        Domain = muclight_domain(),
+        Domain = muc_light_helper:muc_host(),
 
         Body = <<"Are you sure?">>,
         Res = muc_light_helper:when_muc_light_message_is_sent(Alice, ?ROOM, Body, <<"9128">>),
@@ -1420,7 +1429,7 @@ remove_inbox(Config) ->
 
             ExpectedHeader = ["jid", "content", "unread_count", "timestamp"],
 
-            {0, _} = unregister(Alice, Config),
+            unregister(Alice, Config),
 
             assert_personal_data_via_rpc(Alice, [{inbox, ExpectedHeader, []}]),
 
@@ -1436,7 +1445,7 @@ remove_inbox(Config) ->
 
 remove_inbox_muclight(Config) ->
     escalus:fresh_story(Config, [{alice, 1}, {bob, 1}], fun(Alice, Bob) ->
-        Domain = muclight_domain(),
+        Domain = muc_light_helper:muc_host(),
         Room = <<"ttt2">>,
         muc_light_helper:given_muc_light_room(Room, Alice, [{Bob, member}]),
 
@@ -1446,7 +1455,7 @@ remove_inbox_muclight(Config) ->
 
         ExpectedHeader = ["jid", "content", "unread_count", "timestamp"],
 
-        {0, _} = unregister(Alice, Config),
+        unregister(Alice, Config),
 
         %% MUC Light affiliations are also stored in inbox
         %% 1. Added to the room
@@ -1488,7 +1497,7 @@ remove_inbox_muc(Config) ->
 
         ExpectedHeader = ["jid", "content", "unread_count", "timestamp"],
 
-        {0, _} = unregister(Alice, Config),
+        unregister(Alice, Config),
 
         escalus:wait_for_stanza(Bob),
         assert_personal_data_via_rpc(Alice, [{inbox, ExpectedHeader, []}]),
@@ -1525,9 +1534,9 @@ retrieve_inbox_for_multiple_messages(Config) ->
 retrieve_logs(Config) ->
     escalus:fresh_story(Config, [{alice, 1}],
         fun(Alice) ->
-            User = string:to_lower(binary_to_list(escalus_client:username(Alice))),
-            Domain = string:to_lower(binary_to_list(escalus_client:server(Alice))),
-            JID = string:to_upper(binary_to_list(escalus_client:short_jid(Alice))),
+            User = string:lowercase(escalus_client:username(Alice)),
+            Domain = string:lowercase(escalus_client:server(Alice)),
+            JID = string:uppercase(binary_to_list(escalus_client:short_jid(Alice))),
             #{node := MIM2NodeName} = MIM2Node = distributed_helper:mim2(),
             mongoose_helper:successful_rpc(net_kernel, connect_node, [MIM2NodeName]),
             mongoose_helper:successful_rpc(MIM2Node, error_logger, error_msg,
@@ -1538,22 +1547,9 @@ retrieve_logs(Config) ->
             {match, _} = re:run(Content, "disturbance_in_the_force")
         end).
 
-%% ------------------------- Data retrieval - Negative case -------------------------
-
-data_is_not_retrieved_for_missing_user(Config) ->
-    {Filename, 1, _} = retrieve_personal_data("non-person", "oblivion", Config),
-    {error, _} = file:read_file_info(Filename).
-
 %% -------------------------------------------------------------
 %% Internal functions
 %% -------------------------------------------------------------
-
-domain() ->
-    <<"localhost">>. % TODO: Make dynamic?
-
-muc_domain() ->
-    Domain = inbox_helper:domain(),
-    <<"muc.", Domain/binary>>.
 
 assert_personal_data_via_rpc(Client, ExpectedPersonalDataEntries) ->
     ExpectedKeys = [ Key || {Key, _, _} <- ExpectedPersonalDataEntries ],
@@ -1561,7 +1557,7 @@ assert_personal_data_via_rpc(Client, ExpectedPersonalDataEntries) ->
     %% We use wait_until here, because e.g. the deletion in ElasticSearch
     %% sometimes is applied with a delay (i.e. immediately after successful deletion
     %% the data retrieval still returned valid entries)
-    mongoose_helper:wait_until(
+    wait_helper:wait_until(
             fun() ->
                 get_personal_data_via_rpc(Client, ExpectedKeys)
             end, ExpectedPersonalDataEntries).
@@ -1570,7 +1566,7 @@ get_personal_data_via_rpc(Client, ExpectedKeys) ->
     ClientU = escalus_utils:jid_to_lower(escalus_client:username(Client)),
     ClientS = escalus_utils:jid_to_lower(escalus_client:server(Client)),
     AllPersonalData = mongoose_helper:successful_rpc(
-                        service_admin_extra_gdpr, get_data_from_modules, [ClientU, ClientS]),
+                        gdpr_api, get_data_from_modules, [ClientU, ClientS]),
     %% We don't use lists:filter/2 because this line also ensures order
     [ lists:keyfind(Key, 1, AllPersonalData) || Key <- ExpectedKeys ].
 
@@ -1691,7 +1687,9 @@ retrieve_all_personal_data(Client, Config) ->
     request_and_unzip_personal_data(User, Domain, Config).
 
 request_and_unzip_personal_data(User, Domain, Config) ->
-    {Filename, 0, _} = retrieve_personal_data(User, Domain, Config),
+    {Filename, Res} = retrieve_personal_data(User, Domain, Config),
+    ParsedResult = get_ok_value([data, gdpr, retrievePersonalData], Res),
+    ?assertEqual(<<"Data retrieved">>, ParsedResult),
     FullPath = get_mim_cwd() ++ "/" ++ Filename,
     Dir = make_dir_name(Filename, User),
     ct:log("extracting logs ~s", [Dir]),
@@ -1705,14 +1703,18 @@ make_dir_name(Filename, User) when is_list(User) ->
 
 retrieve_personal_data(User, Domain, Config) ->
     Filename = random_filename(Config),
-    {CommandOutput, Code} = ejabberdctl("retrieve_personal_data", [User, Domain, Filename], Config),
-    {Filename, Code, CommandOutput}.
+    Vars = #{<<"username">> => User, <<"domain">> => Domain,
+             <<"resultFilepath">> => list_to_binary(Filename)},
+    Result = execute_command(<<"gdpr">>, <<"retrievePersonalData">>, Vars, Config),
+    {Filename, Result}.
 
 unregister(Client, Config) ->
-    User = escalus_client:username(Client),
-    Domain = escalus_client:server(Client),
-    {CommandOutput, Code} = ejabberdctl("unregister", [User, Domain], Config),
-    {Code, CommandOutput}.
+    User = escalus_client:full_jid(Client),
+    Path = [data, account, removeUser, message],
+    Vars = #{<<"user">> => User},
+    Resp = execute_command(<<"account">>, <<"removeUser">>, Vars, Config),
+    ?assertNotEqual(nomatch, binary:match(get_ok_value(Path, Resp),
+                                          <<"successfully unregister">>)).
 
 random_filename(Config) ->
     TCName = atom_to_list(?config(tc_name, Config)),
@@ -1759,12 +1761,12 @@ item_content(Data) ->
 
 item_content_xml(Data) ->
     #xmlel{name = <<"entry">>,
-           attrs = [{<<"xmlns">>, <<"http://www.w3.org/2005/Atom">>}],
+           attrs = #{<<"xmlns">> => <<"http://www.w3.org/2005/Atom">>},
            children = [#xmlcdata{content = Data}]}.
 
 send_and_assert_private_stanza(User, NS, Content) ->
     XML = #xmlel{ name = <<"fingerprint">>,
-                  attrs = [{<<"xmlns">>, NS}],
+                  attrs = #{<<"xmlns">> => NS},
                   children = [#xmlcdata{ content = Content }]},
     PrivateStanza = escalus_stanza:private_set(XML),
     escalus_client:send(User, PrivateStanza),
@@ -1775,28 +1777,6 @@ send_and_assert_is_chat_message(UserFrom, UserTo, Body) ->
     Msg = escalus:wait_for_stanza(UserTo),
     escalus:assert(is_chat_message, [Body], Msg).
 
-validate_datetime(TimeStr) ->
-    [Date, Time] = string:tokens(TimeStr, "T"),
-    validate_date(Date),
-    validate_time(Time).
-
-validate_date(Date) ->
-    [Y, M, D] = string:tokens(Date, "-"),
-    Date1 = {list_to_integer(Y), list_to_integer(M), list_to_integer(D)},
-    calendar:valid_date(Date1).
-
-validate_time(Time) ->
-  [T | _] = string:tokens(Time, "Z"),
-  validate_time1(T).
-
-
-validate_time1(Time) ->
-    [H, M, S] = string:tokens(Time, ":"),
-    check_list([{H, 24}, {M, 60}, {S, 60}]).
-
-check_list(List) ->
-    lists:all(fun({V, L}) -> I = list_to_integer(V), I >= 0 andalso I < L end, List).
-
 expected_header(mod_roster) -> ["jid", "name", "subscription",
                               "ask", "groups", "askmessage", "xs"].
 
@@ -1804,10 +1784,10 @@ given_fresh_muc_room(UserSpec, RoomOpts) ->
     Username = proplists:get_value(username, UserSpec),
     RoomName = muc_helper:fresh_room_name(Username),
     From = muc_helper:generate_rpc_jid({user, UserSpec}),
-    muc_helper:create_instant_room(<<"localhost">>, RoomName, From, Username, RoomOpts),
+    muc_helper:create_instant_room(RoomName, From, Username, RoomOpts),
     {ok, RoomName}.
 
-send_recieve_muc_private_message(Room, Domain, {User1, Nickname1}, {User2, Nickname2}, Text) ->
+send_receive_muc_private_message(Room, Domain, {User1, Nickname1}, {User2, Nickname2}, Text) ->
     RoomPrivAddrUser1 = <<Room/binary, "@", Domain/binary, "/", Nickname1/binary>>,
     RoomPrivAddrUser2 = <<Room/binary, "@", Domain/binary, "/", Nickname2/binary>>,
     Msg = escalus_stanza:chat_to(RoomPrivAddrUser2, Text),
@@ -1816,5 +1796,3 @@ send_recieve_muc_private_message(Room, Domain, {User1, Nickname1}, {User2, Nickn
     escalus:assert(is_chat_message_from_to,
                    [RoomPrivAddrUser1, escalus_client:full_jid(User2), Text], PMStanza),
     {RoomPrivAddrUser1, RoomPrivAddrUser2}.
-
-

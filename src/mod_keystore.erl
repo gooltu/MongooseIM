@@ -4,16 +4,16 @@
 -behaviour(mongoose_module_metrics).
 
 %% gen_mod callbacks
--export([start/2,
-         stop/1]).
+-export([start/2]).
+-export([stop/1]).
+-export([hooks/1]).
+-export([supported_features/0]).
+-export([config_spec/0]).
 
 %% Hook handlers
--export([get_key/2]).
+-export([get_key/3]).
 
-%% Tests only!
--export([validate_opts/1]).
-
--export([config_metrics/1]).
+-export([process_key/1]).
 
 %% Public types
 -export_type([key/0,
@@ -22,73 +22,94 @@
               key_name/0,
               raw_key/0]).
 
--include("mongoose.hrl").
 -include("mod_keystore.hrl").
+-include("mongoose.hrl").
+-include("mongoose_config_spec.hrl").
 
 -define(DEFAULT_RAM_KEY_SIZE, 2048).
--define(IOL2B(L), iolist_to_binary(L)).
 
 %% A key name is used in the config file to name a key (a class of keys).
 %% The name doesn't differentiate between virtual hosts
 %% (i.e. there are multiple keys with the same name,
 %% one per each XMPP domain).
--type key_name() :: any().
+-type key_name() :: atom().
 %% A key ID is used to uniquely identify a key for storage backends.
 %% It's used to maintain separate instances of a key with the same name
 %% for different virtual hosts.
--type key_id() :: {key_name(), jid:server()}.
+-type key_id() :: {key_name(), mongooseim:host_type()}.
 -type raw_key() :: binary().
 -type key_list() :: [{key_id(), raw_key()}].
 -type key_type() :: ram | {file, file:name_all()}.
 
 -type key() :: #key{id :: key_id(), key :: raw_key()}.
 
--callback init(Domain, Opts) -> ok when
-      Domain :: jid:server(),
-      Opts :: [any()].
-
-%% Cluster members race to decide whose key gets stored in the distributed database.
-%% That's why ProposedKey (the key this cluster member tries to propagate to other nodes)
-%% might not be the same as ActualKey (key of the member who will have won the race).
--callback init_ram_key(ProposedKey) -> Result when
-      ProposedKey :: mod_keystore:key(),
-      Result :: {ok, ActualKey} | {error, any()},
-      ActualKey :: mod_keystore:key().
-
--callback get_key(ID :: key_id()) -> key_list().
-
 %%
 %% gen_mod callbacks
 %%
 
--spec start(jid:server(), list()) -> ok.
-start(Domain, Opts) ->
-    validate_opts(Opts),
-    create_keystore_ets(),
-    gen_mod:start_backend_module(?MODULE, Opts),
-    mod_keystore_backend:init(Domain, Opts),
-    init_keys(Domain, Opts),
-    [ ejabberd_hooks:add(Hook, Domain, ?MODULE, Handler, Priority)
-      || {Hook, Handler, Priority} <- hook_handlers() ],
+-spec start(mongooseim:host_type(), gen_mod:module_opts()) -> ok.
+start(HostType, Opts) ->
+    ejabberd_sup:create_ets_table(keystore, [named_table, public, {read_concurrency, true}]),
+    mod_keystore_backend:init(HostType, Opts),
+    init_keys(HostType, Opts),
     ok.
 
--spec stop(jid:server()) -> ok.
-stop(Domain) ->
-    [ ejabberd_hooks:delete(Hook, Domain, ?MODULE, Handler, Priority)
-      || {Hook, Handler, Priority} <- hook_handlers() ],
-    clear_keystore_ets(Domain),
+-spec stop(mongooseim:host_type()) -> ok.
+stop(HostType) ->
+    clear_keystore_ets(HostType),
+    mod_keystore_backend:stop(HostType),
     ok.
+
+-spec hooks(mongooseim:host_type()) -> gen_hook:hook_list().
+hooks(HostType) ->
+    [
+     {get_key, HostType, fun ?MODULE:get_key/3, #{}, 50}
+    ].
+
+-spec supported_features() -> [atom()].
+supported_features() ->
+    [dynamic_domains].
+
+-spec config_spec() -> mongoose_config_spec:config_section().
+config_spec() ->
+    #section{
+        items = #{<<"ram_key_size">> => #option{type = integer,
+                                                validate = non_negative},
+                  <<"keys">> => #list{items = keys_spec(),
+                                      format_items = map}
+        },
+        defaults = #{<<"ram_key_size">> => ?DEFAULT_RAM_KEY_SIZE,
+                     <<"keys">> => #{}}
+    }.
+
+keys_spec() ->
+    #section{
+        items = #{<<"name">> => #option{type = atom,
+                                        validate = non_empty},
+                  <<"type">> => #option{type = atom,
+                                        validate = {enum, [file, ram]}},
+                  <<"path">> => #option{type = string,
+                                        validate = filename}
+        },
+        required = [<<"name">>, <<"type">>],
+        process = fun ?MODULE:process_key/1
+    }.
+
+process_key(#{name := Name, type := file, path := Path}) ->
+    {Name, {file, Path}};
+process_key(#{name := Name, type := ram}) ->
+    {Name, ram}.
 
 %%
 %% Hook handlers
 %%
 
--spec get_key(HandlerAcc, KeyID) -> Result when
+-spec get_key(HandlerAcc, Params, Extra) -> {ok, HandlerAcc} when
       HandlerAcc :: key_list(),
-      KeyID :: key_id(),
-      Result :: key_list().
-get_key(HandlerAcc, KeyID) ->
-    try
+      Params :: #{key_id := key_id()},
+      Extra :: gen_hook:extra().
+get_key(HandlerAcc, #{key_id := KeyID}, _) ->
+    NewAcc = try
         %% This is OK, because the key is
         %% EITHER stored in ETS
         %% OR stored in BACKEND,
@@ -98,61 +119,33 @@ get_key(HandlerAcc, KeyID) ->
          mod_keystore_backend:get_key(KeyID) ++
          HandlerAcc)
     catch
-        E:R ->
-            ?ERROR_MSG("handler error: {~p, ~p}", [E, R]),
+        E:R:S ->
+            ?LOG_ERROR(#{what => get_key_failed,
+                         error => E, reason => R, stacktrace => S}),
             HandlerAcc
-    end.
+    end,
+    {ok, NewAcc}.
 
 %%
 %% Internal functions
 %%
-
-hook_handlers() ->
-    [
-     {get_key, get_key, 50}
-    ].
-
-create_keystore_ets() ->
-    case does_table_exist(keystore) of
-        true -> ok;
-        false ->
-            BaseOpts = [named_table, public,
-                        {read_concurrency, true}],
-            Opts = maybe_add_heir(whereis(ejabberd_sup), self(), BaseOpts),
-            keystore = ets:new(keystore, Opts),
-            ok
-    end.
-
-%% In tests or when module is started in run-time, we need to set heir to the
-%% ETS table, otherwise it will be destroy when the creator's process finishes.
-%% When started normally during node start up, self() =:= EjdSupPid and there
-%% is no need for setting heir
-maybe_add_heir(EjdSupPid, EjdSupPid, BaseOpts) when is_pid(EjdSupPid) ->
-     BaseOpts;
-maybe_add_heir(EjdSupPid, _Self, BaseOpts) when is_pid(EjdSupPid) ->
-      [{heir, EjdSupPid, testing} | BaseOpts];
-maybe_add_heir(_, _, BaseOpts) ->
-      BaseOpts.
-
-clear_keystore_ets(Domain) ->
-    Pattern = {{'_', Domain}, '$1'},
+clear_keystore_ets(HostType) ->
+    Pattern = {{'_', HostType}, '$1'},
     ets:match_delete(keystore, Pattern).
-does_table_exist(NameOrTID) ->
-    ets:info(NameOrTID, name) /= undefined.
 
-init_keys(Domain, Opts) ->
-    [ init_key(K, Domain, Opts) || K <- proplists:get_value(keys, Opts, []) ].
+init_keys(HostType, Opts = #{keys := Keys}) ->
+    maps:map(fun(KeyName, KeyType) -> init_key({KeyName, KeyType}, HostType, Opts) end, Keys).
 
--spec init_key({key_name(), key_type()}, jid:server(), list()) -> ok.
-init_key({KeyName, {file, Path}}, Domain, _Opts) ->
+-spec init_key({key_name(), key_type()}, mongooseim:host_type(), gen_mod:module_opts()) -> ok.
+init_key({KeyName, {file, Path}}, HostType, _Opts) ->
     {ok, Data} = file:read_file(Path),
-    true = ets_store_key({KeyName, Domain}, Data),
+    true = ets_store_key({KeyName, HostType}, Data),
     ok;
-init_key({KeyName, ram}, Domain, Opts) ->
-    ProposedKey = crypto:strong_rand_bytes(get_key_size(Opts)),
-    KeyRecord = #key{id = {KeyName, Domain},
+init_key({KeyName, ram}, HostType, #{ram_key_size := KeySize}) ->
+    ProposedKey = crypto:strong_rand_bytes(KeySize),
+    KeyRecord = #key{id = {KeyName, HostType},
                      key = ProposedKey},
-    {ok, _ActualKey} = mod_keystore_backend:init_ram_key(KeyRecord),
+    {ok, _ActualKey} = mod_keystore_backend:init_ram_key(HostType, KeyRecord),
     ok.
 
 %% It's easier to trace these than ets:{insert, lookup} - much less noise.
@@ -161,24 +154,3 @@ ets_get_key(KeyID) ->
 
 ets_store_key(KeyID, RawKey) ->
     ets:insert(keystore, {KeyID, RawKey}).
-
-get_key_size(Opts) ->
-    case lists:keyfind(ram_key_size, 1, Opts) of
-        false -> ?DEFAULT_RAM_KEY_SIZE;
-        {ram_key_size, KeySize} -> KeySize
-    end.
-
-validate_opts(Opts) ->
-    validate_key_ids(proplists:get_value(keys, Opts, [])).
-
-validate_key_ids(KeySpecs) ->
-    KeyIDs = [ KeyID || {KeyID, _} <- KeySpecs ],
-    SortedAndUniqueKeyIDs = lists:usort(KeyIDs),
-    case KeyIDs -- SortedAndUniqueKeyIDs of
-        [] -> ok;
-        [_|_] -> error(non_unique_key_ids, KeySpecs)
-    end.
-
-config_metrics(Host) ->
-    OptsToReport = [{backend, mnesia}], %list of tuples {option, defualt_value}
-    mongoose_module_metrics:opts_for_module(Host, ?MODULE, OptsToReport).

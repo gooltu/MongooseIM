@@ -18,7 +18,7 @@
 %%==============================================================================
 
 -module(muc_light_http_api_SUITE).
--compile(export_all).
+-compile([export_all, nowarn_export_all]).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -27,7 +27,10 @@
 -include_lib("exml/include/exml.hrl").
 
 -import(muc_light_helper, [stanza_create_room/3]).
-
+-import(distributed_helper, [subhost_pattern/1]).
+-import(domain_helper, [host_type/0, domain/0]).
+-import(config_parser_helper, [mod_config/2]).
+-import(rest_helper, [putt/3, post/3, delete/2]).
 
 %%--------------------------------------------------------------------
 %% Suite configuration
@@ -38,38 +41,36 @@ all() ->
      {group, negative}].
 
 groups() ->
-    G = [{positive, [parallel], success_response()},
-         {negative, [parallel], negative_response()}],
-    ct_helper:repeat_all_until_all_ok(G).
+    [{positive, [parallel], success_response()},
+     {negative, [parallel], negative_response()}].
 
 success_response() ->
     [create_unique_room,
      create_identifiable_room,
      invite_to_room,
      send_message_to_room,
-     delete_room_by_owner
+     delete_room
     ].
 
 negative_response() ->
-    [delete_room_by_non_owner,
-     delete_non_existent_room,
-     delete_room_without_having_a_membership
-    ].
+    [create_room_errors,
+     create_identifiable_room_errors,
+     invite_to_room_errors,
+     send_message_errors,
+     delete_room_errors].
 
 %%--------------------------------------------------------------------
 %% Init & teardown
 %%--------------------------------------------------------------------
 
 init_per_suite(Config) ->
-    dynamic_modules:start(<<"localhost">>, mod_muc_light,
-        [{host, binary_to_list(muc_light_domain())},
-         {rooms_in_rosters, true},
-         {backend, mongoose_helper:mnesia_or_rdbms_backend()}]),
-    escalus:init_per_suite(Config).
+    Config1 = dynamic_modules:save_modules(host_type(), Config),
+    dynamic_modules:ensure_modules(host_type(), required_modules()),
+    escalus:init_per_suite(Config1).
 
 end_per_suite(Config) ->
     escalus_fresh:clean(),
-    dynamic_modules:stop(<<"localhost">>, mod_muc_light),
+    dynamic_modules:restore_modules(Config),
     escalus:end_per_suite(Config).
 
 init_per_group(_GroupName, Config) ->
@@ -84,6 +85,11 @@ init_per_testcase(CaseName, Config) ->
 end_per_testcase(CaseName, Config) ->
     escalus:end_per_testcase(CaseName, Config).
 
+required_modules() ->
+    [{mod_muc_light,
+      mod_config(mod_muc_light, #{rooms_in_rosters => true,
+                                  backend => mongoose_helper:mnesia_or_rdbms_backend()})
+     }].
 
 %%--------------------------------------------------------------------
 %% Tests
@@ -91,8 +97,8 @@ end_per_testcase(CaseName, Config) ->
 
 create_unique_room(Config) ->
     escalus:fresh_story(Config, [{alice, 1}], fun(Alice) ->
-        Domain = <<"localhost">>,
-        Path = <<"/muc-lights", $/, Domain/binary>>,
+        MUCLightDomain = muc_light_domain(),
+        Path = path([MUCLightDomain]),
         Name = <<"wonderland">>,
         Body = #{ name => Name,
                   owner => escalus_client:short_jid(Alice),
@@ -100,16 +106,15 @@ create_unique_room(Config) ->
                 },
         {{<<"201">>, _}, _} = rest_helper:post(admin, Path, Body),
         [Item] = get_disco_rooms(Alice),
-        MUCLightDomain = muc_light_domain(),
         true = is_room_name(Name, Item),
         true = is_room_domain(MUCLightDomain, Item)
     end).
 
 create_identifiable_room(Config) ->
     escalus:fresh_story(Config, [{alice, 1}], fun(Alice) ->
-        Domain = <<"localhost">>,
-        Path = <<"/muc-lights", $/, Domain/binary>>,
-        RandBits = base16:encode(crypto:strong_rand_bytes(5)),
+        MUCLightDomain = muc_light_domain(),
+        Path = path([MUCLightDomain]),
+        RandBits = binary:encode_hex(crypto:strong_rand_bytes(5), lowercase),
         Name = <<"wonderland">>,
         RoomID = <<"just_some_id_", RandBits/binary>>,
         RoomIDescaped = escalus_utils:jid_to_lower(RoomID),
@@ -121,22 +126,19 @@ create_identifiable_room(Config) ->
         {{<<"201">>, _}, RoomJID} = rest_helper:putt(admin, Path, Body),
         [Item] = get_disco_rooms(Alice),
         [RoomIDescaped, MUCLightDomain] = binary:split(RoomJID, <<"@">>),
-        MUCLightDomain = muc_light_domain(),
         true = is_room_name(Name, Item),
         true = is_room_domain(MUCLightDomain, Item),
         true = is_room_id(RoomIDescaped, Item)
     end).
 
 invite_to_room(Config) ->
-    Domain = muc_light_domain(),
-    Name = <<"wonderland">>,
-    Path = <<"/muc-lights", $/, Domain/binary, $/, Name/binary, $/,
-             "participants">>,
     escalus:fresh_story(Config, [{alice, 1}, {bob, 1}, {kate, 1}],
       fun(Alice, Bob, Kate) ->
+        RoomID = atom_to_binary(?FUNCTION_NAME),
+        Path = path([muc_light_domain(), RoomID, "participants"]),
         %% XMPP: Alice creates a room.
-        Stt = stanza_create_room(undefined,
-            [{<<"roomname">>, Name}], [{Kate, member}]),
+        Stt = stanza_create_room(RoomID,
+            [{<<"roomname">>, <<"wonderland">>}], [{Kate, member}]),
         escalus:send(Alice, Stt),
         %% XMPP: Alice recieves a affiliation message to herself and
         %% an IQ result when creating the MUC Light room.
@@ -157,17 +159,15 @@ invite_to_room(Config) ->
       end).
 
 send_message_to_room(Config) ->
-    Domain = muc_light_domain(),
-    Name = <<"wonderland">>,
-    Path = <<"/muc-lights",$/,Domain/binary,$/,
-             Name/binary,$/,"messages">>,
+    RoomID = atom_to_binary(?FUNCTION_NAME),
+    Path = path([muc_light_domain(), RoomID, "messages"]),
     Text = <<"Hello everyone!">>,
     escalus:fresh_story(Config,
       [{alice, 1}, {bob, 1}, {kate, 1}],
       fun(Alice, Bob, Kate) ->
         %% XMPP: Alice creates a room.
-        escalus:send(Alice, stanza_create_room(undefined,
-            [{<<"roomname">>, Name}], [{Bob, member}, {Kate, member}])),
+        escalus:send(Alice, stanza_create_room(RoomID,
+            [{<<"roomname">>, <<"wonderland">>}], [{Bob, member}, {Kate, member}])),
         %% XMPP: Alice gets her own affiliation info
         escalus:wait_for_stanza(Alice),
         %% XMPP: And Alice gets IQ result
@@ -184,47 +184,122 @@ send_message_to_room(Config) ->
         [ see_message_from_user(U, Alice, Text) || U <- [Bob, Kate] ]
     end).
 
-delete_room_by_owner(Config) ->
+delete_room(Config) ->
+    RoomID = atom_to_binary(?FUNCTION_NAME),
     RoomName = <<"wonderland">>,
     escalus:fresh_story(Config,
                         [{alice, 1}, {bob, 1}, {kate, 1}],
                         fun(Alice, Bob, Kate)->
                                 {{<<"204">>, <<"No Content">>}, <<"">>} =
-                                    check_delete_room(Config, RoomName, RoomName,
-                                                      Alice, [Bob, Kate], Alice)
+                                    check_delete_room(Config, RoomName, RoomID, RoomID,
+                                                      Alice, [Bob, Kate])
                         end).
 
-delete_room_by_non_owner(Config) ->
-    RoomName = <<"wonderland">>,
-    escalus:fresh_story(Config,
-                        [{alice, 1}, {bob, 1}, {kate, 1}],
-                        fun(Alice, Bob, Kate)->
-                                {{<<"403">>, <<"Forbidden">>},
-                                 <<"Command not available for this user">>} =
-                                    check_delete_room(Config, RoomName, RoomName,
-                                                      Alice, [Bob, Kate], Bob)
-                        end).
+create_room_errors(Config) ->
+    Config1 = escalus_fresh:create_users(Config, [{alice, 1}]),
+    AliceJid = escalus_users:get_jid(Config1, alice),
+    Path = path([muc_light_domain()]),
+    Body = #{name => <<"Name">>, owner => AliceJid, subject => <<"Lewis Carol">>},
+    {{<<"400">>, _}, <<"Missing room name">>} =
+        post(admin, Path, maps:remove(name, Body)),
+    {{<<"400">>, _}, <<"Missing owner JID">>} =
+        post(admin, Path, maps:remove(owner, Body)),
+    {{<<"400">>, _}, <<"Missing room subject">>} =
+        post(admin, Path, maps:remove(subject, Body)),
+    {{<<"400">>, _}, <<"Invalid owner JID">>} =
+        post(admin, Path, Body#{owner := <<"@invalid">>}),
+    {{<<"400">>, _}, <<"Given user does not exist">>} =
+        post(admin, Path, Body#{owner := <<"baduser@", (domain())/binary>>}),
+    {{<<"404">>, _}, <<"MUC Light server not found">>} =
+        post(admin, path([domain_helper:domain()]), Body).
 
-delete_non_existent_room(Config) ->
-    RoomName = <<"wonderland">>,
-    escalus:fresh_story(Config,
-                        [{alice, 1}, {bob, 1}, {kate, 1}],
-                        fun(Alice, Bob, Kate)->
-                                {{<<"500">>, _}, _} =
-                                    check_delete_room(Config, RoomName, <<"some_non_existent_room">>,
-                                                      Alice, [Bob, Kate], Alice)
-                        end).
+create_identifiable_room_errors(Config) ->
+    Config1 = escalus_fresh:create_users(Config, [{alice, 1}]),
+    AliceJid = escalus_users:get_jid(Config1, alice),
+    Path = path([muc_light_domain()]),
+    Body = #{id => <<"ID">>, name => <<"NameA">>, owner => AliceJid, subject => <<"Lewis Carol">>},
+    {{<<"201">>, _}, _RoomJID} = putt(admin, Path, Body#{id => <<"ID1">>}),
+    % Fails to create a room with the same ID
+    {{<<"400">>, _}, <<"Missing room ID">>} =
+        putt(admin, Path, maps:remove(id, Body)),
+    {{<<"400">>, _}, <<"Missing room name">>} =
+        putt(admin, Path, maps:remove(name, Body)),
+    {{<<"400">>, _}, <<"Missing owner JID">>} =
+        putt(admin, Path, maps:remove(owner, Body)),
+    {{<<"400">>, _}, <<"Missing room subject">>} =
+        putt(admin, Path, maps:remove(subject, Body)),
+    {{<<"400">>, _}, <<"Invalid owner JID">>} =
+        putt(admin, Path, Body#{owner := <<"@invalid">>}),
+    {{<<"400">>, _}, <<"Given user does not exist">>} =
+        post(admin, Path, Body#{owner := <<"baduser@", (domain())/binary>>}),
+    {{<<"403">>, _}, <<"Room already exists">>} =
+        putt(admin, Path, Body#{id := <<"ID1">>, name := <<"NameB">>}),
+    {{<<"404">>, _}, <<"MUC Light server not found">>} =
+        putt(admin, path([domain_helper:domain()]), Body).
 
-delete_room_without_having_a_membership(Config) ->
-    RoomName = <<"wonderland">>,
-    escalus:fresh_story(Config,
-                        [{alice, 1}, {bob, 1}, {kate, 1}],
-                        fun(Alice, Bob, Kate)->
-                                {{<<"500">>, _}, _} =
-                                    check_delete_room(Config, RoomName, RoomName,
-                                                      Alice, [Bob], Kate)
-                        end).
+invite_to_room_errors(Config) ->
+    Config1 = escalus_fresh:create_users(Config, [{alice, 1}, {bob, 1}]),
+    AliceJid = escalus_users:get_jid(Config1, alice),
+    BobJid = escalus_users:get_jid(Config1, bob),
+    Name = jid:nodeprep(<<(escalus_users:get_username(Config1, alice))/binary, "-room">>),
+    muc_light_helper:create_room(Name, muc_light_domain(), alice, [], Config1, <<"v1">>),
+    Path = path([muc_light_domain(), Name, "participants"]),
+    Body = #{sender => AliceJid, recipient => BobJid},
+    {{<<"400">>, _}, <<"Missing recipient JID">>} =
+        rest_helper:post(admin, Path, maps:remove(recipient, Body)),
+    {{<<"400">>, _}, <<"Missing sender JID">>} =
+        rest_helper:post(admin, Path, maps:remove(sender, Body)),
+    {{<<"400">>, _}, <<"Invalid recipient JID">>} =
+        rest_helper:post(admin, Path, Body#{recipient := <<"@invalid">>}),
+    {{<<"400">>, _}, <<"Invalid sender JID">>} =
+        rest_helper:post(admin, Path, Body#{sender := <<"@invalid">>}),
+    {{<<"400">>, _}, <<"Given user does not exist">>} =
+        rest_helper:post(admin, Path, Body#{sender := <<"baduser@", (domain())/binary>>}),
+    {{<<"403">>, _}, <<"Given user does not occupy this room">>} =
+        rest_helper:post(admin, Path, Body#{sender := BobJid, recipient := AliceJid}),
+    {{<<"404">>, _}, <<"Room not found">>} =
+        rest_helper:post(admin, path([muc_light_domain(), "badroom", "participants"]), Body),
+    {{<<"404">>, _}, <<"MUC Light server not found">>} =
+        rest_helper:post(admin, path([domain(), Name, "participants"]), Body).
 
+send_message_errors(Config) ->
+    Config1 = escalus_fresh:create_users(Config, [{alice, 1}, {bob, 1}]),
+    AliceJid = escalus_users:get_jid(Config1, alice),
+    BobJid = escalus_users:get_jid(Config1, bob),
+    Name = jid:nodeprep(<<(escalus_users:get_username(Config1, alice))/binary, "-room">>),
+    muc_light_helper:create_room(Name, muc_light_domain(), alice, [], Config1, <<"v1">>),
+    Path = path([muc_light_domain(), Name, "messages"]),
+    Body = #{from => AliceJid, body => <<"hello">>},
+    {{<<"204">>, _}, <<>>} =
+        rest_helper:post(admin, Path, Body),
+    {{<<"400">>, _}, <<"Missing message body">>} =
+        rest_helper:post(admin, Path, maps:remove(body, Body)),
+    {{<<"400">>, _}, <<"Missing sender JID">>} =
+        rest_helper:post(admin, Path, maps:remove(from, Body)),
+    {{<<"400">>, _}, <<"Invalid sender JID">>} =
+        rest_helper:post(admin, Path, Body#{from := <<"@invalid">>}),
+    {{<<"400">>, _}, <<"Given user does not exist">>} =
+        rest_helper:post(admin, Path, Body#{from := <<"baduser@", (domain())/binary>>}),
+    {{<<"403">>, _}, <<"Given user does not occupy this room">>} =
+        rest_helper:post(admin, Path, Body#{from := BobJid}),
+    {{<<"404">>, _}, <<"Room not found">>} =
+        rest_helper:post(admin, path([muc_light_domain(), "badroom", "messages"]), Body),
+    {{<<"404">>, _}, <<"MUC Light server not found">>} =
+        rest_helper:post(admin, path([domain(), Name, "messages"]), Body).
+
+delete_room_errors(_Config) ->
+    {{<<"400">>, _}, <<"Invalid room ID or domain name">>} =
+        delete(admin, path([muc_light_domain(), "@badroom", "management"])),
+    {{<<"404">>, _}, _} =
+        delete(admin, path([muc_light_domain()])),
+    {{<<"404">>, _}, _} =
+        delete(admin, path([muc_light_domain(), "badroom"])),
+    {{<<"404">>, _}, <<"Room not found">>} =
+        delete(admin, path([muc_light_domain(), "badroom", "management"])),
+    {{<<"404">>, _}, <<"MUC Light server not found">>} =
+        delete(admin, path([domain(), "badroom", "management"])),
+    {{<<"404">>, _}, <<"MUC Light server not found">>} =
+        delete(admin, path(["baddomain", "badroom", "management"])).
 
 %%--------------------------------------------------------------------
 %% Ancillary (borrowed and adapted from the MUC and MUC Light suites)
@@ -265,12 +340,10 @@ member_is_affiliated(Stanza, User) ->
     Data = exml_query:path(Stanza, [{element, <<"x">>}, {element, <<"user">>}, cdata]),
     MemberJID == Data.
 
-check_delete_room(Config, RoomNameToCreate, RoomNameToDelete, RoomOwner,
-                  RoomMembers, UserToExecuteDelete) ->
-    Domain = muc_light_domain(),
+check_delete_room(_Config, RoomName, RoomIDToCreate, RoomIDToDelete, RoomOwner, RoomMembers) ->
     Members = [{Member, member} || Member <- RoomMembers],
-    escalus:send(RoomOwner, stanza_create_room(undefined,
-                                           [{<<"roomname">>, RoomNameToCreate}],
+    escalus:send(RoomOwner, stanza_create_room(RoomIDToCreate,
+                                           [{<<"roomname">>, RoomName}],
                                            Members)),
     %% XMPP RoomOwner gets affiliation and IQ result
     Affiliations = [{RoomOwner, owner} | Members],
@@ -279,16 +352,16 @@ check_delete_room(Config, RoomNameToCreate, RoomNameToDelete, RoomOwner,
     CreationResult = escalus:wait_for_stanza(RoomOwner),
     escalus:assert(is_iq_result, CreationResult),
     muc_light_helper:verify_aff_bcast(Members, Affiliations),
-    ShortJID = escalus_client:short_jid(UserToExecuteDelete),
-    Path = <<"/muc-lights",$/,Domain/binary,$/,
-             RoomNameToDelete/binary,$/,ShortJID/binary,$/,"management">>,
+    Path = path([muc_light_domain(), RoomIDToDelete, "management"]),
     rest_helper:delete(admin, Path).
 
 %%--------------------------------------------------------------------
-%% Constants
+%% Helpers
 %%--------------------------------------------------------------------
 
-muc_light_domain() ->
-    XMPPParentDomain = ct:get_config({hosts, mim, domain}),
-    <<"muclight", ".", XMPPParentDomain/binary>>.
+path(Items) ->
+    AllItems = ["muc-lights" | Items],
+    iolist_to_binary([[$/, Item] || Item <- AllItems]).
 
+muc_light_domain() ->
+    muc_light_helper:muc_host().

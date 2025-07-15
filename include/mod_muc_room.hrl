@@ -62,14 +62,15 @@
 
 -record(activity, {message_time = 0,
                    presence_time = 0,
-                   message_shaper :: shaper:shaper(),
-                   presence_shaper :: shaper:shaper(),
+                   message_shaper :: mongoose_shaper:shaper(),
+                   presence_shaper :: mongoose_shaper:shaper(),
                    message,
                    presence
                   }).
 
 -record(state, {room                :: mod_muc:room(),
                 host                :: jid:server(),
+                host_type           :: mongooseim:host_type(),
                 server_host         :: jid:server(),
                 access              :: mod_muc:access(),
                 jid                 :: jid:jid(),
@@ -81,9 +82,10 @@
                 history,
                 subject = <<>>,
                 subject_author = <<>>,
+                subject_timestamp = <<>>,
                 just_created = false     :: boolean(),
                 activity = treap:empty() :: treap:treap(),
-                room_shaper              :: shaper:shaper(),
+                room_shaper              :: mongoose_shaper:shaper(),
                 room_queue = queue:new(),
                 http_auth_pool = none :: none | mongoose_http_client:pool(),
                 http_auth_pids = [] :: [pid()],

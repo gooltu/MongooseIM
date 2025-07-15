@@ -20,6 +20,8 @@
 -export([sign/8]).
 -export([datetime_iso8601/1, date_iso8601/1, compose_scope/3, uri_encode/1]).
 
+-ignore_xref([date_iso8601/1]).
+
 %%--------------------------------------------------------------------
 %% API
 %%--------------------------------------------------------------------
@@ -162,12 +164,12 @@ uri_encode_char(C, _) when C >= $a, C =< $z -> <<C>>;
 uri_encode_char(C, _) when C >= $0, C =< $9 -> <<C>>;
 uri_encode_char(C, _) when C == $_; C == $-; C == $~; C == $. -> <<C>>;
 uri_encode_char($/, false) -> <<$/>>;
-uri_encode_char(C, _) -> list_to_binary([$% | httpd_util:integer_to_hexlist(C)]).
+uri_encode_char(C, _) -> list_to_binary([$% | integer_to_list(C, 16)]).
 
 
 -spec hex(Data :: binary()) -> HexEncoded :: binary().
 hex(Data) ->
-    base16:encode(Data).
+    binary:encode_hex(Data, lowercase).
 
 
 -spec sha256_hash(Data :: binary()) -> Hash :: binary().
@@ -177,4 +179,4 @@ sha256_hash(Data) ->
 
 -spec hmac_sha256(Key :: binary(), Data :: binary()) -> Hash :: binary().
 hmac_sha256(Key, Data) ->
-    crypto:hmac(sha256, Key, Data).
+    crypto:mac(hmac, sha256, Key, Data).

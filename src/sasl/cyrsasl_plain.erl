@@ -26,7 +26,10 @@
 -module(cyrsasl_plain).
 -author('alexey@process-one.net').
 
--export([mechanism/0, mech_new/3, mech_step/2, parse/1]).
+-export([mechanism/0, mech_new/3, mech_step/2]).
+
+-ignore_xref([mech_new/3]).
+
 -behaviour(cyrsasl).
 
 -include("mongoose.hrl").
@@ -61,12 +64,7 @@ authorize(Request, User) ->
         {ok, Result} ->
             {ok, Result};
         {error, not_authorized} ->
-            {error, <<"not-authorized">>, User};
-        {error, {no_auth_modules, _}} ->
-            {error, <<"not-authorized">>, User};
-        {error, R} ->
-            ?DEBUG("authorize error: ~p", [R]),
-            {error, <<"internal-error">>}
+            {error, <<"not-authorized">>, User}
     end.
 
 -spec prepare(binary()) -> 'error' | [binary(), ...].

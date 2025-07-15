@@ -23,11 +23,17 @@
 %%%
 %%%----------------------------------------------------------------------
 
+%%%----------------------------------------------------------------------
+%%% FIXME: the code in this module uses Host term to identify domain
+%%% name, not a host type.
+%%%----------------------------------------------------------------------
+
 -module(ejabberd_local).
 -author('alexey@process-one.net').
 
 -behaviour(gen_server).
 -behaviour(mongoose_packet_handler).
+-behaviour(gen_iq_component).
 
 %% API
 -export([start_link/0]).
@@ -36,44 +42,45 @@
          route_iq/5,
          route_iq/6,
          process_iq_reply/4,
-         register_iq_handler/4,
-         register_iq_handler/5,
+         register_iq_handler/3,
          register_host/1,
-         register_iq_response_handler/4,
-         register_iq_response_handler/5,
          unregister_iq_handler/2,
          unregister_host/1,
-         unregister_iq_response_handler/2,
-         refresh_iq_handlers/0,
-         bounce_resource_packet/4
+         sync/0
         ]).
+
+%% RPC callbacks
+-export([get_iq_callback/1]).
 
 %% Hooks callbacks
 
--export([node_cleanup/2]).
+-export([disco_local_features/3]).
 
 %% gen_server callbacks
--export([init/1, handle_call/3, handle_cast/2, handle_info/2,
-         terminate/2, code_change/3]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -export([do_route/4]).
 
-%% For testing only
--export([get_iq_callback/1]).
-
+-ignore_xref([do_route/4, get_iq_callback/1,
+              process_iq_reply/4, start_link/0]).
 
 -include("mongoose.hrl").
 -include("jlib.hrl").
+-include("session.hrl").
 
 -record(state, {}).
 
--type id() :: any().
--record(iq_response, {id :: id(),
-                      module,
-                      function,
-                      timer}).
+-type id() :: binary().
+-type callback() :: fun((From :: jid:jid(), To :: jid:jid(),
+                         Acc :: mongoose_acc:t(), IQ :: jlib:iq()) ->
+                             mongoose_acc:t()) |
+                    fun((From :: undefined, To :: undefined,
+                         Acc :: undefined, IQ :: timeout) ->
+                             undefined).
 
 -define(IQTABLE, local_iqtable).
+-define(NSTABLE, local_nstable).
+-define(IQRESPONSE, local_iqresponse).
 
 %% This value is used in SIP and Megaco for a transaction lifetime.
 -define(IQ_TIMEOUT, 32000).
@@ -81,13 +88,9 @@
 %%====================================================================
 %% API
 %%====================================================================
-%%--------------------------------------------------------------------
-%% Function: start_link() -> {ok, Pid} | ignore | {error, Error}
-%% Description: Starts the server
-%%--------------------------------------------------------------------
--spec start_link() -> 'ignore' | {'error', _} | {'ok', pid()}.
+-spec start_link() -> gen_server:start_ret().
 start_link() ->
-    gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+    gen_server:start_link({local, ?MODULE}, ?MODULE, noargs, []).
 
 -spec process_iq(Acc :: mongoose_acc:t(),
                  From :: jid:jid(),
@@ -104,16 +107,12 @@ process_iq(#iq{ type = Type } = IQReply, Acc, From, To, _El)
 process_iq(#iq{ xmlns = XMLNS } = IQ, Acc, From, To, _El) ->
     Host = To#jid.lserver,
     case ets:lookup(?IQTABLE, {XMLNS, Host}) of
-        [{_, Module, Function}] ->
-            case Module:Function(From, To, IQ) of
-                {Acc1, ignore} -> Acc1;
-                {Acc1, ResIQ} -> ejabberd_router:route(To, From, Acc1, jlib:iq_to_xml(ResIQ))
-            end;
-        [{_, Module, Function, Opts}] ->
-            gen_iq_handler:handle(Host, Module, Function, Opts,
-                                  From, To, Acc, IQ);
+        [{_, IQHandler}] ->
+            gen_iq_component:handle(IQHandler, Acc, From, To, IQ);
         [] ->
-            ejabberd_router:route_error_reply(To, From, Acc, mongoose_xmpp_errors:feature_not_implemented())
+            T = <<"Local server does not implement this feature">>,
+            ejabberd_router:route_error_reply(To, From, Acc,
+                mongoose_xmpp_errors:feature_not_implemented(<<"en">>, T))
     end;
 process_iq(_, Acc, From, To, El) ->
     {Acc1, Err} = jlib:make_error_reply(Acc, El, mongoose_xmpp_errors:bad_request()),
@@ -121,32 +120,52 @@ process_iq(_, Acc, From, To, El) ->
 
 -spec process_iq_reply(From :: jid:jid(),
                        To :: jid:jid(),
-                       mongoose_acc:t(),
-                       IQ :: jlib:iq() ) -> mongoose_acc:t().
-process_iq_reply(From, To, Acc, #iq{id = ID} = IQ) ->
-    case get_iq_callback(ID) of
-        {ok, undefined, Function} ->
-            Function(From, To, Acc, IQ);
-        {ok, Module, Function} ->
-            Module:Function(From, To, Acc, IQ);
-        _ ->
+                       Acc :: mongoose_acc:t(),
+                       IQ :: jlib:iq()) -> mongoose_acc:t().
+process_iq_reply(From, To, Acc, #iq{type = Type, id = ID} = IQ) ->
+    case get_iq_callback_in_cluster(ID, Acc) of
+        {ok, Callback} ->
+            Callback(From, To, Acc, IQ);
+        Other ->
+            %% 8.2.3. IQ Semantics (https://www.rfc-editor.org/rfc/rfc6120)
+            %% An entity that receives a stanza of type "result" or "error" MUST
+            %% NOT respond to the stanza by sending a further IQ response of
+            %% type "result" or "error".
+            %% (Do not reply).
+            ?LOG_INFO(#{what => dropped_iq_reply,
+                        text => <<"User send an unexpected IQ "
+                                  " type=", (atom_to_binary(Type))/binary,
+                                  ". Ignore the stanza.">>,
+                        reason => Other, acc => Acc}),
             Acc
     end.
 
+-spec get_iq_callback_in_cluster(id(), mongoose_acc:t()) ->
+        {ok, callback()} | {error, term()}.
+get_iq_callback_in_cluster(ID, _Acc) ->
+    %% We store information from which node the request is originating in the ID
+    case parse_iq_id(ID) of
+        local_node ->
+            get_iq_callback(ID);
+        {remote_node, NodeName} ->
+            rpc:call(NodeName, ?MODULE, get_iq_callback, [ID]);
+        {error, Reason} ->
+            {error, Reason}
+    end.
 
--spec process_packet(Acc :: mongoose_acc:t(), From :: jid:jid(), To ::jid:jid(), El :: exml:element(),
-                     Extra :: any()) ->
-    ok | {error, lager_not_running}.
+-spec process_packet(Acc :: mongoose_acc:t(),
+                     From :: jid:jid(),
+                     To ::jid:jid(),
+                     El :: exml:element(),
+                     Extra :: map()) -> mongoose_acc:t().
 process_packet(Acc, From, To, El, _Extra) ->
     try
         do_route(Acc, From, To, El)
     catch
-        _:Reason:StackTrace ->
-            ?ERROR_MSG("event=routing_error,from=~ts,to=~ts,module=~p,"
-                       "reason=~p,packet=~ts,stack_trace=~p",
-                       [jid:to_binary(From), jid:to_binary(To),
-                        ?MODULE, Reason, exml:to_binary(mongoose_acc:element(Acc)),
-                        StackTrace])
+        Class:Reason:Stacktrace ->
+            ?LOG_ERROR(#{what => routing_error, acc => Acc,
+                         class => Class, reason => Reason, stacktrace => Stacktrace}),
+            Acc
     end.
 
 -spec route_iq(From :: jid:jid(),
@@ -158,33 +177,32 @@ route_iq(From, To, Acc, IQ, F) ->
     route_iq(From, To, Acc, IQ, F, undefined).
 
 
+%% Send an iq and wait for response
+%% This function is used to route IQs from the server to the client.
+%% A callback function would be called once a response is received from the client.
 -spec route_iq(From :: jid:jid(),
                To :: jid:jid(),
                Acc :: mongoose_acc:t(),
                IQ :: jlib:iq(),
-               F :: fun(),
+               Callback :: callback(),
                Timeout :: undefined | integer()) -> mongoose_acc:t().
-route_iq(From, To, Acc, #iq{type = Type} = IQ, F, Timeout) when is_function(F) ->
+route_iq(From, To, Acc, #iq{type = Type} = IQ, Callback, Timeout)
+  when is_function(Callback) ->
     Packet = case Type == set orelse Type == get of
                 true ->
-                     ID = mongoose_bin:gen_from_crypto(),
-                     Host = From#jid.lserver,
-                     register_iq_response_handler(Host, ID, undefined, F, Timeout),
+                     ID = make_iq_id(),
+                     register_iq_response_handler(ID, Callback, Timeout),
                      jlib:iq_to_xml(IQ#iq{id = ID});
                 false ->
                      jlib:iq_to_xml(IQ)
              end,
     ejabberd_router:route(From, To, Acc, Packet).
 
-register_iq_response_handler(Host, ID, Module, Function) ->
-    register_iq_response_handler(Host, ID, Module, Function, undefined).
-
--spec register_iq_response_handler(_Host :: jid:server(),
-                               ID :: id(),
-                               Module :: atom(),
-                               Function :: fun(),
-                               Timeout :: 'undefined' | pos_integer()) -> any().
-register_iq_response_handler(_Host, ID, Module, Function, Timeout0) ->
+-spec register_iq_response_handler(
+           ID :: id(),
+           Callback :: callback(),
+           Timeout :: undefined | pos_integer()) -> any().
+register_iq_response_handler(ID, Callback, Timeout0) ->
     Timeout = case Timeout0 of
                   undefined ->
                       ?IQ_TIMEOUT;
@@ -192,48 +210,31 @@ register_iq_response_handler(_Host, ID, Module, Function, Timeout0) ->
                       N
               end,
     TRef = erlang:start_timer(Timeout, ejabberd_local, ID),
-    mnesia:dirty_write(#iq_response{id = ID,
-                                    module = Module,
-                                    function = Function,
-                                    timer = TRef}).
+    ets:insert(?IQRESPONSE, {ID, Callback, TRef}).
 
--spec register_iq_handler(Host :: jid:server(),
-                          XMLNS :: binary(),
-                          Module :: atom(),
-                          Function :: fun()) -> {register_iq_handler, _, _, _, _}.
-register_iq_handler(Host, XMLNS, Module, Fun) ->
-    ejabberd_local ! {register_iq_handler, Host, XMLNS, Module, Fun}.
-
--spec register_iq_handler(Host :: jid:server(),
-                          XMLNS :: binary(),
-                          Module :: atom(),
-                          Function :: fun(),
-                          Opts :: [any()]) -> {register_iq_handler, _, _, _, _, _}.
-register_iq_handler(Host, XMLNS, Module, Fun, Opts) ->
-    ejabberd_local ! {register_iq_handler, Host, XMLNS, Module, Fun, Opts}.
-
--spec unregister_iq_response_handler(_Host :: jid:server(),
-                                     ID :: id()) -> 'ok'.
-unregister_iq_response_handler(_Host, ID) ->
-    catch get_iq_callback(ID),
+-spec register_iq_handler(Domain :: jid:server(), Namespace :: binary(),
+                          IQHandler :: mongoose_iq_handler:t()) -> ok.
+register_iq_handler(Domain, XMLNS, IQHandler) ->
+    ejabberd_local ! {register_iq_handler, Domain, XMLNS, IQHandler},
     ok.
 
--spec unregister_iq_handler(Host :: jid:server(),
-                           XMLNS :: binary()) -> {unregister_iq_handler, _, _}.
-unregister_iq_handler(Host, XMLNS) ->
-    ejabberd_local ! {unregister_iq_handler, Host, XMLNS}.
+-spec sync() -> ok.
+sync() ->
+    gen_server:call(ejabberd_local, sync).
 
-refresh_iq_handlers() ->
-    ejabberd_local ! refresh_iq_handlers.
+-spec unregister_iq_handler(Domain :: jid:server(), Namespace :: binary()) -> ok.
+unregister_iq_handler(Domain, XMLNS) ->
+    ejabberd_local ! {unregister_iq_handler, Domain, XMLNS},
+    ok.
 
--spec bounce_resource_packet(Acc:: mongoose_acc:t(),
+-spec bounce_resource_packet(Acc :: mongoose_acc:t(),
                              From :: jid:jid(),
                              To :: jid:jid(),
-                             El :: exml:element()) -> {'stop', mongoose_acc:t()}.
+                             El :: exml:element()) -> mongoose_acc:t().
 bounce_resource_packet(Acc, From, To, El) ->
     {Acc1, Err} = jlib:make_error_reply(Acc, El, mongoose_xmpp_errors:item_not_found()),
     ejabberd_router:route(To, From, Acc1, Err),
-    {stop, Acc}.
+    Acc.
 
 -spec register_host(Host :: jid:server()) -> ok.
 register_host(Host) ->
@@ -243,23 +244,14 @@ register_host(Host) ->
 unregister_host(Host) ->
     gen_server:call(?MODULE, {unregister_host, Host}).
 
-%%====================================================================
-%% API
-%%====================================================================
-
-node_cleanup(Acc, Node) ->
-    F = fun() ->
-                Keys = mnesia:select(
-                         iq_response,
-                         [{#iq_response{timer = '$1', id = '$2', _ = '_'},
-                           [{'==', {node, '$1'}, Node}],
-                           ['$2']}]),
-                lists:foreach(fun(Key) ->
-                                      mnesia:delete({iq_response, Key})
-                              end, Keys)
-        end,
-    Res = mnesia:async_dirty(F),
-    maps:put(?MODULE, Res, Acc).
+-spec disco_local_features(mongoose_disco:feature_acc(),
+                           map(),
+                           map()) -> {ok, mongoose_disco:feature_acc()}.
+disco_local_features(Acc = #{to_jid := #jid{lserver = LServer}, node := <<>>}, _, _) ->
+    Features = [Feature || {_, Feature} <- ets:lookup(?NSTABLE, LServer)],
+    {ok, mongoose_disco:add_features(Features, Acc)};
+disco_local_features(Acc, _, _) ->
+    {ok, Acc}.
 
 %%====================================================================
 %% gen_server callbacks
@@ -272,88 +264,48 @@ node_cleanup(Acc, Node) ->
 %%                         {stop, Reason}
 %% Description: Initiates the server
 %%--------------------------------------------------------------------
-init([]) ->
-    lists:foreach(fun do_register_host/1, ?MYHOSTS),
-    catch ets:new(?IQTABLE, [named_table, public]),
-    update_table(),
-    mnesia:create_table(iq_response,
-                        [{ram_copies, [node()]},
-                         {attributes, record_info(fields, iq_response)}]),
-    mnesia:add_table_copy(iq_response, node(), ram_copies),
-    ejabberd_hooks:add(node_cleanup, global, ?MODULE, node_cleanup, 50),
+init(noargs) ->
+    catch ets:new(?IQTABLE, [named_table, protected, {read_concurrency, true}]),
+    catch ets:new(?NSTABLE, [named_table, bag, protected, {read_concurrency, true}]),
+    catch ets:new(?IQRESPONSE, [named_table, public]),
+    gen_hook:add_handlers(hooks()),
     {ok, #state{}}.
 
-%%--------------------------------------------------------------------
-%% Function: %% handle_call(Request, From, State) -> {reply, Reply, State} |
-%%                                      {reply, Reply, State, Timeout} |
-%%                                      {noreply, State} |
-%%                                      {noreply, State, Timeout} |
-%%                                      {stop, Reason, Reply, State} |
-%%                                      {stop, Reason, State}
-%% Description: Handling call messages
-%%--------------------------------------------------------------------
 handle_call({unregister_host, Host}, _From, State) ->
-    [ejabberd_c2s:stop(Pid)
-     || {_, {_, Pid}, _, _} <- ejabberd_sm:get_vh_session_list(Host)],
+    Node = node(),
+    [mongoose_c2s:stop(Pid, host_was_unregistered)
+     || #session{sid = {_, Pid}} <- ejabberd_sm:get_vh_session_list(Host),
+        node(Pid) =:= Node],
     do_unregister_host(Host),
-    mongoose_metrics:remove_host_metrics(Host),
     {reply, ok, State};
 handle_call({register_host, Host}, _From, State) ->
     do_register_host(Host),
-    mongoose_metrics:init_predefined_host_metrics(Host),
+    {reply, ok, State};
+handle_call(sync, _From, State) ->
     {reply, ok, State};
 handle_call(_Request, _From, State) ->
     Reply = ok,
     {reply, Reply, State}.
 
-%%--------------------------------------------------------------------
-%% Function: handle_cast(Msg, State) -> {noreply, State} |
-%%                                      {noreply, State, Timeout} |
-%%                                      {stop, Reason, State}
-%% Description: Handling cast messages
-%%--------------------------------------------------------------------
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-%%--------------------------------------------------------------------
-%% Function: handle_info(Info, State) -> {noreply, State} |
-%%                                       {noreply, State, Timeout} |
-%%                                       {stop, Reason, State}
-%% Description: Handling all non call/cast messages
-%%--------------------------------------------------------------------
 handle_info({route, Acc, From, To, El}, State) ->
-    process_packet(Acc, From, To, El, undefined),
+    spawn(fun() -> process_packet(Acc, From, To, El, #{}) end),
     {noreply, State};
-handle_info({register_iq_handler, Host, XMLNS, Module, Function}, State) ->
-    ets:insert(?IQTABLE, {{XMLNS, Host}, Module, Function}),
-    catch mod_disco:register_feature(Host, XMLNS),
-    {noreply, State};
-handle_info({register_iq_handler, Host, XMLNS, Module, Function, Opts}, State) ->
-    ets:insert(?IQTABLE, {{XMLNS, Host}, Module, Function, Opts}),
-    catch mod_disco:register_feature(Host, XMLNS),
+handle_info({register_iq_handler, Host, XMLNS, IQHandler}, State) ->
+    ets:insert(?NSTABLE, {Host, XMLNS}),
+    ets:insert(?IQTABLE, {{XMLNS, Host}, IQHandler}),
     {noreply, State};
 handle_info({unregister_iq_handler, Host, XMLNS}, State) ->
     case ets:lookup(?IQTABLE, {XMLNS, Host}) of
-        [{_, Module, Function, Opts}] ->
-            gen_iq_handler:stop_iq_handler(Module, Function, Opts);
+        [{_, IQHandler}] ->
+            gen_iq_component:stop_iq_handler(IQHandler),
+            ets:delete_object(?NSTABLE, {Host, XMLNS}),
+            ets:delete(?IQTABLE, {XMLNS, Host});
         _ ->
             ok
     end,
-    ets:delete(?IQTABLE, {XMLNS, Host}),
-    catch mod_disco:unregister_feature(Host, XMLNS),
-    {noreply, State};
-handle_info(refresh_iq_handlers, State) ->
-    lists:foreach(
-      fun(T) ->
-              case T of
-                  {{XMLNS, Host}, _Module, _Function, _Opts} ->
-                      catch mod_disco:register_feature(Host, XMLNS);
-                  {{XMLNS, Host}, _Module, _Function} ->
-                      catch mod_disco:register_feature(Host, XMLNS);
-                  _ ->
-                      ok
-              end
-      end, ets:tab2list(?IQTABLE)),
     {noreply, State};
 handle_info({timeout, _TRef, ID}, State) ->
     process_iq_timeout(ID),
@@ -369,26 +321,22 @@ handle_info(_Info, State) ->
 %% The return value is ignored.
 %%--------------------------------------------------------------------
 terminate(_Reason, _State) ->
-    ejabberd_hooks:delete(node_cleanup, global, ?MODULE, node_cleanup, 50),
-    ok.
-
-%%--------------------------------------------------------------------
-%% Func: code_change(OldVsn, State, Extra) -> {ok, NewState}
-%% Description: Convert process state when code is changed
-%%--------------------------------------------------------------------
-code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.
+    gen_hook:delete_handlers(hooks()).
 
 %%--------------------------------------------------------------------
 %%% Internal functions
 %%--------------------------------------------------------------------
+
+hooks() ->
+    [{disco_local_features, HostType, fun ?MODULE:disco_local_features/3, #{}, 99}
+     || HostType <- ?ALL_HOST_TYPES].
+
 -spec do_route(Acc :: mongoose_acc:t(),
                From :: jid:jid(),
                To :: jid:jid(),
-               El :: mongoose_acc:t()) -> mongoose_acc:t().
+               El :: exml:element()) -> mongoose_acc:t().
 do_route(Acc, From, To, El) ->
-    ?DEBUG("local route~n\tfrom ~p~n\tto ~p~n\tpacket ~P~n",
-           [From, To, El, 8]),
+    ?LOG_DEBUG(#{what => local_routing, acc => Acc}),
     case directed_to(To) of
         user ->
             ejabberd_sm:route(From, To, Acc, El);
@@ -403,11 +351,7 @@ do_route(Acc, From, To, El) ->
             case mongoose_acc:stanza_type(Acc) of
                 <<"error">> -> Acc;
                 <<"result">> -> Acc;
-                _ ->
-                    mongoose_hooks:local_send_to_resource_hook(
-                                            To#jid.lserver,
-                                            Acc,
-                                            From, To, El)
+                _ -> bounce_resource_packet(Acc, From, To, El)
             end
     end.
 
@@ -422,68 +366,58 @@ directed_to(<<>>, _) ->
 directed_to(_, _) ->
     user.
 
--spec update_table() -> ok | {atomic|aborted, _}.
-update_table() ->
-    case catch mnesia:table_info(iq_response, attributes) of
-        [id, module, function] ->
-            mnesia:delete_table(iq_response);
-        [id, module, function, timer] ->
-            ok;
-        {'EXIT', _} ->
-            ok
-    end.
-
--spec get_iq_callback(ID :: id()) -> 'error' | {'ok', Mod :: atom(), fun() | atom()}.
+-spec get_iq_callback(ID :: id()) -> error | {ok, fun()}.
 get_iq_callback(ID) ->
-    case mnesia:dirty_read(iq_response, ID) of
-        [#iq_response{module = Module, timer = TRef,
-                      function = Function}] ->
-            cancel_timer(TRef),
-            mnesia:dirty_delete(iq_response, ID),
-            {ok, Module, Function};
+    case ets:lookup(?IQRESPONSE, ID) of
+        [{ID, Callback, TRef}] ->
+            erlang:cancel_timer(TRef),
+            ets:delete(?IQRESPONSE, ID),
+            {ok, Callback};
         _ ->
             error
     end.
 
--spec process_iq_timeout(id()) -> id().
+-spec process_iq_timeout(id()) -> ok.
 process_iq_timeout(ID) ->
-    spawn(fun process_iq_timeout/0) ! ID.
+    spawn(fun() -> process_iq_timeout2(ID) end), ok.
 
--spec process_iq_timeout() -> ok | any().
-process_iq_timeout() ->
-    receive
-        ID ->
-            case get_iq_callback(ID) of
-                {ok, undefined, Function} ->
-                    Function(undefined, undefined, undefined, timeout);
-                _ ->
-                    ok
-            end
-    after 5000 ->
-            ok
-    end.
-
--spec cancel_timer(reference()) -> 'ok'.
-cancel_timer(TRef) ->
-    case erlang:cancel_timer(TRef) of
-        false ->
-            receive
-                {timeout, TRef, _} ->
-                    ok
-            after 0 ->
-                    ok
-            end;
+-spec process_iq_timeout2(id()) -> ok.
+process_iq_timeout2(ID) ->
+    case get_iq_callback(ID) of
+        {ok, Function} ->
+            Function(undefined, undefined, undefined, timeout), ok;
         _ ->
             ok
     end.
 
 do_register_host(Host) ->
-    ejabberd_router:register_route(Host, mongoose_packet_handler:new(?MODULE)),
-    ejabberd_hooks:add(local_send_to_resource_hook, Host,
-                       ?MODULE, bounce_resource_packet, 100).
+    mongoose_router:register_route(Host, mongoose_packet_handler:new(?MODULE)).
 
 do_unregister_host(Host) ->
-    ejabberd_router:unregister_route(Host),
-    ejabberd_hooks:delete(local_send_to_resource_hook, Host,
-                          ?MODULE, bounce_resource_packet, 100).
+    mongoose_router:unregister_route(Host).
 
+make_iq_id() ->
+    %% Attach NodeId, so we know to which node to forward the response
+    BinNodeId = mongoose_start_node_id:node_id(),
+    Rand = mongoose_bin:gen_from_crypto(),
+    <<BinNodeId/binary, "_", Rand/binary>>.
+
+%% Parses ID, made by make_iq_id function
+-spec parse_iq_id(ID :: binary()) ->
+    local_node | {remote_node, node()}
+    | {error, {unknown_node_id, term()} | bad_iq_format}.
+parse_iq_id(ID) ->
+    BinNodeId = mongoose_start_node_id:node_id(),
+    case binary:split(ID, <<"_">>) of
+        [BinNodeId, _Rest] ->
+            local_node;
+        [OtherBinNodeId, _Rest] ->
+            case mongoose_start_node_id:node_id_to_name(OtherBinNodeId) of
+                {ok, NodeName} ->
+                    {remote_node, NodeName};
+                {error, Reason} ->
+                    {error, {unknown_node_id, Reason}}
+            end;
+        _ ->
+            {error, bad_iq_format}
+    end.

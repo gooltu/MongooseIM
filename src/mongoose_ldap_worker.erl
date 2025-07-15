@@ -11,11 +11,9 @@
          code_change/3]).
 
 -include("mongoose.hrl").
--include("eldap.hrl").
 
--type state() :: #{handle := none | eldap:handle(),
+-type state() :: #{handle := none | eldap_utils:handle(),
                    servers := [string()],
-                   encrypt := none | tls,
                    tls_options := list(),
                    port := pos_integer(),
                    root_dn := binary(),
@@ -25,7 +23,7 @@
 
 %% gen_server callbacks
 
--spec init(list()) -> {ok, state()}.
+-spec init(gen_mod:module_opts()) -> {ok, state()}.
 init(Options) ->
     State = initial_state(Options),
     self() ! connect,
@@ -38,14 +36,14 @@ handle_call(Request, _From, State) ->
 
 -spec handle_cast(any(), state()) -> {noreply, state()}.
 handle_cast(Cast, State) ->
-    ?ERROR_MSG("Invalid cast: ~p", [Cast]),
+    ?UNEXPECTED_CAST(Cast),
     {noreply, State}.
 
 -spec handle_info(any(), state()) -> {noreply, state()}.
 handle_info(connect, State) ->
     {noreply, connect(State)};
 handle_info(Info, State) ->
-    ?ERROR_MSG("Unexpected info: ~p", [Info]),
+    ?UNEXPECTED_INFO(Info),
     {noreply, State}.
 
 -spec terminate(any(), state()) -> ok.
@@ -59,46 +57,14 @@ code_change(_OldVsn, State, _Extra) ->
 %% internal functions
 
 initial_state(Opts) ->
-    Servers = eldap_utils:get_mod_opt(servers, Opts,
-                      fun(L) ->
-                              lists:map(fun(H) when is_list(H) -> H end, L)
-                      end, ["localhost"]),
-    Encrypt = eldap_utils:get_mod_opt(encrypt, Opts,
-                      fun(tls) -> tls;
-                         (none) -> none
-                      end, none),
-    TLSOptions = eldap_utils:get_mod_opt(tls_options, Opts,
-                        fun(L) when is_list(L) -> L end, []),
-    Port = eldap_utils:get_mod_opt(port, Opts,
-                   fun(I) when is_integer(I), I>0 -> I end,
-                   case Encrypt of
-                       tls -> ?LDAPS_PORT;
-                       starttls -> ?LDAP_PORT;
-                       _ -> ?LDAP_PORT
-                   end),
-    RootDN = eldap_utils:get_mod_opt(rootdn, Opts,
-                     fun iolist_to_binary/1,
-                     <<"">>),
-    Password = eldap_utils:get_mod_opt(password, Opts,
-                 fun iolist_to_binary/1,
-                 <<"">>),
-    ConnectInterval = eldap_utils:get_mod_opt(connect_interval, Opts,
-                                  fun(I) when is_integer(I), I>0 -> I end,
-                                  default_connect_interval()),
-    #{handle => none,
-      servers => Servers,
-      encrypt => Encrypt,
-      tls_options => TLSOptions,
-      port => Port,
-      root_dn => RootDN,
-      password => Password,
-      connect_interval => ConnectInterval}.
+    Opts#{handle => none}.
 
 call_eldap(Request, State) ->
     case do_call_eldap(Request, State) of
         {error, Reason} when Reason =:= ldap_closed;
                              Reason =:= {gen_tcp_error, closed} ->
-            ?INFO_MSG("LDAP request failed: connection closed, reconnecting...", []),
+            ?LOG_INFO(#{what => ldap_request_failed, reason => Reason,
+                        text => <<"LDAP request failed: connection closed, reconnecting...">>}),
             eldap:close(maps:get(handle, State)),
             NewState = connect(State#{handle := none}),
             retry_call_eldap(Request, NewState);
@@ -106,33 +72,41 @@ call_eldap(Request, State) ->
             {Result, State}
     end.
 
+connect_opts(State = #{port := Port,
+                       root_dn := RootDN,
+                       password := Password}) ->
+    AnonAuth = RootDN =:= <<>> andalso Password =:= <<>>,
+    SSLConfig = case State of
+                    #{tls := TLSOptions} -> [{sslopts, just_tls:make_client_opts(TLSOptions)}];
+                    #{} -> []
+                end,
+    [{port, Port}, {anon_auth, AnonAuth}] ++ SSLConfig.
+
 connect(State = #{handle := none,
                   servers := Servers,
-                  encrypt := Encrypt,
-                  tls_options := TLSOptions,
                   port := Port,
                   root_dn := RootDN,
                   password := Password,
                   connect_interval := ConnectInterval}) ->
-    AnonAuth = RootDN =:= <<>> andalso Password =:= <<>>,
-    SSLConfig = case Encrypt of
-                    tls -> [{ssl, true}, {sslopts, TLSOptions}];
-                    none -> [{ssl, false}]
-                end,
-    case eldap:open(Servers, [{port, Port}, {anon_auth, AnonAuth}] ++ SSLConfig) of
+    case eldap:open(Servers, connect_opts(State)) of
         {ok, Handle} ->
             case eldap:simple_bind(Handle, RootDN, Password) of
                 ok ->
-                    ?INFO_MSG("Connected to LDAP server", []),
+                    ?LOG_INFO(#{what => ldap_connected,
+                                text => <<"Connected to LDAP server">>}),
                     State#{handle := Handle};
                 Error ->
-                    ?ERROR_MSG("LDAP authentication failed: ~p", [Error]),
+                    ?LOG_ERROR(#{what => ldap_auth_failed, reason => Error,
+                                 text => <<"LDAP bind returns an error">>,
+                                 ldap_servers => Servers, port => Port}),
                     eldap:close(Handle),
                     erlang:send_after(ConnectInterval, self(), connect),
                     State
             end;
         Error ->
-            ?ERROR_MSG("LDAP connection failed: ~p", [Error]),
+            ?LOG_ERROR(#{what => ldap_connect_failed,
+                         text => <<"LDAP open returns an error">>,
+                         ldap_servers => Servers, port => Port, reason => Error}),
             erlang:send_after(ConnectInterval, self(), connect),
             State
     end.
@@ -143,6 +117,3 @@ retry_call_eldap(Request, State) ->
 
 do_call_eldap(_Request, #{handle := none}) -> {error, not_connected};
 do_call_eldap({F, Args}, #{handle := Handle}) -> apply(eldap, F, [Handle | Args]).
-
-default_connect_interval() ->
-    10000.

@@ -20,17 +20,17 @@
 
 start(Port, Path, HandleFun) ->
     application:ensure_all_started(cowboy),
-    Dispatch = cowboy_router:compile([{'_', [{Path, http_helper, [HandleFun]}]}]),
+    Dispatch = cowboy_router:compile([{'_', [{Path, http_helper, HandleFun}]}]),
     {ok, _} = cowboy:start_clear(http_helper_listener,
-                                 [{port, Port}, {num_acceptors, 200}],
-                                #{env => #{dispatch => Dispatch}}).
+                                 #{socket_opts => [{port, Port}], num_acceptors => 200},
+                                 #{env => #{dispatch => Dispatch}}).
 
 stop() ->
     cowboy:stop_listener(http_helper_listener).
 
 %% Cowboy handler callbacks
 
-init(Req, [HandleFun]) ->
+init(Req, HandleFun) ->
     Req2 = HandleFun(Req),
     {ok, Req2, no_state}.
 

@@ -19,6 +19,7 @@
 -export([init/1, init/2,
          node_cwd/2,
          restart_application/1, restart_application/2,
+         ensure_started_application/1, ensure_started_application/2,
          call_fun/3, call_fun/4,
          call_ctl/2, call_ctl/3,
          call_ctl_with_args/3,
@@ -26,6 +27,7 @@
          backup_config_file/1, backup_config_file/2,
          restore_config_file/1, restore_config_file/2,
          modify_config_file/2, modify_config_file/4,
+         replace_config_file/1, replace_config_file/2,
          get_cwd/2]).
 
 -include_lib("common_test/include/ct.hrl").
@@ -33,20 +35,19 @@
 cwd(Node, Config) ->
     ?config({ejabberd_cwd, Node}, Config).
 
-current_config_path(Node, Config) ->
-    filename:join([cwd(Node, Config), "etc", "mongooseim.cfg"]).
+backup_config_path(Node, Config, Format) ->
+    filename:join([cwd(Node, Config), "etc", config_file_name(Format) ++ ".bak"]).
 
-backup_config_path(Node, Config) ->
-    filename:join([cwd(Node, Config), "etc","mongooseim.cfg.bak"]).
-
-config_template_path(Config) ->
-    filename:join([path_helper:repo_dir(Config), "rel", "files", "mongooseim.cfg"]).
+config_template_path(Config, Format) ->
+    filename:join([path_helper:repo_dir(Config), "rel", "files", config_file_name(Format)]).
 
 config_vars_path(File, Config) ->
     filename:join([path_helper:repo_dir(Config), "rel", File]).
 
 ctl_path(Node, Config) ->
     filename:join([cwd(Node, Config), "bin", "mongooseimctl"]).
+
+config_file_name(toml) -> "mongooseim.toml".
 
 -type ct_config() :: list({Key :: term(), Value :: term()}).
 
@@ -74,9 +75,18 @@ restart_application(ApplicationName) ->
 
 -spec restart_application(node(), atom()) -> ok.
 restart_application(Node, ApplicationName) ->
-    ok = ejabberd_node_utils:call_fun(Node, application, stop, [ApplicationName]),
-    ok = ejabberd_node_utils:call_fun(Node, application, start, [ApplicationName]).
+    ok = call_fun(Node, application, stop, [ApplicationName]),
+    ok = call_fun(Node, application, start, [ApplicationName]).
 
+-spec ensure_started_application(atom()) -> ok.
+ensure_started_application(ApplicationName) ->
+    Node = distributed_helper:mim(),
+    ensure_started_application(Node#{timeout => timer:seconds(30)}, ApplicationName).
+
+-spec ensure_started_application(node(), atom()) -> ok.
+ensure_started_application(Node, ApplicationName) ->
+    call_fun(Node, application, stop, [ApplicationName]),
+    ok = call_fun(Node, application, start, [ApplicationName]).
 
 -spec backup_config_file(ct_config()) -> ct_config().
 backup_config_file(Config) ->
@@ -85,8 +95,8 @@ backup_config_file(Config) ->
 
 -spec backup_config_file(distributed_helper:rpc_spec(), ct_config()) -> ct_config().
 backup_config_file(#{node := Node} = RPCSpec, Config) ->
-    {ok, _} = call_fun(RPCSpec, file, copy, [current_config_path(Node, Config),
-                                             backup_config_path(Node, Config)]).
+    {ok, _} = call_fun(RPCSpec, file, copy, [get_config_path(RPCSpec),
+                                             backup_config_path(Node, Config, toml)]).
 
 -spec restore_config_file(ct_config()) -> 'ok'.
 restore_config_file(Config) ->
@@ -95,8 +105,8 @@ restore_config_file(Config) ->
 
 -spec restore_config_file(distributed_helper:rpc_spec(), ct_config()) -> 'ok'.
 restore_config_file(#{node := Node} = RPCSpec, Config) ->
-    ok = call_fun(RPCSpec, file, rename, [backup_config_path(Node, Config),
-                                          current_config_path(Node, Config)]).
+    ok = call_fun(RPCSpec, file, rename, [backup_config_path(Node, Config, toml),
+                                          update_config_path(RPCSpec, toml)]).
 
 -spec call_fun(module(), atom(), []) -> term() | {badrpc, term()}.
 call_fun(M, F, A) ->
@@ -133,12 +143,12 @@ file_exists(Filename) ->
 file_exists(Node, Filename) ->
     call_fun(Node, filelib, is_file, [Filename]).
 
-%% @doc Modifies default ejabberd config file: `etc/mongooseim.cfg'.
+%% @doc Modifies default ejabberd config file: `etc/mongooseim.toml'.
 %%
 %% This function assumes that the config file was generated from template
-%% file in `rel/files/mongooseim.cfg' using variables from `rel/vars.config'.
+%% file in `rel/files/mongooseim.toml' using variables from `rel/vars-toml.config'.
 %% The modification procedure overrides given variables provided in
-%% `rel/vars.config'.
+%% `rel/vars-toml.config'.
 %%
 %% For example to change `hosts' value in the configuration file one
 %% has to call the function as follows:
@@ -148,36 +158,85 @@ file_exists(Node, Filename) ->
       ConfigVariable :: atom(),
       Value :: string().
 modify_config_file(CfgVarsToChange, Config) ->
-    Node = distributed_helper:mim(),
-    modify_config_file(Node, "vars.config", CfgVarsToChange, Config).
+    modify_config_file(mim, CfgVarsToChange, Config, toml).
 
--spec modify_config_file(distributed_helper:rpc_spec(), string(), [{ConfigVariable, Value}], ct_config()) -> ok when
+-spec modify_config_file(Host, [{ConfigVariable, Value}], ct_config(), toml) -> ok when
+      Host :: atom(),
       ConfigVariable :: atom(),
       Value :: string().
-modify_config_file(#{node := Node} = RPCSpec, VarsFile, CfgVarsToChange, Config) ->
-    CurrentCfgPath = current_config_path(Node, Config),
-    {ok, CfgTemplate} = file:read_file(config_template_path(Config)),
-    CfgVarsPath = config_vars_path("vars.config", Config),
-    {ok, DefaultVars} = file:consult(CfgVarsPath),
-    {ok, NodeVars} = file:consult(config_vars_path(VarsFile, Config)),
-    PresetVars = case proplists:get_value(preset, Config) of
-                     undefined ->
-                         [];
-                     Name ->
-                         Presets = ct:get_config(ejabberd_presets),
-                         proplists:get_value(list_to_existing_atom(Name), Presets)
-                 end,
-    CfgVars1 = dict:to_list(dict:merge(fun(_, V, _) -> V end,
-                                       dict:from_list(NodeVars),
-                                       dict:from_list(DefaultVars))),
-    CfgVars = dict:to_list(dict:merge(fun(_, V, _) -> V end,
-                                      dict:from_list(PresetVars),
-                                      dict:from_list(CfgVars1))),
-    UpdatedCfgVars = update_config_variables(CfgVarsToChange, CfgVars),
+modify_config_file(Host, VarsToChange, Config, Format) ->
+    NodeVarsFile = ct:get_config({hosts, Host, vars}, Config) ++ "." ++ vars_file(Format),
+    TemplatePath = config_template_path(Config, Format),
+    NodeVarsPath = config_vars_path(NodeVarsFile, Config),
+
+    {ok, Template} = file:read_file(TemplatePath),
+    NodeVars = read_vars(NodeVarsPath),
+    PresetVars = preset_vars(Config, Format),
+
+    TemplatedConfig = template_config(Template, NodeVars ++ PresetVars ++ VarsToChange),
+
+    RPCSpec = distributed_helper:Host(),
+    NewCfgPath = update_config_path(RPCSpec, Format),
+    ok = call_fun(RPCSpec, file, write_file, [NewCfgPath, TemplatedConfig]).
+
+-spec replace_config_file(binary()) -> ok.
+replace_config_file(TomlContent) ->
+    Node = distributed_helper:mim(),
+    replace_config_file(Node, TomlContent).
+
+-spec replace_config_file(distributed_helper:node_spec(), binary()) -> ok.
+replace_config_file(RPCSpec, TomlContent) ->
+    NewCfgPath = update_config_path(RPCSpec, toml),
+    ok = call_fun(RPCSpec, file, write_file, [NewCfgPath, TomlContent]).
+
+read_vars(File) ->
+    {ok, Terms} = file:consult(File),
+    lists:flatmap(fun({Key, Val}) ->
+                          [{Key, Val}];
+                     (IncludedFile) when is_list(IncludedFile) ->
+                          Path = filename:join(filename:dirname(File), IncludedFile),
+                          read_vars(Path)
+                  end, Terms).
+
+template_config(Template, Vars) ->
+    MergedVars = ensure_binary_strings(maps:from_list(Vars)),
     %% Render twice to replace variables in variables
-    UpdatedCfgFileTmp = bbmustache:render(CfgTemplate, UpdatedCfgVars, [{key_type, atom}]),
-    UpdatedCfgFile = bbmustache:render(UpdatedCfgFileTmp, UpdatedCfgVars, [{key_type, atom}]),
-    ok = ejabberd_node_utils:call_fun(RPCSpec, file, write_file, [CurrentCfgPath, UpdatedCfgFile]).
+    Tmp = bbmustache:render(Template, MergedVars, [{key_type, atom}]),
+    bbmustache:render(Tmp, MergedVars, [{key_type, atom}]).
+
+%% bbmustache tries to iterate over lists, so we need to make them binaries
+ensure_binary_strings(Vars) ->
+    maps:map(fun(dbs, V) -> V;
+                (_K, []) -> <<"\n">>; % empty binary is considered falsey in conditions
+                (_K, V) when is_list(V) -> list_to_binary(V);
+                (_K, V) -> V
+              end, Vars).
+
+update_config_path(RPCSpec, Format) ->
+    CurrentCfgPath = get_config_path(RPCSpec),
+    CurrentConfigFileName = filename:basename(CurrentCfgPath),
+    case config_file_name(Format) of
+        CurrentConfigFileName ->
+            CurrentCfgPath;
+        NewConfigFileName ->
+            Path = filename:join(filename:dirname(CurrentCfgPath), NewConfigFileName),
+            set_config_path(RPCSpec, Path),
+            Path
+    end.
+
+get_config_path(RPCSpec) ->
+    call_fun(RPCSpec, os, getenv, ["EJABBERD_CONFIG_PATH"]).
+
+set_config_path(RPCSpec, Path) ->
+    call_fun(RPCSpec, os, putenv, ["EJABBERD_CONFIG_PATH", Path]).
+
+vars_file(toml) -> "vars-toml.config".
+
+preset_vars(Config, Format) ->
+    case proplists:get_value(preset, Config) of
+        undefined -> [];
+        Name -> ct:get_config({presets, Format, list_to_existing_atom(Name)})
+    end.
 
 -spec get_cwd(node(), ct_config()) -> string().
 get_cwd(Node, Config) ->
@@ -190,8 +249,3 @@ get_cwd(Node, Config) ->
 set_ejabberd_node_cwd(#{node := Node} = RPCSpec, Config) ->
     {ok, Cwd} = call_fun(RPCSpec, file, get_cwd, []),
     [{{ejabberd_cwd, Node}, Cwd} | Config].
-
-update_config_variables(CfgVarsToChange, CfgVars) ->
-    lists:foldl(fun({Var, Val}, Acc) ->
-                        lists:keystore(Var, 1, Acc,{Var, Val})
-                end, CfgVars, CfgVarsToChange).

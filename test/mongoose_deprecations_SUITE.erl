@@ -3,11 +3,11 @@
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
 
--compile([export_all]).
+-compile([export_all, nowarn_export_all]).
 
 -define(TEST_COOLDOWN, 50).    % ms
 -define(COOLDOWN_EPS, 3).      % ms, must be much smaller than TEST_COOLDOWN
--define(LOG_MSG, "hey, deprecated!").
+-define(LOG_MSG, #{what => cool_deprecated}).
 
 all() ->
     [
@@ -21,7 +21,7 @@ all() ->
 
 init_per_suite(C) ->
     C.
-    
+
 end_per_suite(C) ->
     C.
 

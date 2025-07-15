@@ -26,34 +26,32 @@
 -author('alexey@process-one.net').
 
 -behaviour(gen_server).
+-behaviour(gen_iq_component).
+-behaviour(mongoose_instrument_probe).
+
 
 %% API
 -export([start/0,
          start_link/0,
          route/3,
          route/4,
-         open_session/3, open_session/4,
-         close_session/4,
-         store_info/2,
+         make_new_sid/0,
+         open_session/5,
+         close_session/5,
+         store_info/4,
          get_info/2,
-         remove_info/2,
-         check_in_subscription/6,
-         bounce_offline_message/4,
-         disconnect_removed_user/3,
+         remove_info/3,
          get_user_resources/1,
          set_presence/6,
          unset_presence/5,
-         close_session_unset_presence/5,
          get_unique_sessions_number/0,
          get_total_sessions_number/0,
          get_node_sessions_number/0,
          get_vh_session_number/1,
          get_vh_session_list/1,
          get_full_session_list/0,
-         register_iq_handler/4,
-         register_iq_handler/5,
+         register_iq_handler/3,
          unregister_iq_handler/2,
-         force_update_presence/1,
          user_resources/2,
          get_session_pid/1,
          get_session/1,
@@ -61,44 +59,26 @@
          get_user_present_resources/1,
          get_raw_sessions/1,
          is_offline/1,
-         get_user_present_pids/2
+         get_user_present_pids/2,
+         sync/0,
+         session_cleanup/1,
+         sessions_cleanup/1,
+         terminate_session/2,
+         sm_backend/0,
+         probe/2,
+         start_probes/0,
+         stop_probes/0
         ]).
-
-%% Deprecated API
--export([
-         open_session/5,
-         open_session/6,
-         close_session/6,
-         close_session_unset_presence/7,
-         unset_presence/7,
-         get_raw_sessions/2,
-         store_info/4,
-         set_presence/8,
-         remove_info/4,
-         get_user_resources/2,
-         get_session_pid/3,
-         get_session/3,
-         get_session_ip/3,
-         get_user_present_resources/2
-        ]).
-
--deprecated({open_session, 5, eventually}).
--deprecated({open_session, 6, eventually}).
--deprecated({close_session, 6, eventually}).
--deprecated({close_session_unset_presence, 7, eventually}).
--deprecated({unset_presence, 7, eventually}).
--deprecated({get_raw_sessions, 2, eventually}).
--deprecated({store_info, 4, eventually}).
--deprecated({set_presence, 8, eventually}).
--deprecated({remove_info, 4, eventually}).
--deprecated({get_user_resources, 2, eventually}).
--deprecated({get_session_pid, 3, eventually}).
--deprecated({get_session, 3, eventually}).
--deprecated({get_session_ip, 3, eventually}).
--deprecated({get_user_present_resources, 2, eventually}).
 
 %% Hook handlers
--export([node_cleanup/2]).
+-export([node_cleanup/3,
+         check_in_subscription/3,
+         bounce_offline_message/3,
+         disconnect_removed_user/3
+        ]).
+
+%% c2s async callback
+-export([store_info_async/5]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -108,16 +88,18 @@
 -export([do_filter/3]).
 -export([do_route/4]).
 
+-ignore_xref([do_filter/3, do_route/4, get_unique_sessions_number/0,
+              get_user_present_pids/2, start_link/0, user_resources/2, sm_backend/0,
+              start_probes/0, stop_probes/0]).
+
 -include("mongoose.hrl").
 -include("jlib.hrl").
--include("ejabberd_commands.hrl").
--include("mod_privacy.hrl").
 -include("session.hrl").
 
 -record(state, {}).
 -type state() :: #state{}.
 
--type sid() :: tuple().
+-type sid() :: {mongoose_lib:microseconds(), pid()}.
 -type priority() :: integer() | undefined.
 
 -type session() :: #session{
@@ -127,29 +109,23 @@
                       priority :: priority(),
                       info     :: info()
                      }.
--type info() :: [info_item()].
+-type info() :: #{info_key() => any()}.
 
-%% Session representation as 4-tuple.
--type ses_tuple() :: {USR :: jid:simple_jid(),
-                      Sid :: ejabberd_sm:sid(),
-                      Prio :: priority(),
-                      Info :: info()}.
--type backend() :: ejabberd_sm_mnesia | ejabberd_sm_redis.
--type close_reason() :: resumed | normal | replaced.
+-type backend() :: ejabberd_sm_mnesia | ejabberd_sm_redis | ejabberd_sm_cets.
+-type close_reason() :: resumed | normal | {replaced, pid()}.
 -type info_key() :: atom().
--type info_item() :: {info_key(), any()}.
 
 -export_type([session/0,
               sid/0,
-              ses_tuple/0,
+              priority/0,
               backend/0,
               close_reason/0,
-              info/0
+              info/0,
+              info_key/0
              ]).
 
 %% default value for the maximum number of user connections
 -define(MAX_USER_SESSIONS, 100).
--define(UNIQUE_COUNT_CACHE, [cache, unique_sessions_number]).
 
 %%====================================================================
 %% API
@@ -164,187 +140,116 @@ start() ->
     Spec = {?MODULE, {?MODULE, start_link, []}, permanent, brutal_kill, worker, [?MODULE]},
     {ok, _} = ejabberd_sup:start_child(Spec).
 
--spec start_link() -> 'ignore' | {'error', _} | {'ok', pid()}.
+-spec start_link() -> gen_server:start_ret().
 start_link() ->
-    mongoose_metrics:ensure_metric(global, ?UNIQUE_COUNT_CACHE, gauge),
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
 
+%% You MUST NOT call this function from the big tests.
+%% In 99% you should call ejabberd_router:route/3 instead.
+%% This function would fail for the first routed IQ.
 -spec route(From, To, Packet) -> Acc when
       From :: jid:jid(),
       To :: jid:jid(),
-      Packet :: exml:element() | mongoose_acc:t() | ejabberd_c2s:broadcast(),
+      Packet :: exml:element() | mongoose_acc:t(),
       Acc :: mongoose_acc:t().
 route(From, To, #xmlel{} = Packet) ->
-    Acc = mongoose_acc:new(#{ location => ?LOCATION,
-                              lserver => From#jid.lserver,
-                              element => Packet,
-                              from_jid => From,
-                              to_jid => To }),
+    Acc = new_acc(From, To, Packet),
     route(From, To, Acc);
-route(From, To, {broadcast, #xmlel{} = Payload}) ->
-    Acc = mongoose_acc:new(#{ location => ?LOCATION,
-                              from_jid => From,
-                              to_jid => To,
-                              lserver => To#jid.lserver,
-                              element => Payload }),
-    route(From, To, Acc, {broadcast, Payload});
-route(From, To, {broadcast, Payload}) ->
-    Acc = mongoose_acc:new(#{ location => ?LOCATION,
-                              lserver => To#jid.lserver,
-                              element => undefined }),
-    route(From, To, Acc, {broadcast, Payload});
 route(From, To, Acc) ->
     route(From, To, Acc, mongoose_acc:element(Acc)).
 
-route(From, To, Acc, {broadcast, Payload}) ->
-    case (catch do_route(Acc, From, To, {broadcast, Payload})) of
-        {'EXIT', {Reason, StackTrace}} ->
-            ?ERROR_MSG("error when routing from=~ts to=~ts in module=~p~n~nreason=~p~n~n"
-            "broadcast=~p~n~nstack_trace=~p~n",
-                [jid:to_binary(From), jid:to_binary(To),
-                    ?MODULE, Reason, Payload, StackTrace]);
-        Acc1 -> Acc1
-    end;
+-spec new_acc(jid:jid(), jid:jid(), exml:element()) -> mongoose_acc:t().
+new_acc(From, To = #jid{lserver = LServer}, Packet) ->
+    {ok, HostType} = mongoose_domain_api:get_domain_host_type(To#jid.lserver),
+    mongoose_acc:new(#{location => ?LOCATION,
+                       host_type => HostType,
+                       lserver => LServer,
+                       element => Packet,
+                       from_jid => From,
+                       to_jid => To}).
+
 route(From, To, Acc, El) ->
-    case (catch do_route(Acc, From, To, El)) of
-        {'EXIT', {Reason, StackTrace}} ->
-            ?ERROR_MSG("error when routing from=~ts to=~ts in module=~p~n~nreason=~p~n~n"
-                       "packet=~ts~n~nstack_trace=~p~n",
-                       [jid:to_binary(From), jid:to_binary(To),
-                        ?MODULE, Reason, exml:to_binary(El), StackTrace]);
-        Acc1 -> Acc1
+    try
+        do_route(Acc, From, To, El)
+    catch Class:Reason:Stacktrace ->
+              ?LOG_ERROR(#{what => sm_route_failed,
+                           text => <<"Failed to route stanza in ejabberd_sm">>,
+                           class => Class, reason => Reason, stacktrace => Stacktrace,
+                           acc => Acc}),
+              Acc
     end.
 
--spec open_session(SID, JID, Info) -> ReplacedPids when
-      SID :: 'undefined' | sid(),
-      JID :: jid:jid(),
-      Info :: info(),
-      ReplacedPids :: [pid()].
-open_session(SID, JID, Info) ->
-    open_session(SID, JID, undefined, Info).
+-spec make_new_sid() -> sid().
+make_new_sid() ->
+    {erlang:system_time(microsecond), self()}.
 
--spec open_session(SID, JID, Priority, Info) -> ReplacedPids when
-      SID :: 'undefined' | sid(),
+-spec open_session(HostType, SID, JID, Priority, Info) -> ReplacedPids when
+      HostType :: binary(),
+      SID :: sid(),
       JID :: jid:jid(),
       Priority :: integer() | undefined,
       Info :: info(),
       ReplacedPids :: [pid()].
-open_session(SID, JID, Priority, Info) ->
+open_session(HostType, SID, JID, Priority, Info) ->
     set_session(SID, JID, Priority, Info),
-    ReplacedPIDs = check_for_sessions_to_replace(JID),
-    mongoose_hooks:sm_register_connection_hook(JID#jid.lserver, SID, JID, Info),
+    ReplacedPIDs = check_for_sessions_to_replace(HostType, SID, JID),
+    mongoose_instrument:execute(sm_session, #{host_type => HostType},
+                                #{jid => JID, logins => 1, count => 1}),
+    mongoose_hooks:sm_register_connection(HostType, SID, JID, Info),
     ReplacedPIDs.
 
--spec close_session(Acc, SID, JID, Reason) -> Acc1 when
+-spec close_session(Acc, SID, JID, Reason, Info) -> Acc1 when
       Acc :: mongoose_acc:t(),
-      SID :: 'undefined' | sid(),
+      SID :: sid(),
       JID :: jid:jid(),
       Reason :: close_reason(),
+      Info :: info(),
       Acc1 :: mongoose_acc:t().
-close_session(Acc, SID, JID, Reason) ->
+close_session(Acc, SID, JID, Reason, Info) ->
     #jid{luser = LUser, lserver = LServer, lresource = LResource} = JID,
-    Info = case ejabberd_gen_sm:get_sessions(sm_backend(), LUser, LServer, LResource) of
-               [Session] ->
-                   Session#session.info;
-               _ ->
-                   []
-           end,
-    ejabberd_gen_sm:delete_session(sm_backend(), SID, LUser, LServer, LResource),
-    mongoose_hooks:sm_remove_connection_hook(JID#jid.lserver, Acc, SID, JID, Info, Reason).
+    ejabberd_sm_backend:delete_session(SID, LUser, LServer, LResource),
+    HostType = mongoose_acc:host_type(Acc),
+    mongoose_instrument:execute(sm_session, #{host_type => HostType},
+                                #{jid => JID, logouts => 1, count => -1}),
+    mongoose_hooks:sm_remove_connection(Acc, SID, JID, Info, Reason).
 
--spec store_info(jid:jid(), info_item()) ->
-    {ok, {any(), any()}} | {error, offline}.
-store_info(JID, {Key, _Value} = KV) ->
-    case get_session(JID) of
-        offline -> {error, offline};
-        {_SUser, SID, SPriority, SInfo} ->
-            case SID of
-                {_, Pid} when self() =:= Pid ->
-                    %% It's safe to allow process update its own record
-                    update_session(SID, JID, SPriority,
-                                   lists:keystore(Key, 1, SInfo, KV)),
-                    {ok, KV};
-                {_, Pid} ->
-                    %% Ask the process to update its record itself
-                    %% Async operation
-                    ejabberd_c2s:store_session_info(Pid, JID, KV),
-                    {ok, KV}
-            end
-    end.
+-spec store_info(jid:jid(), sid(), info_key(), any()) -> ok.
+store_info(JID, SID, Key, Value) ->
+    {_, Pid} = SID,
+    mongoose_c2s:async_with_state(Pid, fun ejabberd_sm:store_info_async/5, [SID, JID, Key, Value]).
+
+-spec remove_info(jid:jid(), sid(), info_key()) -> ok.
+remove_info(JID, SID, Key) ->
+    store_info(JID, SID, Key, undefined).
+
+store_info_async(C2sData, SID, JID, Key, Value) ->
+    Info = mongoose_c2s:get_info(C2sData),
+    Info2 = update_info(Key, Value, Info),
+    Priority = mod_presence:get_old_priority(mod_presence:maybe_get_handler(C2sData)),
+    set_session(SID, JID, Priority, Info2),
+    mongoose_c2s:set_info(C2sData, Info2).
+
+update_info(Key, undefined, Info) ->
+    maps:remove(Key, Info);
+update_info(Key, Value, Info) ->
+    maps:put(Key, Value, Info).
 
 -spec get_info(jid:jid(), info_key()) ->
     {ok, any()} | {error, offline | not_set}.
 get_info(JID, Key) ->
     case get_session(JID) of
         offline -> {error, offline};
-        {_SUser, _SID, _SPriority, SInfo} ->
-            case lists:keyfind(Key, 1, SInfo) of
-                {Key, Value} ->
-                    {ok, Value};
-                _ ->
-                    {error, not_set}
+        Session ->
+            case mongoose_session:get_info(Session, Key, {error, not_set}) of
+                {Key, Value} -> {ok, Value};
+                Other -> Other
             end
     end.
-
--spec remove_info(jid:jid(), info_key()) ->
-    ok | {error, offline}.
-remove_info(JID, Key) ->
-    case get_session(JID) of
-        offline -> {error, offline};
-        {_SUser, SID, SPriority, SInfo} ->
-            case SID of
-                {_, Pid} when self() =:= Pid ->
-                    %% It's safe to allow process update its own record
-                    update_session(SID, JID, SPriority,
-                                   lists:keydelete(Key, 1, SInfo)),
-                    ok;
-                {_, Pid} ->
-                    %% Ask the process to update its record itself
-                    %% Async operation
-                    ejabberd_c2s:remove_session_info(Pid, JID, Key),
-                    ok
-            end
-    end.
-
--spec check_in_subscription(Acc, User, Server, JID, Type, Reason) -> any() | {stop, false} when
-      Acc :: any(),
-      User :: jid:user(),
-      Server :: jid:server(),
-      JID :: jid:jid(),
-      Type :: any(),
-      Reason :: any().
-check_in_subscription(Acc, User, Server, _JID, _Type, _Reason) ->
-    case ejabberd_auth:is_user_exists(User, Server) of
-        true ->
-            Acc;
-        false ->
-            {stop, mongoose_acc:set(hook, result, false, Acc)}
-    end.
-
--spec bounce_offline_message(Acc, From, To, Packet) -> {stop, Acc} when
-      Acc :: map(),
-      From :: jid:jid(),
-      To :: jid:jid(),
-      Packet :: exml:element().
-bounce_offline_message(Acc, #jid{server = Server} = From, To, Packet) ->
-    Acc1 = mongoose_hooks:xmpp_bounce_message(Server, Acc),
-    {Acc2, Err} = jlib:make_error_reply(Acc1, Packet, mongoose_xmpp_errors:service_unavailable()),
-    Acc3 = ejabberd_router:route(To, From, Acc2, Err),
-    {stop, Acc3}.
-
--spec disconnect_removed_user(mongoose_acc:t(), User :: jid:user(),
-                              Server :: jid:server()) -> mongoose_acc:t().
-disconnect_removed_user(Acc, User, Server) ->
-    lists:map(fun({_, Pid}) -> ejabberd_c2s:terminate_session(Pid, <<"User removed">>) end,
-              get_user_present_pids(User, Server)),
-    Acc.
-
 
 -spec get_user_resources(JID :: jid:jid()) -> [binary()].
-get_user_resources(JID) ->
-    #jid{luser = LUser, lserver = LServer} = JID,
-    Ss = ejabberd_gen_sm:get_sessions(sm_backend(), LUser, LServer),
+get_user_resources(#jid{luser = LUser, lserver = LServer}) ->
+    Ss = ejabberd_sm_backend:get_sessions(LUser, LServer),
     [element(3, S#session.usr) || S <- clean_session_list(Ss)].
 
 
@@ -353,67 +258,52 @@ get_user_resources(JID) ->
 get_session_ip(JID) ->
     case get_session(JID) of
         offline -> undefined;
-        {_, _, _, Info} -> proplists:get_value(ip, Info)
+        Session ->
+            case mongoose_session:get_info(Session, ip, undefined) of
+                {ip, Val} -> Val;
+                Other -> Other
+            end
     end.
 
--spec get_session(JID) -> offline | ses_tuple() when
+-spec get_session(JID) -> offline | session() when
       JID :: jid:jid().
 get_session(JID) ->
     #jid{luser = LUser, lserver = LServer, lresource = LResource} = JID,
-    case ejabberd_gen_sm:get_sessions(sm_backend(), LUser, LServer, LResource) of
+    case ejabberd_sm_backend:get_sessions(LUser, LServer, LResource) of
         [] ->
             offline;
         Ss ->
-            Session = lists:max(Ss),
-            {Session#session.usr,
-             Session#session.sid,
-             Session#session.priority,
-             Session#session.info}
+            lists:max(Ss)
     end.
 
 -spec get_raw_sessions(jid:jid()) -> [session()].
 get_raw_sessions(#jid{luser = LUser, lserver = LServer}) ->
     clean_session_list(
-      ejabberd_gen_sm:get_sessions(sm_backend(), LUser, LServer)).
+      ejabberd_sm_backend:get_sessions(LUser, LServer)).
 
 -spec set_presence(Acc, SID, JID, Prio, Presence, Info) -> Acc1 when
       Acc :: mongoose_acc:t(),
       Acc1 :: mongoose_acc:t(),
-      SID :: 'undefined' | sid(),
+      SID :: sid(),
       JID :: jid:jid(),
       Prio :: 'undefined' | integer(),
       Presence :: any(),
       Info :: info().
 set_presence(Acc, SID, JID, Priority, Presence, Info) ->
-    #jid{luser = LUser, lserver = LServer, lresource = LResource} = JID,
     set_session(SID, JID, Priority, Info),
-    mongoose_hooks:set_presence_hook(LServer, Acc, LUser, LResource, Presence).
+    mongoose_hooks:set_presence(Acc, JID, Presence).
 
 
 -spec unset_presence(Acc, SID, JID, Status, Info) -> Acc1 when
       Acc :: mongoose_acc:t(),
       Acc1 :: mongoose_acc:t(),
-      SID :: 'undefined' | sid(),
+      SID :: sid(),
       JID :: jid:jid(),
       Status :: binary(),
       Info :: info().
 unset_presence(Acc, SID, JID, Status, Info) ->
-    #jid{luser = LUser, lserver = LServer, lresource = LResource} = JID,
     set_session(SID, JID, undefined, Info),
-    mongoose_hooks:unset_presence_hook(LServer, Acc, LUser, LResource, Status).
-
-
--spec close_session_unset_presence(Acc, SID, JID, Status, Reason) -> Acc1 when
-      Acc :: mongoose_acc:t(),
-      SID :: 'undefined' | sid(),
-      JID :: jid:jid(),
-      Status :: binary(),
-      Reason :: close_reason(),
-      Acc1 :: mongoose_acc:t().
-close_session_unset_presence(Acc, SID, JID, Status, Reason) ->
-    #jid{luser = LUser, lserver = LServer, lresource = LResource} = JID,
-    Acc1 = close_session(Acc, SID, JID, Reason),
-    mongoose_hooks:unset_presence_hook(LServer, Acc1, LUser, LResource, Status).
+    mongoose_hooks:unset_presence(Acc, JID, Status).
 
 
 -spec get_session_pid(JID) -> none | pid() when
@@ -421,67 +311,150 @@ close_session_unset_presence(Acc, SID, JID, Status, Reason) ->
 get_session_pid(JID) ->
     case get_session(JID) of
         offline -> none;
-        {_, {_, Pid}, _, _} -> Pid
+        #session{sid = {_, Pid}} -> Pid
     end.
 
 -spec get_unique_sessions_number() -> integer().
 get_unique_sessions_number() ->
-    try
-        C = ejabberd_gen_sm:unique_count(sm_backend()),
-        mongoose_metrics:update(global, ?UNIQUE_COUNT_CACHE, C),
-        C
-    catch
-        _:_ ->
-            get_cached_unique_count()
-    end.
-
+    ejabberd_sm_backend:unique_count().
 
 -spec get_total_sessions_number() -> integer().
 get_total_sessions_number() ->
-    ejabberd_gen_sm:total_count(sm_backend()).
+    ejabberd_sm_backend:total_count().
 
 
 -spec get_vh_session_number(jid:server()) -> non_neg_integer().
 get_vh_session_number(Server) ->
-    length(ejabberd_gen_sm:get_sessions(sm_backend(), Server)).
+    length(ejabberd_sm_backend:get_sessions(Server)).
 
 
--spec get_vh_session_list(jid:server()) -> [ses_tuple()].
+-spec get_vh_session_list(jid:server()) -> [session()].
 get_vh_session_list(Server) ->
-    ejabberd_gen_sm:get_sessions(sm_backend(), Server).
+    ejabberd_sm_backend:get_sessions(Server).
 
 
 -spec get_node_sessions_number() -> non_neg_integer().
 get_node_sessions_number() ->
-    {value, {active, Active}} = lists:keysearch(active, 1,
-                                                supervisor:count_children(ejabberd_c2s_sup)),
-    Active.
+    Children = supervisor:which_children(mongoose_listener_sup),
+    Listeners = [Ref || {Ref, _, _, [mongoose_c2s_listener | _]} <- Children],
+    lists:sum([maps:get(active_connections, ranch:info(Ref)) || Ref <- Listeners]).
 
-
--spec get_full_session_list() -> [ses_tuple()].
+-spec get_full_session_list() -> [session()].
 get_full_session_list() ->
-    ejabberd_gen_sm:get_sessions(sm_backend()).
+    ejabberd_sm_backend:get_sessions().
 
 
-register_iq_handler(Host, XMLNS, Module, Fun) ->
-    ejabberd_sm ! {register_iq_handler, Host, XMLNS, Module, Fun}.
+register_iq_handler(Host, XMLNS, IQHandler) ->
+    ejabberd_sm ! {register_iq_handler, Host, XMLNS, IQHandler},
+    ok.
 
-
-register_iq_handler(Host, XMLNS, Module, Fun, Opts) ->
-    ejabberd_sm ! {register_iq_handler, Host, XMLNS, Module, Fun, Opts}.
-
+-spec sync() -> ok.
+sync() ->
+    gen_server:call(ejabberd_sm, sync).
 
 unregister_iq_handler(Host, XMLNS) ->
-    ejabberd_sm ! {unregister_iq_handler, Host, XMLNS}.
+    ejabberd_sm ! {unregister_iq_handler, Host, XMLNS},
+    ok.
+
+-spec session_cleanup(#session{}) -> mongoose_acc:t().
+session_cleanup(#session{usr = {U, S, R}, sid = SID}) ->
+    {ok, HostType} = mongoose_domain_api:get_domain_host_type(S),
+    Acc = mongoose_acc:new(
+            #{location => ?LOCATION,
+              host_type => HostType,
+              lserver => S,
+              element => undefined}),
+    mongoose_hooks:session_cleanup(S, Acc, U, R, SID).
+
+-spec sessions_cleanup([#session{}]) -> ok.
+sessions_cleanup(Sessions) ->
+    SerSess = [{Server, Session} || Session = #session{usr = {_, Server, _}} <- Sessions],
+    Servers = lists:usort([Server || {Server, _Session} <- SerSess]),
+    Map = maps:from_list([{Server, server_to_host_type(Server)} || Server <- Servers]),
+    HTSession = [{maps:get(Server, Map), Session} || {Server, Session} <- SerSess],
+    HT2Session = group_sessions(lists:sort(HTSession)),
+    [mongoose_hooks:sessions_cleanup(HostType, HTSessions)
+     || {HostType, HTSessions} <- HT2Session, HostType =/= undefined],
+    ok.
+
+%% Group sessions by HostType.
+%% Sessions should be sorted.
+group_sessions([{HostType, Session} | Sessions]) ->
+    {Acc, Sessions2} = group_sessions(HostType, [Session], Sessions),
+    [{HostType, Acc} | group_sessions(Sessions2)];
+group_sessions([]) ->
+    [].
+
+group_sessions(HostType, Acc, [{HostType, Session} | Sessions]) ->
+    group_sessions(HostType, [Session | Acc], Sessions);
+group_sessions(_HostType, Acc, Sessions) ->
+    {lists:reverse(Acc), Sessions}.
+
+server_to_host_type(Server) ->
+    case mongoose_domain_api:get_domain_host_type(Server) of
+        {ok, HostType} ->
+           HostType;
+        _ ->
+           undefined
+    end.
+
+-spec terminate_session(jid:jid() | pid(), binary()) -> ok | no_session.
+terminate_session(#jid{} = Jid, Reason) ->
+    case get_session_pid(Jid) of
+        none ->
+            no_session;
+        Pid ->
+            terminate_session(Pid, Reason)
+    end;
+terminate_session(Pid, Reason) ->
+    mongoose_c2s:exit(Pid, Reason).
 
 %%====================================================================
 %% Hook handlers
 %%====================================================================
 
-node_cleanup(Acc, Node) ->
+-spec node_cleanup(Acc, Args, Extra) -> {ok, Acc} when
+      Acc :: any(),
+      Args :: #{node := node()},
+      Extra :: map().
+node_cleanup(Acc, #{node := Node}, _) ->
     Timeout = timer:minutes(1),
     Res = gen_server:call(?MODULE, {node_cleanup, Node}, Timeout),
-    maps:put(?MODULE, Res, Acc).
+    {ok, maps:put(?MODULE, Res, Acc)}.
+
+-spec check_in_subscription(Acc, Args, Extra)-> {ok, Acc} | {stop, false} when
+      Acc :: any(),
+      Args :: #{to := jid:jid()},
+      Extra :: map().
+check_in_subscription(Acc, #{to := ToJID}, _) ->
+    case ejabberd_auth:does_user_exist(ToJID) of
+        true ->
+            {ok, Acc};
+        false ->
+            {stop, mongoose_acc:set(hook, result, false, Acc)}
+    end.
+
+-spec bounce_offline_message(Acc, Args, Extra) -> {stop, Acc} when
+      Acc :: map(),
+      Args :: #{from := jid:jid(), to := jid:jid(), packet := exml:element()},
+      Extra :: map().
+bounce_offline_message(Acc, #{from := From, to := To, packet := Packet}, _) ->
+    HostType = mongoose_acc:host_type(Acc),
+    mongoose_instrument:execute(sm_message_bounced, #{host_type => HostType},
+                                #{count => 1, from_jid => From, to_jid => To, element => Packet}),
+    E = mongoose_xmpp_errors:service_unavailable(<<"en">>, <<"Bounce offline message">>),
+    {Acc1, Err} = jlib:make_error_reply(Acc, Packet, E),
+    Acc2 = ejabberd_router:route(To, From, Acc1, Err),
+    {stop, Acc2}.
+
+-spec disconnect_removed_user(Acc, Args, Extra) -> {ok, Acc} when
+      Acc :: mongoose_acc:t(),
+      Args :: #{jid := jid:jid()},
+      Extra :: map().
+disconnect_removed_user(Acc, #{jid := #jid{luser = LUser, lserver = LServer}}, _) ->
+    lists:map(fun(#session{sid = {_, Pid}}) -> terminate_session(Pid, <<"User removed">>) end,
+              ejabberd_sm_backend:get_sessions(LUser, LServer)),
+    {ok, Acc}.
 
 %%====================================================================
 %% gen_server callbacks
@@ -496,27 +469,30 @@ node_cleanup(Acc, Node) ->
 %%--------------------------------------------------------------------
 -spec init(_) -> {ok, state()}.
 init([]) ->
-    {Backend, Opts} = ejabberd_config:get_global_option(sm_backend),
-    {Mod, Code} = dynamic_compile:from_string(sm_backend(Backend)),
-    code:load_binary(Mod, "ejabberd_sm_backend.erl", Code),
+    Backend = mongoose_config:get_opt(sm_backend),
+    ejabberd_sm_backend:init(#{backend => Backend}),
 
-    ets:new(sm_iqtable, [named_table]),
-
-    ejabberd_hooks:add(node_cleanup, global, ?MODULE, node_cleanup, 50),
-    lists:foreach(fun(Host) -> ejabberd_hooks:add(hooks(Host)) end, ?MYHOSTS),
-
-    ejabberd_commands:register_commands(commands()),
-
-    ejabberd_gen_sm:start(sm_backend(), Opts),
-
+    ets:new(sm_iqtable, [named_table, protected, {read_concurrency, true}]),
+    gen_hook:add_handler(node_cleanup, global, fun ?MODULE:node_cleanup/3, #{}, 50),
+    lists:foreach(fun(HostType) ->
+                          gen_hook:add_handlers(hooks(HostType)),
+                          mongoose_instrument:set_up(instrumentation(HostType))
+                  end,
+                  ?ALL_HOST_TYPES),
+    %% Set up global metrics here to avoid registering global hooks
+    mongoose_instrument:set_up(instrumentation(global)),
     {ok, #state{}}.
 
-hooks(Host) ->
+start_probes() ->
+    mongoose_instrument:set_up(global_probes()).
+
+-spec hooks(binary()) -> [gen_hook:hook_tuple()].
+hooks(HostType) ->
     [
-     {roster_in_subscription, Host, ejabberd_sm, check_in_subscription, 20},
-     {offline_message_hook, Host, ejabberd_sm, bounce_offline_message, 100},
-     {offline_groupchat_message_hook, Host, ejabberd_sm, bounce_offline_message, 100},
-     {remove_user, Host, ejabberd_sm, disconnect_removed_user, 100}
+     {roster_in_subscription, HostType, fun ?MODULE:check_in_subscription/3, #{}, 20},
+     {offline_message, HostType, fun ?MODULE:bounce_offline_message/3, #{}, 100},
+     {offline_groupchat_message, HostType, fun ?MODULE:bounce_offline_message/3, #{}, 100},
+     {remove_user, HostType, fun ?MODULE:disconnect_removed_user/3, #{}, 100}
     ].
 
 %%--------------------------------------------------------------------
@@ -529,10 +505,13 @@ hooks(Host) ->
 %% Description: Handling call messages
 %%--------------------------------------------------------------------
 handle_call({node_cleanup, Node}, _From, State) ->
-    BackendModule = sm_backend(),
-    {TimeDiff, _R} = timer:tc(fun BackendModule:cleanup/1, [Node]),
-    ?INFO_MSG("sessions cleanup after node=~p, took=~pms",
-              [Node, erlang:round(TimeDiff / 1000)]),
+    {TimeDiff, _R} = timer:tc(fun ejabberd_sm_backend:cleanup/1, [Node]),
+    ?LOG_INFO(#{what => sm_node_cleanup,
+                text => <<"Cleaning after a node that went down">>,
+                cleanup_node => Node,
+                duration => erlang:round(TimeDiff / 1000)}),
+    {reply, ok, State};
+handle_call(sync, _From, State) ->
     {reply, ok, State};
 handle_call(_Request, _From, State) ->
     Reply = ok,
@@ -557,20 +536,23 @@ handle_cast(_Msg, State) ->
 handle_info({route, From, To, Packet}, State) ->
     route(From, To, Packet),
     {noreply, State};
-handle_info({register_iq_handler, Host, XMLNS, Module, Function}, State) ->
-    ets:insert(sm_iqtable, {{XMLNS, Host}, Module, Function}),
-    {noreply, State};
-handle_info({register_iq_handler, Host, XMLNS, Module, Function, Opts}, State) ->
-    ets:insert(sm_iqtable, {{XMLNS, Host}, Module, Function, Opts}),
+handle_info({register_iq_handler, Host, XMLNS, IQHandler}, State) ->
+    case ets:insert_new(sm_iqtable, {{XMLNS, Host}, IQHandler}) of
+        true -> ok;
+        false ->
+              ?LOG_WARNING(#{what => register_iq_handler_duplicate,
+                             xmlns => XMLNS, host => Host})
+    end,
     {noreply, State};
 handle_info({unregister_iq_handler, Host, XMLNS}, State) ->
     case ets:lookup(sm_iqtable, {XMLNS, Host}) of
-        [{_, Module, Function, Opts}] ->
-            gen_iq_handler:stop_iq_handler(Module, Function, Opts);
+        [{_, IQHandler}] ->
+            gen_iq_component:stop_iq_handler(IQHandler),
+            ets:delete(sm_iqtable, {XMLNS, Host});
         _ ->
-            ok
+            ?LOG_WARNING(#{what => unregister_iq_handler_missing,
+                           xmlns => XMLNS, host => Host})
     end,
-    ets:delete(sm_iqtable, {XMLNS, Host}),
     {noreply, State};
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -584,12 +566,12 @@ handle_info(_Info, State) ->
 %%--------------------------------------------------------------------
 -spec terminate(_, state()) -> 'ok'.
 terminate(_Reason, _State) ->
-    try
-        ejabberd_commands:unregister_commands(commands())
-    catch E:R:S ->
-        ?ERROR_MSG("Caught error while terminating sm: ~p:~p~n~p", [E, R, S])
-    end,
+    [mongoose_instrument:tear_down(instrumentation(HostType))
+     || HostType <- [global | ?ALL_HOST_TYPES]],
     ok.
+
+stop_probes() ->
+    mongoose_instrument:tear_down(global_probes()).
 
 %%--------------------------------------------------------------------
 %% Func: code_change(OldVsn, State, Extra) -> {ok, NewState}
@@ -603,7 +585,7 @@ code_change(_OldVsn, State, _Extra) ->
 %%--------------------------------------------------------------------
 
 -spec set_session(SID, JID, Prio, Info) -> ok | {error, any()} when
-      SID :: sid() | 'undefined',
+      SID :: sid(),
       JID :: jid:jid(),
       Prio :: priority(),
       Info :: info().
@@ -616,23 +598,7 @@ set_session(SID, JID, Priority, Info) ->
                        us = US,
                        priority = Priority,
                        info = Info},
-    ejabberd_gen_sm:create_session(sm_backend(), LUser, LServer, LResource, Session).
-
--spec update_session(SID, JID, Prio, Info) -> ok | {error, any()} when
-      SID :: sid() | 'undefined',
-      JID :: jid:jid(),
-      Prio :: priority(),
-      Info :: info().
-update_session(SID, JID, Priority, Info) ->
-    #jid{luser = LUser, lserver = LServer, lresource = LResource} = JID,
-    US = {LUser, LServer},
-    USR = {LUser, LServer, LResource},
-    Session = #session{sid = SID,
-                       usr = USR,
-                       us = US,
-                       priority = Priority,
-                       info = Info},
-    ejabberd_gen_sm:update_session(sm_backend(), LUser, LServer, LResource, Session).
+    ejabberd_sm_backend:set_session(LUser, LServer, LResource, Session).
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
@@ -643,46 +609,23 @@ do_filter(From, To, Packet) ->
     Acc :: mongoose_acc:t(),
     From :: jid:jid(),
     To :: jid:jid(),
-    Payload :: exml:element() | ejabberd_c2s:broadcast().
-do_route(Acc, From, To, {broadcast, Payload} = Broadcast) ->
-    ?DEBUG("from=~p, to=~p, broadcast=~p", [From, To, Broadcast]),
-    #jid{ luser = LUser, lserver = LServer, lresource = LResource} = To,
-    case LResource of
-        <<>> ->
-            CurrentPids = get_user_present_pids(LUser, LServer),
-            Acc1 = mongoose_hooks:sm_broadcast(To#jid.lserver, Acc, From, To,
-                                               Broadcast, length(CurrentPids)),
-            ?DEBUG("bc_to=~p~n", [CurrentPids]),
-            BCast = {broadcast, Payload},
-            lists:foreach(fun({_, Pid}) -> Pid ! BCast end, CurrentPids),
-            Acc1;
-        _ ->
-            case get_session_pid(To) of
-                none ->
-                    Acc; % do nothing
-                Pid when is_pid(Pid) ->
-                    ?DEBUG("sending to process ~p~n", [Pid]),
-                    Pid ! Broadcast,
-                    Acc
-            end
-    end;
+    Payload :: exml:element().
 do_route(Acc, From, To, El) ->
-    ?DEBUG("session manager~n\tfrom ~p~n\tto ~p~n\tpacket ~P~n",
-           [From, To, Acc, 8]),
+    ?LOG_DEBUG(#{what => sm_route, acc => Acc}),
     #jid{lresource = LResource} = To,
-    #xmlel{name = Name, attrs = Attrs} = El,
+    #xmlel{name = Name} = El,
     case LResource of
         <<>> ->
-            do_route_no_resource(Name, xml:get_attr_s(<<"type">>, Attrs),
-                                 From, To, Acc, El);
+            do_route_no_resource(Name, From, To, Acc, El);
         _ ->
             case get_session_pid(To) of
                 none ->
-                    do_route_offline(Name, xml:get_attr_s(<<"type">>, Attrs),
+                    do_route_offline(Name, mongoose_acc:stanza_type(Acc),
                                      From, To, Acc, El);
                 Pid when is_pid(Pid) ->
-                    ?DEBUG("sending to process ~p~n", [Pid]),
-                    Pid ! {route, From, To, Acc},
+                    ?LOG_DEBUG(#{what => sm_route_to_pid, session_pid => Pid,
+                                 session_node => node(Pid), acc => Acc}),
+                    mongoose_c2s:route(Pid, Acc),
                     Acc
             end
     end.
@@ -697,13 +640,22 @@ do_route(Acc, From, To, El) ->
 do_route_no_resource_presence_prv(From, To, Acc, Packet, Type, Reason) ->
     case is_privacy_allow(From, To, Acc, Packet) of
         true ->
-            Res = mongoose_hooks:roster_in_subscription(To#jid.lserver,
-                                         Acc,
-                                         To#jid.user, To#jid.server, From, Type, Reason),
+            HostType = mongoose_acc:host_type(Acc),
+            execute_subscription_instrumentation(HostType, From, To, Type),
+            Res = mongoose_hooks:roster_in_subscription(Acc, To, From, Type, Reason),
             mongoose_acc:get(hook, result, false, Res);
         false ->
             false
     end.
+
+execute_subscription_instrumentation(HostType, From, To, subscribed) ->
+    mongoose_instrument:execute(sm_presence_subscription, #{host_type => HostType},
+                                #{from_jid => From, to_jid => To, subscription_count => 1});
+execute_subscription_instrumentation(HostType, From, To, unsubscribed) ->
+    mongoose_instrument:execute(sm_presence_subscription, #{host_type => HostType},
+                                #{from_jid => From, to_jid => To, unsubscription_count => 1});
+execute_subscription_instrumentation(_HostType, _From, _To, _Type) ->
+    ok.
 
 -spec do_route_no_resource_presence(Type, From, To, Acc, Packet) -> boolean() when
       Type :: binary(),
@@ -712,7 +664,7 @@ do_route_no_resource_presence_prv(From, To, Acc, Packet, Type, Reason) ->
       Acc :: mongoose_acc:t(),
       Packet :: exml:element().
 do_route_no_resource_presence(<<"subscribe">>, From, To, Acc, Packet) ->
-    Reason = xml:get_path_s(Packet, [{elem, <<"status">>}, cdata]),
+    Reason = exml_query:path(Packet, [{element, <<"status">>}, cdata], <<>>),
     do_route_no_resource_presence_prv(From, To, Acc, Packet, subscribe, Reason);
 do_route_no_resource_presence(<<"subscribed">>, From, To, Acc, Packet) ->
     do_route_no_resource_presence_prv(From, To, Acc, Packet, subscribed, <<>>);
@@ -724,30 +676,32 @@ do_route_no_resource_presence(_, _, _, _, _) ->
     true.
 
 
--spec do_route_no_resource(Name, Type, From, To, Acc, El) -> Acc when
+-spec do_route_no_resource(Name, From, To, Acc, El) -> Acc when
       Name :: undefined | binary(),
-      Type :: any(),
       From :: jid:jid(),
       To :: jid:jid(),
       Acc :: mongoose_acc:t(),
       El :: exml:element().
-do_route_no_resource(<<"presence">>, Type, From, To, Acc, El) ->
+do_route_no_resource(<<"presence">>, From, To, Acc, El) ->
+    Type = mongoose_acc:stanza_type(Acc),
     case do_route_no_resource_presence(Type, From, To, Acc, El) of
         true ->
-            PResources = get_user_present_resources(To),
-            lists:foldl(fun({_, R}, A) ->
-                            do_route(A, From, jid:replace_resource(To, R), El)
-                        end,
-                        Acc,
-                        PResources);
+            ResourcesPids = get_user_present_resources_and_pids(To),
+            lists:foldl(fun({Resource, Pid}, Acc1) ->
+                                NewTo = jid:replace_resource(To, Resource),
+                                NewAccParams = #{element => El, from_jid => From, to_jid => NewTo},
+                                Acc2 = mongoose_acc:update_stanza(NewAccParams, Acc1),
+                                mongoose_c2s:route(Pid, Acc2),
+                                Acc2
+                        end, Acc, ResourcesPids);
         false ->
             Acc
     end;
-do_route_no_resource(<<"message">>, _, From, To, Acc, El) ->
+do_route_no_resource(<<"message">>, From, To, Acc, El) ->
     route_message(From, To, Acc, El);
-do_route_no_resource(<<"iq">>, _, From, To, Acc, El) ->
+do_route_no_resource(<<"iq">>, From, To, Acc, El) ->
     process_iq(From, To, Acc, El);
-do_route_no_resource(_, _, _, _, Acc, _) ->
+do_route_no_resource(_, _, _, Acc, _) ->
     Acc.
 
 -spec do_route_offline(Name, Type, From, To, Acc, Packet) -> mongoose_acc:t() when
@@ -758,13 +712,13 @@ do_route_no_resource(_, _, _, _, Acc, _) ->
       Acc :: mongoose_acc:t(),
       Packet :: exml:element().
 do_route_offline(<<"message">>, _, From, To, Acc, Packet)  ->
-    Drop = mongoose_hooks:sm_filter_offline_message(To#jid.lserver,
-                                                    false, From, To, Packet),
+    HostType = mongoose_acc:host_type(Acc),
+    Drop = mongoose_hooks:sm_filter_offline_message(HostType, From, To, Packet),
     case Drop of
         false ->
             route_message(From, To, Acc, Packet);
         true ->
-            ?DEBUG("issue=\"message droped\", to=~1000p", [To]),
+            ?LOG_DEBUG(#{what => sm_offline_dropped, acc => Acc}),
             Acc
     end;
 do_route_offline(<<"iq">>, <<"error">>, _From, _To, Acc, _Packet) ->
@@ -772,10 +726,11 @@ do_route_offline(<<"iq">>, <<"error">>, _From, _To, Acc, _Packet) ->
 do_route_offline(<<"iq">>, <<"result">>, _From, _To, Acc, _Packet) ->
     Acc;
 do_route_offline(<<"iq">>, _, From, To, Acc, Packet) ->
-    {Acc1, Err} = jlib:make_error_reply(Acc, Packet, mongoose_xmpp_errors:service_unavailable()),
+    E = mongoose_xmpp_errors:service_unavailable(<<"en">>, <<"Route offline">>),
+    {Acc1, Err} = jlib:make_error_reply(Acc, Packet, E),
     ejabberd_router:route(To, From, Acc1, Err);
 do_route_offline(_, _, _, _, Acc, _) ->
-    ?DEBUG("packet droped~n", []),
+    ?LOG_DEBUG(#{what => sm_packet_dropped, acc => Acc}),
     Acc.
 
 
@@ -789,14 +744,12 @@ do_route_offline(_, _, _, _, Acc, _) ->
       Acc :: mongoose_acc:t(),
       Packet :: exml:element() | mongoose_acc:t().
 is_privacy_allow(From, To, Acc, Packet) ->
-    User = To#jid.user,
-    Server = To#jid.server,
-    PrivacyList = mongoose_hooks:privacy_get_user_list(Server, #userlist{}, User),
+    HostType = mongoose_acc:host_type(Acc),
+    PrivacyList = mongoose_hooks:privacy_get_user_list(HostType, To),
     is_privacy_allow(From, To, Acc, Packet, PrivacyList).
 
 
 %% @doc Check if privacy rules allow this delivery
-%% Function copied from ejabberd_c2s.erl
 -spec is_privacy_allow(From, To, Acc, Packet, PrivacyList) -> boolean() when
       From :: jid:jid(),
       To :: jid:jid(),
@@ -804,10 +757,7 @@ is_privacy_allow(From, To, Acc, Packet) ->
       Packet :: exml:element(),
       PrivacyList :: mongoose_privacy:userlist().
 is_privacy_allow(_From, To, Acc, _Packet, PrivacyList) ->
-    User = To#jid.user,
-    Server = To#jid.lserver,
-    {_, Res} = mongoose_privacy:privacy_check_packet(Acc, Server, User, PrivacyList,
-                                                     To, in),
+    {Res, _} = mongoose_privacy:privacy_check_packet(Acc, To, PrivacyList, To, in),
     allow == Res.
 
 
@@ -827,7 +777,7 @@ route_message(From, To, Acc, Packet) ->
               %% positive
               fun({Prio, Pid}) when Prio == Priority ->
                  %% we will lose message if PID is not alive
-                      Pid ! {route, From, To, Acc};
+                      mongoose_c2s:route(Pid, Acc);
                  %% Ignore other priority:
                  ({_Prio, _Pid}) ->
                       ok
@@ -835,56 +785,53 @@ route_message(From, To, Acc, Packet) ->
               PrioPid),
               Acc;
         _ ->
-            MessageType = xml:get_tag_attr_s(<<"type">>, Packet),
+            MessageType = mongoose_acc:stanza_type(Acc),
             route_message_by_type(MessageType, From, To, Acc, Packet)
     end.
 
 route_message_by_type(<<"error">>, _From, _To, Acc, _Packet) ->
     Acc;
 route_message_by_type(<<"groupchat">>, From, To, Acc, Packet) ->
-    LServer = To#jid.lserver,
-    mongoose_hooks:offline_groupchat_message_hook(LServer, Acc, From, To, Packet);
+    mongoose_hooks:offline_groupchat_message(Acc, From, To, Packet);
 route_message_by_type(<<"headline">>, From, To, Acc, Packet) ->
-    {stop, Acc1} = bounce_offline_message(Acc, From, To, Packet),
+    {stop, Acc1} = bounce_offline_message(Acc, #{from => From, to => To, packet => Packet}, #{}),
     Acc1;
 route_message_by_type(_, From, To, Acc, Packet) ->
-    LServer = To#jid.lserver,
-    case ejabberd_auth:does_user_exist(To) of
+    HostType = mongoose_acc:host_type(Acc),
+    case ejabberd_auth:does_user_exist(HostType, To, stored) of
         true ->
             case is_privacy_allow(From, To, Acc, Packet) of
                 true ->
-                    mongoose_hooks:offline_message_hook(LServer, Acc, From, To, Packet);
+                    mongoose_hooks:offline_message(Acc, From, To, Packet);
                 false ->
-                    mongoose_hooks:failed_to_store_message(LServer, Acc, From, Packet)
+                    mongoose_hooks:failed_to_store_message(Acc)
             end;
         _ ->
-            {Acc1, Err} = jlib:make_error_reply(
-                Acc, Packet, mongoose_xmpp_errors:service_unavailable()),
+            E = mongoose_xmpp_errors:service_unavailable(<<"en">>, <<"User not found">>),
+            {Acc1, Err} = jlib:make_error_reply(Acc, Packet, E),
             ejabberd_router:route(To, From, Acc1, Err)
     end.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
--spec clean_session_list([sid()]) -> [sid()].
+-spec clean_session_list([session()]) -> [session()].
 clean_session_list(Ss) ->
     clean_session_list(lists:keysort(#session.usr, Ss), []).
 
 
--spec clean_session_list([sid()], [sid()]) -> [sid()].
+-spec clean_session_list([session()], [session()]) -> [session()].
 clean_session_list([], Res) ->
     Res;
 clean_session_list([S], Res) ->
     [S | Res];
 clean_session_list([S1, S2 | Rest], Res) ->
-    if
-        S1#session.usr == S2#session.usr ->
-            if
-                S1#session.sid > S2#session.sid ->
-                    clean_session_list([S1 | Rest], Res);
-                true ->
-                    clean_session_list([S2 | Rest], Res)
-            end;
+    case S1#session.usr == S2#session.usr of
         true ->
+            case S1#session.sid > S2#session.sid of
+                true -> clean_session_list([S1 | Rest], Res);
+                false -> clean_session_list([S2 | Rest], Res)
+            end;
+        false ->
             clean_session_list([S2 | Rest], [S1 | Res])
     end.
 
@@ -895,12 +842,20 @@ clean_session_list([S1, S2 | Rest], Res) ->
       LUser :: jid:luser(),
       LServer :: jid:lserver().
 get_user_present_pids(LUser, LServer) ->
-    Ss = clean_session_list(ejabberd_gen_sm:get_sessions(sm_backend(), LUser, LServer)),
-    [{S#session.priority, element(2, S#session.sid)} || S <- Ss, is_integer(S#session.priority)].
+    Ss = ejabberd_sm_backend:get_sessions(LUser, LServer),
+    [{S#session.priority, element(2, S#session.sid)} ||
+     S <- clean_session_list(Ss), is_integer(S#session.priority)].
+
+-spec get_user_present_resources_and_pids(jid:jid()) -> [{Resource :: binary(), pid()}].
+get_user_present_resources_and_pids(#jid{luser = LUser, lserver = LServer}) ->
+    Ss = ejabberd_sm_backend:get_sessions(LUser, LServer),
+    [{Resource, Pid} ||
+     #session{usr = {_, _, Resource}, sid = {_, Pid}, priority = Prio}
+         <- clean_session_list(Ss), is_integer(Prio)].
 
 -spec get_user_present_resources(jid:jid()) -> [{priority(), binary()}].
 get_user_present_resources(#jid{luser = LUser, lserver = LServer}) ->
-    Ss = ejabberd_gen_sm:get_sessions(sm_backend(), LUser, LServer),
+    Ss = ejabberd_sm_backend:get_sessions(LUser, LServer),
     [{S#session.priority, element(3, S#session.usr)} ||
         S <- clean_session_list(Ss), is_integer(S#session.priority)].
 
@@ -916,37 +871,43 @@ is_offline(#jid{luser = LUser, lserver = LServer}) ->
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 %% @doc On new session, check if some existing connections need to be replace
--spec check_for_sessions_to_replace(JID) -> ReplacedPids when
+-spec check_for_sessions_to_replace(HostType, SID, JID) -> ReplacedPids when
+      HostType :: mongooseim:host_type(),
+      SID :: sid(),
       JID :: jid:jid(),
       ReplacedPids :: [pid()].
-check_for_sessions_to_replace(JID) ->
+check_for_sessions_to_replace(HostType, {_, NewPid}, JID) ->
     #jid{luser = LUser, lserver = LServer, lresource = LResource} = JID,
+    Sessions = ejabberd_sm_backend:get_sessions(LUser, LServer),
     %% TODO: Depending on how this is executed, there could be an unneeded
     %% replacement for max_sessions. We need to check this at some point.
-    ReplacedRedundantSessions = check_existing_resources(LUser, LServer, LResource),
-    AllReplacedSessionPids = check_max_sessions(LUser, LServer, ReplacedRedundantSessions),
-    [Pid ! replaced || Pid <- AllReplacedSessionPids],
+    ReplacedRedundantSessions = check_existing_resources(LResource, Sessions),
+    AllReplacedSessionPids = check_max_sessions(HostType, LUser, LServer, ReplacedRedundantSessions, Sessions),
+    [mongoose_c2s:exit(Pid, {replaced, NewPid}) || Pid <- AllReplacedSessionPids],
     AllReplacedSessionPids.
 
--spec check_existing_resources(LUser, LServer, LResource) -> ReplacedSessionsPIDs when
-      LUser :: 'error' | jid:luser() | tuple(),
-      LServer :: 'error' | jid:lserver() | tuple(),
-      LResource :: 'error' | jid:lresource() | [byte()] | tuple(),
+-spec check_existing_resources(LResource, Sessions) ->
+        ReplacedSessionsPIDs when
+      LResource :: jid:lresource(),
+      Sessions :: [session()],
       ReplacedSessionsPIDs :: ordsets:ordset(pid()).
-check_existing_resources(LUser, LServer, LResource) ->
+check_existing_resources(LResource, Sessions) ->
     %% A connection exist with the same resource. We replace it:
-    Sessions = ejabberd_gen_sm:get_sessions(sm_backend(), LUser, LServer, LResource),
-    case [S#session.sid || S <- Sessions] of
+    case [S#session.sid || S = #session{usr = {_, _, R}} <- Sessions, R =:= LResource] of
         [] -> [];
+        [_] -> [];
         SIDs ->
             MaxSID = lists:max(SIDs),
             ordsets:from_list([Pid || {_, Pid} = S <- SIDs, S /= MaxSID])
     end.
 
-
--spec check_max_sessions(LUser :: jid:user(), LServer :: jid:server(),
-                         ReplacedPIDs :: [pid()]) -> AllReplacedPIDs :: ordsets:ordset(pid()).
-check_max_sessions(LUser, LServer, ReplacedPIDs) ->
+-spec check_max_sessions(HostType :: mongooseim:host_type(),
+                         LUser :: jid:luser(),
+                         LServer :: jid:lserver(),
+                         ReplacedPIDs :: [pid()],
+                         Sessions :: [session()]) ->
+    AllReplacedPIDs :: ordsets:ordset(pid()).
+check_max_sessions(HostType, LUser, LServer, ReplacedPIDs, Sessions) ->
     %% If the max number of sessions for a given is reached, we replace the
     %% first one
     SIDs = lists:filtermap(
@@ -957,8 +918,8 @@ check_max_sessions(LUser, LServer, ReplacedPIDs) ->
                         false -> {true, SID}
                     end
                 end,
-                ejabberd_gen_sm:get_sessions(sm_backend(), LUser, LServer)),
-    MaxSessions = get_max_user_sessions(LUser, LServer),
+                Sessions),
+    MaxSessions = get_max_user_sessions(HostType, LUser, LServer),
     case length(SIDs) =< MaxSessions of
         true -> ordsets:to_list(ReplacedPIDs);
         false ->
@@ -970,12 +931,14 @@ check_max_sessions(LUser, LServer, ReplacedPIDs) ->
 %% @doc Get the user_max_session setting
 %% This option defines the max number of time a given users are allowed to
 %% log in. Defaults to infinity
--spec get_max_user_sessions(LUser, Host) -> infinity | pos_integer() when
-      LUser :: jid:user(),
-      Host :: jid:server().
-get_max_user_sessions(LUser, Host) ->
-    case acl:match_rule(
-           Host, max_user_sessions, jid:make_noprep(LUser, Host, <<>>)) of
+-spec get_max_user_sessions(HostType, LUser, LServer) -> Result when
+      HostType :: mongooseim:host_type(),
+      LUser :: jid:luser(),
+      LServer :: jid:lserver(),
+      Result :: infinity | pos_integer().
+get_max_user_sessions(HostType, LUser, LServer) ->
+    JID = jid:make_noprep(LUser, LServer, <<>>),
+    case acl:match_rule(HostType, LServer, max_user_sessions, JID) of
         Max when is_integer(Max) -> Max;
         infinity -> infinity;
         _ -> ?MAX_USER_SESSIONS
@@ -998,202 +961,52 @@ process_iq(#iq{type = Type}, _From, _To, Acc, _Packet) when Type == result; Type
 process_iq(#iq{xmlns = XMLNS} = IQ, From, To, Acc, Packet) ->
     Host = To#jid.lserver,
     case ets:lookup(sm_iqtable, {XMLNS, Host}) of
-        [{_, Module, Function}] ->
-            case Module:Function(From, To, IQ) of
-                {Acc1, ignore} -> Acc1;
-                {Acc1, ResIQ} ->
-                    ejabberd_router:route(To, From, Acc1,
-                        jlib:iq_to_xml(ResIQ))
-            end;
-        [{_, Module, Function, Opts}] ->
-            gen_iq_handler:handle(Host, Module, Function, Opts,
-                                  From, To, Acc, IQ);
+        [{_, IQHandler}] ->
+            gen_iq_component:handle(IQHandler, Acc, From, To, IQ);
         [] ->
-            {Acc1, Err} = jlib:make_error_reply(
-                    Acc, Packet, mongoose_xmpp_errors:service_unavailable()),
+            E = mongoose_xmpp_errors:service_unavailable(<<"en">>, <<"Unknown xmlns=", XMLNS/binary, " for host=", Host/binary>>),
+            {Acc1, Err} = jlib:make_error_reply(Acc, Packet, E),
             ejabberd_router:route(To, From, Acc1, Err)
     end;
 process_iq(_, From, To, Acc, Packet) ->
     {Acc1, Err} = jlib:make_error_reply(Acc, Packet, mongoose_xmpp_errors:bad_request()),
    ejabberd_router:route(To, From, Acc1, Err).
 
-
--spec force_update_presence({jid:user(), jid:server()}) -> 'ok'.
-force_update_presence({LUser, LServer}) ->
-    Ss = ejabberd_gen_sm:get_sessions(sm_backend(), LUser, LServer),
-    lists:foreach(fun(#session{sid = {_, Pid}}) ->
-                          Pid ! {force_update_presence, LUser}
-                  end, Ss).
-
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%% ejabberd commands
-
--spec commands() -> [ejabberd_commands:cmd(), ...].
-commands() ->
-        [
-     %% TODO: Implement following API functions with pluggable backends architcture
-     %% #ejabberd_commands{name = connected_users,
-     %%                    tags = [session],
-     %%                    desc = "List all established sessions",
-     %%                    module = ?MODULE, function = connected_users,
-     %%                    args = [],
-     %%                    result = {connected_users, {list, {sessions, string}}}},
-     %% #ejabberd_commands{name = connected_users_number,
-     %%                    tags = [session, stats],
-     %%                    desc = "Get the number of established sessions",
-     %%                    module = ?MODULE, function = connected_users_number,
-     %%                    args = [],
-     %%                    result = {num_sessions, integer}},
-     #ejabberd_commands{name = user_resources,
-                        tags = [session],
-                        desc = "List user's connected resources",
-                        module = ?MODULE, function = user_resources,
-                        args = [{user, string}, {host, string}],
-                        result = {resources, {list, {resource, binary}}}}
-        ].
-
-
 -spec user_resources(UserStr :: string(), ServerStr :: string()) -> [binary()].
 user_resources(UserStr, ServerStr) ->
-    JID = jid:make(list_to_binary(UserStr), list_to_binary(ServerStr), <<"">>),
+    JID = jid:make_bare(list_to_binary(UserStr), list_to_binary(ServerStr)),
     Resources = get_user_resources(JID),
     lists:sort(Resources).
 
--spec sm_backend(backend()) -> string().
-sm_backend(Backend) ->
-    lists:flatten(
-      ["-module(ejabberd_sm_backend).
-        -export([backend/0]).
-        -spec backend() -> atom().
-        backend() ->
-            ejabberd_sm_",
-       atom_to_list(Backend),
-       ".\n"]).
-
--spec get_cached_unique_count() -> non_neg_integer().
-get_cached_unique_count() ->
-    case mongoose_metrics:get_metric_value(global, ?UNIQUE_COUNT_CACHE) of
-        {ok, DataPoints} ->
-            proplists:get_value(value, DataPoints);
-        _ ->
-            0
-    end.
-
+%% It is used from big tests
 -spec sm_backend() -> backend().
 sm_backend() ->
-    ejabberd_sm_backend:backend().
+    mongoose_backend:get_backend_module(global, ?MODULE).
 
-%%====================================================================
-%% Deprecated API
-%%====================================================================
-open_session(SID, U, S, R, Info) ->
-    mongoose_deprecations:log(
-      {?MODULE, ?FUNCTION_NAME, ?FUNCTION_ARITY},
-      "The function ejabberd_sm:open_session/5"
-      " is deprecated, please use the #jid{} equivalent instead",
-      [{log_level, warning}]),
-    open_session(SID, jid:make(U, S, R), undefined, Info).
+-spec instrumentation(mongooseim:host_type_or_global()) -> [mongoose_instrument:spec()].
+instrumentation(global) ->
+    global_probes();
+instrumentation(HostType) ->
+    [{sm_session, #{host_type => HostType},
+      #{metrics => #{logins => spiral, logouts => spiral, count => counter}}},
+     {sm_presence_subscription, #{host_type => HostType},
+      #{metrics => #{subscription_count => spiral, unsubscription_count => spiral}}},
+     {sm_message_bounced, #{host_type => HostType},
+      #{metrics => #{count => spiral}}}].
 
-open_session(SID, U, S, R, Priority, Info) ->
-    mongoose_deprecations:log(
-      {?MODULE, ?FUNCTION_NAME, ?FUNCTION_ARITY},
-      "The function ejabberd_sm:open_session/6"
-      " is deprecated, please use the #jid{} equivalent instead",
-      [{log_level, warning}]),
-    open_session(SID, jid:make(U, S, R), Priority, Info).
+global_probes() ->
+    [{sm_total_sessions, #{},
+      #{probe => #{module => ?MODULE}, metrics => #{count => gauge}}},
+     {sm_unique_sessions, #{},
+      #{probe => #{module => ?MODULE}, metrics => #{count => gauge}}},
+     {sm_node_sessions, #{},
+      #{probe => #{module => ?MODULE}, metrics => #{count => gauge}}}].
 
-close_session(Acc, SID, U, S, R, Reason) ->
-    mongoose_deprecations:log(
-      {?MODULE, ?FUNCTION_NAME, ?FUNCTION_ARITY},
-      "The function ejabberd_sm:close_session/6"
-      " is deprecated, please use the #jid{} equivalent instead",
-      [{log_level, warning}]),
-    close_session(Acc, SID, jid:make(U, S, R), Reason).
-
-close_session_unset_presence(Acc, SID, U, S, R, Status, Reason) ->
-    mongoose_deprecations:log(
-      {?MODULE, ?FUNCTION_NAME, ?FUNCTION_ARITY},
-      "The function ejabberd_sm:close_session_unset_presence/7"
-      " is deprecated, please use the #jid{} equivalent instead",
-      [{log_level, warning}]),
-    close_session_unset_presence(Acc, SID, jid:make(U, S, R), Status, Reason).
-
-unset_presence(Acc, SID, U, S, R, Status, Info) ->
-    mongoose_deprecations:log(
-      {?MODULE, ?FUNCTION_NAME, ?FUNCTION_ARITY},
-      "The function ejabberd_sm:unset_presence/7"
-      " is deprecated, please use the #jid{} equivalent instead",
-      [{log_level, warning}]),
-    unset_presence(Acc, SID, jid:make(U, S, R), Status, Info).
-
-get_raw_sessions(U, S) ->
-    mongoose_deprecations:log(
-      {?MODULE, ?FUNCTION_NAME, ?FUNCTION_ARITY},
-      "The function ejabberd_sm:get_raw_sessions/2"
-      " is deprecated, please use the #jid{} equivalent instead",
-      [{log_level, warning}]),
-    get_raw_sessions(jid:make(U, S, <<>>)).
-
-store_info(U, S, R, {Key, _Value} = KV) ->
-    mongoose_deprecations:log(
-      {?MODULE, ?FUNCTION_NAME, ?FUNCTION_ARITY},
-      "The function ejabberd_sm:store_info/4"
-      " is deprecated, please use the #jid{} equivalent instead",
-      [{log_level, warning}]),
-    store_info(jid:make(U, S, R), {Key, _Value} = KV).
-
-set_presence(Acc, SID, U, S, R, Priority, Presence, Info) ->
-    mongoose_deprecations:log(
-      {?MODULE, ?FUNCTION_NAME, ?FUNCTION_ARITY},
-      "The function ejabberd_sm:set_presence/8"
-      " is deprecated, please use the #jid{} equivalent instead",
-      [{log_level, warning}]),
-    set_presence(Acc, SID, jid:make(U, S, R), Priority, Presence, Info).
-
-remove_info(U, S, R, Key) ->
-    mongoose_deprecations:log(
-      {?MODULE, ?FUNCTION_NAME, ?FUNCTION_ARITY},
-      "The function ejabberd_sm:remove_info/4"
-      " is deprecated, please use the #jid{} equivalent instead",
-      [{log_level, warning}]),
-    remove_info(jid:make(U, S, R), Key).
-
-get_user_resources(U, S) ->
-    mongoose_deprecations:log(
-      {?MODULE, ?FUNCTION_NAME, ?FUNCTION_ARITY},
-      "The function ejabberd_sm:get_user_resources/2"
-      " is deprecated, please use the #jid{} equivalent instead",
-      [{log_level, warning}]),
-    get_user_resources(jid:make(U, S, <<>>)).
-
-get_session_pid(U, S, R) ->
-    mongoose_deprecations:log(
-      {?MODULE, ?FUNCTION_NAME, ?FUNCTION_ARITY},
-      "The function ejabberd_sm:get_session_pid/3"
-      " is deprecated, please use the #jid{} equivalent instead",
-      [{log_level, warning}]),
-    get_session_pid(jid:make(U, S, R)).
-
-get_session(U, S, R) ->
-    mongoose_deprecations:log(
-      {?MODULE, ?FUNCTION_NAME, ?FUNCTION_ARITY},
-      "The function ejabberd_sm:get_session/3"
-      " is deprecated, please use the #jid{} equivalent instead",
-      [{log_level, warning}]),
-    get_session(jid:make(U, S, R)).
-
-get_session_ip(U, S, R) ->
-    mongoose_deprecations:log(
-      {?MODULE, ?FUNCTION_NAME, ?FUNCTION_ARITY},
-      "The function ejabberd_sm:get_session_ip/3"
-      " is deprecated, please use the #jid{} equivalent instead",
-      [{log_level, warning}]),
-    get_session_ip(jid:make(U, S, R)).
-
-get_user_present_resources(U, S) ->
-    mongoose_deprecations:log(
-      {?MODULE, ?FUNCTION_NAME, ?FUNCTION_ARITY},
-      "The function ejabberd_sm:get_user_present_resources/2"
-      " is deprecated, please use the #jid{} equivalent instead",
-      [{log_level, warning}]),
-    get_user_present_resources(jid:make(U, S, <<>>)).
+-spec probe(mongoose_instrument:event_name(), mongoose_instrument:labels()) ->
+    mongoose_instrument:measurements().
+probe(sm_total_sessions, #{}) ->
+    #{count => get_total_sessions_number()};
+probe(sm_unique_sessions, #{}) ->
+    #{count => get_unique_sessions_number()};
+probe(sm_node_sessions, #{}) ->
+    #{count => get_node_sessions_number()}.

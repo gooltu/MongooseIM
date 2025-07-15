@@ -8,6 +8,8 @@
 -module(mod_event_pusher_http).
 -author("baibossynov.valery@gmail.com").
 
+-ignore_xref([behaviour_info/1]).
+
 -behaviour(gen_mod).
 -behaviour(mod_event_pusher).
 -behaviour(mongoose_module_metrics).
@@ -20,14 +22,14 @@
                           Opts :: [{atom(), term()}]) -> boolean().
 -callback prepare_headers(Acc :: mongoose_acc:t(),
                           Dir :: in | out,
-                          Host :: jid:lserver(),
+                          Domain :: jid:lserver(),
                           Message :: binary(),
                           Sender :: jid:luser(),
                           Receiver :: jid:luser(),
                           Opts :: [{atom(), term()}]) -> [{binary(), binary()}].
 -callback prepare_body(Acc :: mongoose_acc:t(),
                        Dir :: in | out,
-                       Host :: jid:lserver(),
+                       Domain :: jid:lserver(),
                        Message :: binary(),
                        Sender :: jid:luser(),
                        Receiver :: jid:luser(),
@@ -37,35 +39,58 @@
 -include("jlib.hrl").
 
 %% API
--export([start/2, stop/1, push_event/3]).
+-export([start/2, stop/1, config_spec/0, push_event/2, instrumentation/1]).
+
+%% config spec callbacks
+-export([fix_path/1]).
 
 -include("mongoose.hrl").
 -include("jlib.hrl").
+-include("mongoose_config_spec.hrl").
 
--define(DEFAULT_POOL_NAME, http_pool).
--define(DEFAULT_PATH, "").
+-define(SENT_METRIC, mod_event_pusher_http_sent).
 
--define(SENT_METRIC, [mod_http_notifications, sent]).
--define(FAILED_METRIC, [mod_http_notifications, failed]).
--define(RESPONSE_METRIC, [mod_http_notifications, response_time]).
-
-start(Host, _Opts) ->
-    ensure_metrics(Host),
+-spec start(mongooseim:host_type(), gen_mod:module_opts()) -> ok.
+start(_HostType, _Opts) ->
     ok.
 
-stop(_Host) ->
+-spec stop(mongooseim:host_type()) -> ok.
+stop(_HostType) ->
     ok.
 
-push_event(Acc, _Host, #chat_event{direction = Dir, from = From, to = To, packet = Packet}) ->
+-spec config_spec() -> mongoose_config_spec:config_section().
+config_spec() ->
+    #section{items = #{<<"handlers">> => #list{items = handler_config_spec(),
+                                              validate = unique}},
+             defaults = #{<<"handlers">> => []}}.
+
+handler_config_spec() ->
+    #section{items = #{<<"pool_name">> => #option{type = atom,
+                                                  validate = pool_name},
+                       <<"path">> => #option{type = binary,
+                                             process = fun ?MODULE:fix_path/1},
+                       <<"callback_module">> => #option{type = atom,
+                                                        validate = module}
+                },
+             defaults = #{<<"pool_name">> => http_pool,
+                          <<"path">> => <<>>,
+                          <<"callback_module">> => mod_event_pusher_http_defaults}
+            }.
+
+instrumentation(HostType) ->
+    [{?SENT_METRIC, #{host_type => HostType},
+      #{metrics => #{count => spiral, response_time => histogram, failure_count => spiral}}}].
+
+push_event(Acc, #chat_event{direction = Dir, from = From, to = To, packet = Packet}) ->
+    HostType = mongoose_acc:host_type(Acc),
     lists:map(fun(Opts) -> push_event(Acc, Dir, From, To, Packet, Opts) end,
-              gen_mod:get_module_opt(From#jid.lserver, ?MODULE, configs, [])),
+              gen_mod:get_module_opt(HostType, ?MODULE, handlers)),
     Acc;
-push_event(Acc, _Host, _Event) ->
+push_event(Acc, _Event) ->
     Acc.
 
-push_event(Acc, Dir, From, To, Packet, Opts) ->
+push_event(Acc, Dir, From, To, Packet, Opts = #{callback_module := Mod}) ->
     Body = exml_query:path(Packet, [{element, <<"body">>}, cdata], <<>>),
-    Mod = get_callback_module(Opts),
     case Mod:should_make_req(Acc, Dir, Packet, From, To, Opts) of
         true ->
             make_req(Acc, Dir, From#jid.lserver, From#jid.luser, To#jid.luser, Body, Opts);
@@ -78,39 +103,28 @@ push_event(Acc, Dir, From, To, Packet, Opts) ->
 %%% Internal functions
 %%%===================================================================
 
-get_callback_module(Opts) ->
-    proplists:get_value(callback_module, Opts, mod_event_pusher_http_defaults).
+make_req(Acc, Dir, Domain, Sender, Receiver, Message, Opts) ->
+    #{pool_name := PoolName, path := Path, callback_module := Mod} = Opts,
+    HostType = mongoose_acc:host_type(Acc),
+    Body = Mod:prepare_body(Acc, Dir, Domain, Message, Sender, Receiver, Opts),
+    Headers = Mod:prepare_headers(Acc, Dir, Domain, Message, Sender, Receiver, Opts),
+    LogMeta = #{what => event_pusher_http_req,
+                text => <<"mod_event_pusher_http makes an external HTTP call">>,
+                path => Path, body => Body, headers => Headers,
+                sender => Sender, receiver => Receiver, direction => Dir,
+                server => Domain, pool_name => PoolName, acc => Acc},
+    ?LOG_INFO(LogMeta),
+    mongoose_instrument:span(?SENT_METRIC, #{host_type => HostType},
+                             fun mongoose_http_client:post/5, [HostType, PoolName, Path, Headers, Body],
+                             fun(Time, Result) -> handle_post_result(Time, Result, LogMeta) end).
 
-make_req(Acc, Dir, Host, Sender, Receiver, Message, Opts) ->
-    Path = fix_path(list_to_binary(proplists:get_value(path, Opts, ?DEFAULT_PATH))),
-    PoolName = proplists:get_value(pool_name, Opts, ?DEFAULT_POOL_NAME),
-    Mod = get_callback_module(Opts),
-    Body = Mod:prepare_body(Acc, Dir, Host, Message, Sender, Receiver, Opts),
-    Headers = Mod:prepare_headers(Acc, Dir, Host, Message, Sender, Receiver, Opts),
-    ?INFO_MSG("Making request '~p' for user ~s@~s...", [Path, Sender, Host]),
-    T0 = os:timestamp(),
-    {Res, Elapsed} = case mongoose_http_client:post(Host, PoolName, Path, Headers, Body) of
-                         {ok, _} ->
-                             {ok, timer:now_diff(os:timestamp(), T0)};
-                         {error, Reason} ->
-                             {{error, Reason}, 0}
-                     end,
-    record_result(Host, Res, Elapsed),
-    ok.
-
-ensure_metrics(Host) ->
-    mongoose_metrics:ensure_metric(Host, ?SENT_METRIC, spiral),
-    mongoose_metrics:ensure_metric(Host, ?FAILED_METRIC, spiral),
-    mongoose_metrics:ensure_metric(Host, ?RESPONSE_METRIC, histogram),
-    ok.
-record_result(Host, ok, Elapsed) ->
-    mongoose_metrics:update(Host, ?SENT_METRIC, 1),
-    mongoose_metrics:update(Host, ?RESPONSE_METRIC, Elapsed),
-    ok;
-record_result(Host, {error, Reason}, _) ->
-    mongoose_metrics:update(Host, ?FAILED_METRIC, 1),
-    ?WARNING_MSG("Sending http notification failed: ~p", [Reason]),
-    ok.
+handle_post_result(Time, {ok, {Code, _Body}}, #{sender := Sender}) ->
+    #{count => 1, response_time => Time, sender => Sender, response_code => Code};
+handle_post_result(_Time, {error, Reason}, LogMeta = #{sender := Sender}) ->
+    ?LOG_WARNING(LogMeta#{what => event_pusher_http_req_failed,
+                          text => <<"mod_event_pusher_http HTTP call failed">>,
+                          reason => Reason}),
+    #{failure_count => 1, sender => Sender}.
 
 %% @doc Strip initial slash (it is added by mongoose_http_client)
 fix_path(<<"/", R/binary>>) ->

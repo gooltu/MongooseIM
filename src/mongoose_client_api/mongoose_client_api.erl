@@ -1,19 +1,65 @@
 -module(mongoose_client_api).
 
--export([init/2]).
--export([content_types_provided/2]).
--export([is_authorized/2]).
--export([options/2]).
--export([allowed_methods/2]).
--export([to_json/2]).
--export([bad_request/2]).
--export([bad_request/3]).
--export([forbidden_request/2]).
--export([forbidden_request/3]).
--export([json_to_map/1]).
+-behaviour(mongoose_http_handler).
+
+%% mongoose_http_handler callbacks
+-export([config_spec/0, routes/1]).
+
+%% Utilities for the handler modules
+-export([init/2,
+         is_authorized/2,
+         parse_body/1,
+         parse_qs/1,
+         try_handle_request/3,
+         throw_error/2]).
 
 -include("mongoose.hrl").
--include("jlib.hrl").
+-include("mongoose_config_spec.hrl").
+
+-type handler_options() :: #{path := string(), handlers := [module()], docs := boolean(),
+                             atom() => any()}.
+-type req() :: cowboy_req:req().
+-type state() :: #{atom() => any()}.
+-type error_type() :: bad_request | denied | not_found.
+
+-callback routes() -> mongoose_http_handler:routes().
+
+%% mongoose_http_handler callbacks
+
+-spec config_spec() -> mongoose_config_spec:config_section().
+config_spec() ->
+    Handlers = all_handlers(),
+    #section{items = #{<<"handlers">> => #list{items = #option{type = atom,
+                                                               validate = {enum, Handlers}},
+                                               validate = unique},
+                       <<"docs">> => #option{type = boolean}},
+             defaults = #{<<"handlers">> => Handlers,
+                          <<"docs">> => true}}.
+
+-spec routes(handler_options()) -> mongoose_http_handler:routes().
+routes(Opts = #{path := BasePath}) ->
+    [{[BasePath, Path], Module, ModuleOpts}
+     || {Path, Module, ModuleOpts} <- api_paths(Opts)] ++ api_doc_paths(Opts).
+
+all_handlers() ->
+    [sse, messages, contacts, rooms, rooms_config, rooms_users, rooms_messages].
+
+-spec api_paths(handler_options()) -> mongoose_http_handler:routes().
+api_paths(#{handlers := Handlers}) ->
+    lists:flatmap(fun api_paths_for_handler/1, Handlers).
+
+api_paths_for_handler(Handler) ->
+    HandlerModule = list_to_existing_atom("mongoose_client_api_" ++ atom_to_list(Handler)),
+    HandlerModule:routes().
+
+api_doc_paths(#{docs := true}) ->
+    [{"/api-docs", cowboy_swagger_redirect_handler, #{}},
+     {"/api-docs/swagger.json", cowboy_swagger_json_handler, #{}},
+     {"/api-docs/[...]", cowboy_static, {priv_dir, cowboy_swagger, "swagger",
+                                         [{mimetypes, cow_mimetypes, all}]}
+     }];
+api_doc_paths(#{docs := false}) ->
+    [].
 
 init(Req, _Opts) ->
     State = #{},
@@ -38,45 +84,6 @@ set_cors_headers(Origin, Req) ->
 set_cors_header({Header, Value}, Req) ->
     cowboy_req:set_resp_header(Header, Value, Req).
 
-allowed_methods(Req, State) ->
-    {[<<"OPTIONS">>, <<"GET">>], Req, State}.
-
-content_types_provided(Req, State) ->
-    {[
-      {{<<"application">>, <<"json">>, '*'}, to_json}
-     ], Req, State}.
-
-options(Req, State) ->
-    {ok, Req, State}.
-
-to_json(Req, User) ->
-    {<<"{}">>, Req, User}.
-
-bad_request(Req, State) ->
-    bad_request(Req, <<>>, State).
-
-bad_request(Req, Reason, State) ->
-    reply(400, Req, Reason, State).
-
-forbidden_request(Req, State) ->
-    forbidden_request(Req, <<>>, State).
-
-forbidden_request(Req, Reason, State) ->
-    reply(403, Req, Reason, State).
-
-reply(StatusCode, Req, Body, State) ->
-    Req1 = set_resp_body_if_missing(Body, Req),
-    Req2 = cowboy_req:reply(StatusCode, Req1),
-    {stop, Req2, State#{was_replied => true}}.
-
-set_resp_body_if_missing(Body, Req) ->
-    case cowboy_req:has_resp_body(Req) of
-        true ->
-            Req;
-        false ->
-            cowboy_req:set_resp_body(Body, Req)
-    end.
-
 %%--------------------------------------------------------------------
 %% Authorization
 %%--------------------------------------------------------------------
@@ -88,56 +95,88 @@ is_authorized(Req, State) ->
     case AuthDetails of
         undefined ->
             mongoose_api_common:make_unauthorized_response(Req, State);
-        _ ->
-            authorize(AuthDetails, HTTPMethod, Req, State)
+        {AuthMethod, User, Password} ->
+            authorize(AuthMethod, User, Password, HTTPMethod, Req, State)
     end.
 
-authorize({_AuthMethod, User, _Pass} = AuthDetails, HTTPMethod, Req, State) ->
-    case do_authorize(AuthDetails, HTTPMethod) of
+authorize(AuthMethod, User, Password, HTTPMethod, Req, State) ->
+    MaybeJID = jid:from_binary(User),
+    case do_authorize(AuthMethod, MaybeJID, Password, HTTPMethod) of
         noauth ->
             {true, Req, State};
-        true ->
-            {true, Req, State#{user => User, jid => jid:from_binary(User)}};
+        {true, Creds} ->
+            {true, Req, State#{user => User, jid => MaybeJID, creds => Creds}};
         false ->
             mongoose_api_common:make_unauthorized_response(Req, State)
     end.
 
-do_authorize({AuthMethod, User, Password}, HTTPMethod) ->
+do_authorize(AuthMethod, MaybeJID, Password, HTTPMethod) ->
     case is_noauth_http_method(HTTPMethod) of
         true ->
             noauth;
         false ->
-            check_password(User, Password) andalso
-            mongoose_api_common:is_known_auth_method(AuthMethod)
-    end.
-
-check_password(<<>>, _) ->
-    false;
-check_password(User, Password) ->
-    #jid{luser = RawUser, lserver = Server} = jid:from_binary(User),
-    Creds0 = mongoose_credentials:new(Server),
-    Creds1 = mongoose_credentials:set(Creds0, username, RawUser),
-    Creds2 = mongoose_credentials:set(Creds1, password, Password),
-    case ejabberd_auth:authorize(Creds2) of
-        {ok, _} -> true;
-        _ -> false
+            mongoose_api_common:is_known_auth_method(AuthMethod) andalso
+                mongoose_api_common:check_password(MaybeJID, Password)
     end.
 
 % Constraints
 is_noauth_http_method(<<"OPTIONS">>) -> true;
 is_noauth_http_method(_) -> false.
 
-%% -------------------------------------------------------------------
-%% @doc
-%% Decode JSON binary into map
-%% @end
-%% -------------------------------------------------------------------
--spec json_to_map(JsonBin :: binary()) -> {ok, Map :: maps:map()} | {error, invalid_json}.
-
-json_to_map(JsonBin) ->
-    case catch jiffy:decode(JsonBin, [return_maps]) of
-        Map when is_map(Map) ->
-            {ok, Map};
-        _ ->
-            {error, invalid_json}
+-spec parse_body(req()) -> #{atom() => jiffy:json_value()}.
+parse_body(Req) ->
+    try
+        {ok, Body, _Req2} = cowboy_req:read_body(Req),
+        decoded_json_to_map(jiffy:decode(Body))
+    catch Class:Reason:Stacktrace ->
+            ?LOG_INFO(#{what => parse_body_failed,
+                        class => Class, reason => Reason, stacktrace => Stacktrace}),
+            throw_error(bad_request, <<"Invalid request body">>)
     end.
+
+decoded_json_to_map({L}) when is_list(L) ->
+    maps:from_list([{binary_to_existing_atom(K), decoded_json_to_map(V)} || {K, V} <- L]);
+decoded_json_to_map(V) ->
+    V.
+
+-spec parse_qs(req()) -> #{atom() => binary() | true}.
+parse_qs(Req) ->
+    try
+        maps:from_list([{binary_to_existing_atom(K), V} || {K, V} <- cowboy_req:parse_qs(Req)])
+    catch Class:Reason:Stacktrace ->
+            ?LOG_INFO(#{what => parse_qs_failed,
+                        class => Class, reason => Reason, stacktrace => Stacktrace}),
+            throw_error(bad_request, <<"Invalid query string">>)
+    end.
+
+-spec try_handle_request(req(), state(), fun((req(), state()) -> Result)) -> Result.
+try_handle_request(Req, State, F) ->
+    try
+        F(Req, State)
+    catch throw:#{error_type := ErrorType, message := Msg} ->
+            error_response(ErrorType, Msg, Req, State)
+    end.
+
+-spec throw_error(error_type(), iodata()) -> no_return().
+throw_error(ErrorType, Msg) ->
+    throw(#{error_type => ErrorType, message => Msg}).
+
+-spec error_response(error_type(), iodata(), req(), state()) -> {stop, req(), state()}.
+error_response(ErrorType, Message, Req, State) ->
+    BinMessage = iolist_to_binary(Message),
+    ?LOG(log_level(ErrorType), #{what => mongoose_client_api_error_response,
+                                 error_type => ErrorType,
+                                 message => BinMessage,
+                                 req => Req}),
+    Req1 = cowboy_req:reply(error_code(ErrorType), #{}, jiffy:encode(BinMessage), Req),
+    {stop, Req1, State}.
+
+-spec error_code(error_type()) -> non_neg_integer().
+error_code(bad_request) -> 400;
+error_code(denied) -> 403;
+error_code(not_found) -> 404.
+
+-spec log_level(error_type()) -> logger:level().
+log_level(bad_request) -> info;
+log_level(denied) -> info;
+log_level(not_found) -> info.

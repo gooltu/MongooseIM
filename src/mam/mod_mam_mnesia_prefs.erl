@@ -13,14 +13,15 @@
 %% Exports
 
 %% gen_mod handlers
--export([start/2, stop/1]).
+-behaviour(gen_mod).
+-export([start/2, stop/1, supported_features/0]).
 
 %% MAM hook handlers
 -behaviour(ejabberd_gen_mam_prefs).
--export([get_behaviour/5,
-         get_prefs/4,
-         set_prefs/7,
-         remove_archive/4]).
+-export([get_behaviour/3,
+         get_prefs/3,
+         set_prefs/3,
+         remove_archive/3]).
 
 -include("mongoose.hrl").
 -include("jlib.hrl").
@@ -38,117 +39,82 @@
 %% gen_mod callbacks
 %% Starting and stopping functions for users' archives
 
--spec start(Host :: jid:server(), Opts :: list()) -> any().
-start(Host, Opts) ->
-    mnesia:create_table(mam_prefs,
-            [{disc_copies, [node()]},
-             {attributes, record_info(fields, mam_prefs)}]),
-    mnesia:add_table_copy(mam_prefs, node(), disc_copies),
-    case gen_mod:get_module_opt(Host, ?MODULE, pm, false) of
-        true ->
-            start_pm(Host, Opts);
-        false ->
-            ok
-    end,
-    case gen_mod:get_module_opt(Host, ?MODULE, muc, false) of
-        true ->
-            start_muc(Host, Opts);
-        false ->
-            ok
-    end.
+-spec start(mongooseim:host_type(), gen_mod:module_opts()) -> ok.
+start(HostType, Opts) ->
+    mongoose_mnesia:create_table(mam_prefs,
+        [{disc_copies, [node()]},
+         {attributes, record_info(fields, mam_prefs)}]),
+    gen_hook:add_handlers(hooks(HostType, Opts)).
 
+-spec stop(mongooseim:host_type()) -> ok.
+stop(HostType) ->
+    Opts = gen_mod:get_loaded_module_opts(HostType, ?MODULE),
+    gen_hook:delete_handlers(hooks(HostType, Opts)).
 
--spec stop(Host :: jid:server()) -> any().
-stop(Host) ->
-    case gen_mod:get_module_opt(Host, ?MODULE, pm, false) of
-        true ->
-            stop_pm(Host);
-        false ->
-            ok
-    end,
-    case gen_mod:get_module_opt(Host, ?MODULE, muc, false) of
-        true ->
-            stop_muc(Host);
-        false ->
-            ok
-    end.
-
+-spec supported_features() -> [atom()].
+supported_features() ->
+    [dynamic_domains].
 
 %% ----------------------------------------------------------------------
-%% Add hooks for mod_mam
+%% Hooks
 
--spec start_pm(jid:server(), list()) -> 'ok'.
-start_pm(Host, _Opts) ->
-    ejabberd_hooks:add(mam_get_behaviour, Host, ?MODULE, get_behaviour, 50),
-    ejabberd_hooks:add(mam_get_prefs, Host, ?MODULE, get_prefs, 50),
-    ejabberd_hooks:add(mam_set_prefs, Host, ?MODULE, set_prefs, 50),
-    ejabberd_hooks:add(mam_remove_archive, Host, ?MODULE, remove_archive, 50),
-    ok.
+hooks(HostType, Opts) ->
+    lists:flatmap(fun(Type) -> hooks(HostType, Type, Opts) end, [pm, muc]).
 
-
--spec stop_pm(jid:server()) -> 'ok'.
-stop_pm(Host) ->
-    ejabberd_hooks:delete(mam_get_behaviour, Host, ?MODULE, get_behaviour, 50),
-    ejabberd_hooks:delete(mam_get_prefs, Host, ?MODULE, get_prefs, 50),
-    ejabberd_hooks:delete(mam_set_prefs, Host, ?MODULE, set_prefs, 50),
-    ejabberd_hooks:delete(mam_remove_archive, Host, ?MODULE, remove_archive, 50),
-    ok.
-
-
-%% ----------------------------------------------------------------------
-%% Add hooks for mod_mam_muc_muc
-
--spec start_muc(jid:server(), list()) -> 'ok'.
-start_muc(Host, _Opts) ->
-    ejabberd_hooks:add(mam_muc_get_behaviour, Host, ?MODULE, get_behaviour, 50),
-    ejabberd_hooks:add(mam_muc_get_prefs, Host, ?MODULE, get_prefs, 50),
-    ejabberd_hooks:add(mam_muc_set_prefs, Host, ?MODULE, set_prefs, 50),
-    ejabberd_hooks:add(mam_muc_remove_archive, Host, ?MODULE, remove_archive, 50),
-    ok.
-
-
--spec stop_muc(jid:server()) -> 'ok'.
-stop_muc(Host) ->
-    ejabberd_hooks:delete(mam_muc_get_behaviour, Host, ?MODULE, get_behaviour, 50),
-    ejabberd_hooks:delete(mam_muc_get_prefs, Host, ?MODULE, get_prefs, 50),
-    ejabberd_hooks:delete(mam_muc_set_prefs, Host, ?MODULE, set_prefs, 50),
-    ejabberd_hooks:delete(mam_muc_remove_archive, Host, ?MODULE, remove_archive, 50),
-    ok.
-
+hooks(HostType, pm, #{pm := true}) ->
+    [{mam_get_behaviour, HostType, fun ?MODULE:get_behaviour/3, #{}, 50},
+     {mam_get_prefs, HostType, fun ?MODULE:get_prefs/3, #{}, 50},
+     {mam_set_prefs, HostType, fun ?MODULE:set_prefs/3, #{}, 50},
+     {mam_remove_archive, HostType, fun ?MODULE:remove_archive/3, #{}, 50}];
+hooks(HostType, muc, #{muc := true}) ->
+    [{mam_muc_get_behaviour, HostType, fun ?MODULE:get_behaviour/3, #{}, 50},
+     {mam_muc_get_prefs, HostType, fun ?MODULE:get_prefs/3, #{}, 50},
+     {mam_muc_set_prefs, HostType, fun ?MODULE:set_prefs/3, #{}, 50},
+     {mam_muc_remove_archive, HostType, fun ?MODULE:remove_archive/3, #{}, 50}];
+hooks(_HostType, _Opt, _Opts) ->
+    [].
 
 %% ----------------------------------------------------------------------
 %% Internal functions and callbacks
 
--spec get_behaviour(Default :: behaviour(), Host :: jid:server(),
-    ArcID :: mod_mam:archive_id(), LocJID :: jid:jid(),
-    RemJID :: jid:jid()) -> any().
-get_behaviour(DefaultBehaviour, _Host,
-              _ArcID,
-              LocJID=#jid{},
-              RemJID=#jid{}) ->
+-spec get_behaviour(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: mod_mam:archive_behaviour(),
+    Params :: ejabberd_gen_mam_prefs:get_behaviour_params(),
+    Extra :: gen_hook:extra().
+get_behaviour(DefaultBehaviour,
+              #{owner := LocJID, remote := RemJID},
+              _Extra) ->
+    get_behaviour2(DefaultBehaviour, LocJID, RemJID);
+get_behaviour(DefaultBehaviour,
+              #{room := LocJID, remote := RemJID},
+              _Extra) ->
+    get_behaviour2(DefaultBehaviour, LocJID, RemJID).
+
+get_behaviour2(DefaultBehaviour, LocJID, RemJID) ->
     SU = su_key(LocJID),
     case mnesia:dirty_read(mam_prefs, SU) of
-        [] -> DefaultBehaviour;
-        [User] -> get_behaviour(User, LocJID, RemJID)
+        [] -> {ok, DefaultBehaviour};
+        [User] -> {ok, get_behaviour3(User, LocJID, RemJID)}
     end.
 
 
--spec get_behaviour(mam_prefs(), LocJID :: jid:jid(),
+-spec get_behaviour3(mam_prefs(), LocJID :: jid:jid(),
                     RemJID :: jid:jid()) -> behaviour().
-get_behaviour(#mam_prefs{default_mode = always, never_rules=NeverJIDs}, LocJID, RemJID) ->
+get_behaviour3(#mam_prefs{default_mode = always, never_rules = NeverJIDs}, LocJID, RemJID) ->
     IsNever = match_jid(LocJID, RemJID, NeverJIDs),
     case IsNever of
         true -> never;
         false -> always
     end;
-get_behaviour(#mam_prefs{default_mode = never, always_rules=AlwaysJIDs}, LocJID, RemJID) ->
+get_behaviour3(#mam_prefs{default_mode = never, always_rules = AlwaysJIDs}, LocJID, RemJID) ->
     IsAlways = match_jid(LocJID, RemJID, AlwaysJIDs),
     case IsAlways of
         true -> always;
         false -> never
     end;
-get_behaviour(#mam_prefs{default_mode = roster,
-        never_rules=NeverJIDs, always_rules=AlwaysJIDs}, LocJID, RemJID) ->
+get_behaviour3(#mam_prefs{default_mode = roster,
+                          never_rules = NeverJIDs,
+                          always_rules = AlwaysJIDs}, LocJID, RemJID) ->
     IsNever = match_jid(LocJID, RemJID, NeverJIDs),
     case IsNever of
         true -> never;
@@ -160,20 +126,29 @@ get_behaviour(#mam_prefs{default_mode = roster,
             end
     end.
 
+-spec set_prefs(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: term(),
+    Params :: ejabberd_gen_mam_prefs:set_prefs_params(),
+    Extra :: gen_hook:extra().
+set_prefs(_Result,
+          #{archive_id := ArcID, owner := ArcJID, default_mode := DefaultMode,
+            always_jids := AlwaysJIDs, never_jids := NeverJIDs},
+          _Extra) ->
+            set_prefs1(ArcID, ArcJID, DefaultMode, AlwaysJIDs, NeverJIDs);
+set_prefs(_Result,
+          #{archive_id := ArcID, room := ArcJID, default_mode := DefaultMode,
+            always_jids := AlwaysJIDs, never_jids := NeverJIDs},
+          _Extra) ->
+            set_prefs1(ArcID, ArcJID, DefaultMode, AlwaysJIDs, NeverJIDs).
 
--spec set_prefs(Result :: any(), Host :: jid:server(),
-                ArcID :: mod_mam:archive_id(), ArcJID :: jid:jid(),
-                DefaultMode :: mod_mam:archive_behaviour(),
-                AlwaysJIDs :: [jid:literal_jid()],
-                NeverJIDs :: [jid:literal_jid()]) -> any().
-set_prefs(_Result, _Host, ArcID, ArcJID, DefaultMode, AlwaysJIDs, NeverJIDs) ->
+set_prefs1(ArcID, ArcJID, DefaultMode, AlwaysJIDs, NeverJIDs) ->
     try
-        set_prefs1(ArcID, ArcJID, DefaultMode, AlwaysJIDs, NeverJIDs)
+        {ok, set_prefs2(ArcID, ArcJID, DefaultMode, AlwaysJIDs, NeverJIDs)}
     catch _Type:Error ->
-        {error, Error}
+        {ok, {error, Error}}
     end.
 
-set_prefs1(_ArcID, ArcJID, DefaultMode, AlwaysJIDs, NeverJIDs) ->
+set_prefs2(_ArcID, ArcJID, DefaultMode, AlwaysJIDs, NeverJIDs) ->
     SU = su_key(ArcJID),
     NewARules = lists:usort(rules(ArcJID, AlwaysJIDs)),
     NewNRules = lists:usort(rules(ArcJID, NeverJIDs)),
@@ -189,24 +164,37 @@ set_prefs1(_ArcID, ArcJID, DefaultMode, AlwaysJIDs, NeverJIDs) ->
     ok.
 
 
--spec get_prefs(mod_mam:preference(), _Host :: jid:server(),
-                _ArcId :: mod_mam:archive_id(), ArcJID :: jid:jid()
-                ) -> mod_mam:preference().
-get_prefs({GlobalDefaultMode, _, _}, _Host, _ArcID, ArcJID) ->
+-spec get_prefs(Acc, Params, Extra) -> {ok, Acc} when
+    Acc ::  mod_mam:preference(),
+    Params :: ejabberd_gen_mam_prefs:get_prefs_params(),
+    Extra :: gen_hook:extra().
+get_prefs({GlobalDefaultMode, _, _}, #{owner := ArcJID}, _Extra) ->
+    get_prefs1(GlobalDefaultMode, ArcJID);
+get_prefs({GlobalDefaultMode, _, _}, #{room := ArcJID}, _Extra) ->
+    get_prefs1(GlobalDefaultMode, ArcJID).
+
+get_prefs1(GlobalDefaultMode, ArcJID) ->
     SU = su_key(ArcJID),
     case mnesia:dirty_read(mam_prefs, SU) of
         [] ->
-            {GlobalDefaultMode, [], []};
+            {ok, {GlobalDefaultMode, [], []}};
         [#mam_prefs{default_mode=DefaultMode,
                     always_rules=ARules, never_rules=NRules}] ->
             AlwaysJIDs = jids(ArcJID, ARules),
             NeverJIDs = jids(ArcJID, NRules),
-            {DefaultMode, AlwaysJIDs, NeverJIDs}
+            {ok, {DefaultMode, AlwaysJIDs, NeverJIDs}}
     end.
 
-remove_archive(Acc, _Host, _ArcID, ArcJID) ->
+-spec remove_archive(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: term(),
+    Params :: #{archive_id := mod_mam:archive_id() | undefined, owner => jid:jid(), room => jid:jid()},
+    Extra :: gen_hook:extra().
+remove_archive(Acc, #{owner := ArcJID}, _Extra) ->
     remove_archive(ArcJID),
-    Acc.
+    {ok, Acc};
+remove_archive(Acc, #{room := ArcJID}, _Extra) ->
+    remove_archive(ArcJID),
+    {ok, Acc}.
 
 remove_archive(ArcJID) ->
     SU = su_key(ArcJID),

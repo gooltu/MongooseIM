@@ -1,24 +1,116 @@
-### Module Description
+## Module Description
 
 `Inbox` is an experimental feature implemented as a few separate modules.
+It is described in detail as our [Open XMPP Extension](../open-extensions/inbox.md).
 To use it, enable mod\_inbox in the config file.
 
-### Options
+## Options
 
-* **backend** (atom, default: `rdbms`) - Database backend to use. For now, only `rdbms` is supported.
-* **reset_markers** (list, default: `[displayed]`) - List of atom chat markers that when sent, will reset the unread message counter for a conversation.
+### `modules.mod_inbox.backend`
+* **Syntax:** string, one of `"rdbms"`, `"rdbms_async"`
+* **Default:** `"rdbms"`
+* **Example:** `backend = "rdbms_async"`
+
+Only RDBMS storage is supported, but `rdbms` means flushes to DB are synchronous with each message, while `rdbms_async` is instead asynchronous.
+
+Regular `rdbms` has worse performance characteristics, but it has better consistency properties, as events aren't lost nor reordered. `rdbms_async` processes events asynchronously and potentially unloading a lot of aggregation from the DB. Like the case of the asynchronous workers for MAM, it is the preferred method, with the risk messages being lost on an ungraceful shutdown.
+
+#### `modules.mod_inbox.async_writer.pool_size`
+* **Syntax:** non-negative integer
+* **Default:** `2 * erlang:system_info(schedulers_online)`
+* **Example:** `modules.mod_inbox.async_writer.pool_size = 32`
+
+Number of workers in the pool. More than the number of available schedulers is recommended, to minimise lock contention on the message queues, and more than the number of DB workers, to fully utilise the DB capacity. How much more than these two parameters is then a good fine-tuning for specific deployments.
+
+### `modules.mod_inbox.boxes`
+* **Syntax:** array of strings.
+* **Default:** `[]`
+* **Example:** `["classified", "spam"]`
+
+A list of supported inbox boxes by the server. This can be used by clients to classify their inbox entries in any way that fits the end-user. The strings provided here will be used verbatim in the IQ query as described in [Inbox – Filtering and Ordering](../open-extensions/inbox.md#filtering-and-ordering).
+
+!!! note
+    `inbox`, `archive`, and `bin` are reserved box names and are always enabled, therefore they don't need to –and must not– be specified in this section. `all` has a special meaning in the box query and therefore is also not allowed as a box name.
+
+    If the asynchronous backend is configured, automatic removals become moves to the `bin` box, also called "Trash bin". This is to ensure eventual consistency. Then the bin can be emptied, either on a [user request](../open-extensions/inbox.md#examples-emptying-the-trash-bin), with the `mongooseimctl inbox` command, through the [GraphQL API](../graphql-api/Admin-GraphQL.md), or through the [REST API](../rest-api/Administration-backend.md).
+
+#### `modules.mod_inbox.bin_ttl`
+* **Syntax:** non-negative integer, expressed in days.
+* **Default:** `30`
+* **Example:** `modules.mod_inbox.bin_ttl = 7`
+
+How old entries in the bin can be before the automatic bin cleaner collects them. A value of `7` would mean that entries that have been in the bin for more than 7 days will be cleaned on the next bin collection.
+
+#### `modules.mod_inbox.bin_clean_after`
+* **Syntax:** non-negative integer, expressed in hours
+* **Default:** `1`
+* **Example:** `modules.mod_inbox.bin_clean_after = 24`
+
+How often the automatic garbage collection runs over the bin.
+
+#### `modules.mod_inbox.delete_domain_limit`
+
+* **Syntax:** non-negative integer or the string `"infinity"`
+* **Default:** `"infinity"`
+* **Example:** `modules.mod_inbox.delete_domain_limit = 10000`
+
+Domain deletion can be an expensive operation, as it requires to delete potentially many thousands of records from the DB. By default, the delete operation deletes everything in a transaction, but it might be desired, to handle timeouts and table locks more gracefully, to delete the records in batches. This limit establishes the size of the batch.
+
+!!! Note
+    Not supported by MSSQL.
+
+### `modules.mod_inbox.reset_markers`
+* **Syntax:** array of strings, out of `"displayed"`, `"received"`, `"acknowledged"`
+* **Default:** `["displayed"]`
+* **Example:** `reset_markers = ["received"]`
+
+List of chat markers that when sent, will reset the unread message counter for a conversation.
 This works when [Chat Markers](https://xmpp.org/extensions/xep-0333.html) are enabled on the client side.
-Possible values are from the set: `displayed`, `received`, `acknowledged`. Setting as empty list (not recommended) means that no chat marker can decrease the counter value.
-* **groupchat** (list, default: `[muclight]`) - The list indicating which groupchats will be included in inbox.
+Setting as empty list (not recommended) means that no chat marker can decrease the counter value.
+
+### `modules.mod_inbox.groupchat`
+* **Syntax:** array of strings
+* **Default:** `["muclight"]`
+* **Example:** `groupchat = ["muclight"]`
+
+The list indicating which groupchats will be included in inbox.
 Possible values are `muclight` [Multi-User Chat Light](https://xmpp.org/extensions/inbox/muc-light.html) or `muc` [Multi-User Chat](https://xmpp.org/extensions/xep-0045.html).
-* **aff_changes** (boolean, default: `true`) - use this option when `muclight` is enabled.
+
+### `modules.mod_inbox.aff_changes`
+* **Syntax:** boolean
+* **Default:** `true`
+* **Example:** `aff_changes = true`
+
+Use this option when `muclight` is enabled.
 Indicates if MUC Light affiliation change messages should be included in the conversation inbox.
 Only changes that affect the user directly will be stored in their inbox.
-* **remove_on_kicked** (boolean, default: `true`) - use this option when `muclight` is enabled.
-If true, the inbox conversation is removed for a user when they are removed from the groupchat.
-* **iqdisc** (atom, default: `no_queue`)
 
-### Note about supported RDBMS
+### `modules.mod_inbox.remove_on_kicked`
+* **Syntax:** boolean
+* **Default:** `true`
+* **Example:** `remove_on_kicked = true`
+
+Use this option when `muclight` is enabled.
+If true, the inbox conversation is removed for a user when they are removed from the groupchat.
+Enabling this option will also clear all inbox entries associated with a destroyed room.
+
+### `modules.mod_inbox.iqdisc.type`
+* **Syntax:** string, one of `"one_queue"`, `"no_queue"`, `"queues"`, `"parallel"`
+* **Default:** `"no_queue"`
+
+Strategy to handle incoming stanzas. For details, please refer to
+[IQ processing policies](../configuration/Modules.md#iq-processing-policies).
+
+#### `modules.mod_inbox.max_result_limit`
+* **Syntax:** the string `"infinity"` or a positive integer
+* **Default:** `"infinity"`
+* **Example:** `modules.mod_inbox.max_result_limit = 100`
+
+This option sets the maximum size of returned results when quering inbox.
+It works in the same manner as [setting a limit in iq stanza](../open-extensions/inbox.md#limiting-the-query).
+The special value `infinity` means no limit.
+
+## Note about supported RDBMS
 
 `mod_inbox` executes upsert queries, which have different syntax in every supported RDBMS.
 Inbox currently supports the following DBs:
@@ -27,178 +119,20 @@ Inbox currently supports the following DBs:
 * PgSQL via native driver
 * MSSQL via ODBC driver
 
-### Legacy MUC support
+## Legacy MUC support
 Inbox comes with support for the legacy MUC as well. It stores all groupchat messages sent to
 room in each sender's and recipient's inboxes and private messages. Currently it is not possible to
-configure it to store system messages like [subject](https://xmpp.org/extensions/xep-0045.html#enter-subject) 
+configure it to store system messages like [subject](https://xmpp.org/extensions/xep-0045.html#enter-subject)
 or [affiliation](https://xmpp.org/extensions/xep-0045.html#affil) change.
 
-### Filtering and ordering
 
-Inbox query results may be filtered by time range and sorted by timestamp.
-By default, `mod_inbox` returns all conversations, listing the ones updated most recently first.
+## Example configuration
 
-A client may specify three parameters:
-
-* Start date for the result set (variable `start`, value: ISO timestamp)
-* End date for the result set (variable `end`, value: ISO timestamp)
-* Order by timestamp (variable `order`, values: `asc`, `desc`)
-* Show only conversations with unread messages (variable `hidden_read`,
-  values: `true`, `false`)
-
-They are encoded inside a standard XMPP [Data Forms](https://xmpp.org/extensions/xep-0004.html) format.
-Dates must be formatted according to [XMPP Date and Time Profiles](https://xmpp.org/extensions/xep-0082.html).
-It is not mandatory to add an empty data form if a client prefers to use default values (`<query/>` element may be empty).
-However, the IQ type must be "set", even when data form is missing.
-
-Your client application may request the currently supported form with IQ get:
-
+```toml
+[modules.mod_inbox]
+  backend = "rdbms_async"
+  reset_markers = ["displayed"]
+  aff_changes = true
+  remove_on_kicked = true
+  groupchat = ["muclight"]
 ```
-Client:
-
-<iq type='get' id='c94a88ddf4957128eafd08e233f4b964'>
-  <query xmlns='erlang-solutions.com:xmpp:inbox:0'/>
-</iq>
-
-Server:
-
-<iq from='alicE@localhost' to='alicE@localhost/res1' id='c94a88ddf4957128eafd08e233f4b964' type='result'>
-  <query xmlns='erlang-solutions.com:xmpp:inbox:0'>
-    <x xmlns='jabber:x:data' type='form'>
-      <field type='hidden' var='FORM_TYPE'><value>erlang-solutions.com:xmpp:inbox:0</value></field>
-      <field var='start' type='text-single'/>
-      <field var='end' type='text-single'/>
-      <field var='order' type='list-single'>
-        <value>desc</value>
-        <option label='Ascending by timestamp'><value>asc</value></option>
-        <option label='Descending by timestamp'><value>desc</value></option>
-      </field>
-      <field var='hidden_read' type='text-single' value='false'/>
-    </x>
-  </query>
-</iq>
-```
-
-### Reseting inbox
-
-You can reset the inbox with the following stanza:
-
-```xml
-<iq type='set'>
-    <reset xmlns='erlang-solutions.com:xmpp:inbox:0#conversation' jid='interlocutor_bare_jid'/>
-</iq>
-```
-
-Here `jid` is the bare jid of the user whose inbox we want to reset. This action
-does not change the last message stored in inbox; meaning that neither this
-stanza nor anything given within will be stored; the only change is the inbox
-`unread_count` is set to zero.
-
-Resetting the inbox count will also skip the forwarding of messages. While a
-typical chat marker will be forwarded to the interlocutor(s), (including the
-case of a big groupchat with thousands of participants!), this reset stanza will
-not.
-
-### Example Request
-
-```
-Alice sends:
-
-<message type="chat" to="bOb@localhost/res1" id=”123”>
-  <body>Hello</body>
-</message>
-
-Bob receives:
-
-<message from="alicE@localhost/res1" to="bOb@localhost/res1" id=“123” xml:lang="en" type="chat">
-  <body>Hello</body>
-</message>
-
-Alice sends:
-
-<iq type="set" id="10bca">
-  <inbox xmlns=”erlang-solutions.com:xmpp:inbox:0” queryid="b6">
-    <x xmlns='jabber:x:data' type='form'>
-      <field type='hidden' var='FORM_TYPE'><value>erlang-solutions.com:xmpp:inbox:0</value></field>
-      <field type='text-single' var='start'><value>2018-07-10T12:00:00Z</value></field>
-      <field type='text-single' var='end'><value>2018-07-11T12:00:00Z</value></field>
-      <field type='list-single' var='order'><value>asc</value></field>
-      <field type='text-single' var='hidden_read'><value>true</value></field>
-    </x>
-  </inbox>
-</iq>
-
-
-Alice receives:
-
-<message from="alicE@localhost" to="alicE@localhost" id="9b759">
-  <result xmlns="erlang-solutions.com:xmpp:inbox:0" unread="0" queryid="b6">
-    <forwarded xmlns="urn:xmpp:forward:0">
-      <delay xmlns="urn:xmpp:delay" stamp="2018-07-10T23:08:25.123456Z"/>
-      <message xml:lang="en" type="chat" to="bOb@localhost/res1" from="alicE@localhost/res1" id=”123”>
-        <body>Hello</body>
-      </message>
-    </forwarded>
-  </result>
-</message>
-
-<iq from="alicE@localhost" to="alicE@localhost/res1" id="b6" type="result">
-  <fin xmlns='erlang-solutions.com:xmpp:inbox:0'>
-    <count>1</count>
-    <unread-messages>0</unread-messages>
-    <active-conversations>0</active-conversations>
-  </fin>
-</iq>
-
-```
-
-
-Inbox query result IQ stanza returns the following values:
-
-* `count`: the total number of conversations (if `hidden_read` value was set
-  to true, this value will be equal to `active_conversations`)
-* `unread-messages`: total number of unread messages from all
-  conversations
-* `active-conversations`: the number of conversations with unread
-  message(s)
-
-### Example error response
-
-```
-Alice sends request with invalid value of start field:
-
-<iq type='set' id='a78478f20103ff8354d7834d0ba2fdb2'>
-  <inbox xmlns='erlang-solutions.com:xmpp:inbox:0'>
-    <x xmlns='jabber:x:data' type='submit'>
-      <field type='text-single' var='start'>
-        <value>invalid</value>
-      </field>
-    </x>
-  </inbox>
-</iq>
-
-Alice receives an error with description of the first encountered invalid
-value: 
-
-<iq from='alicE@localhost' to='alicE@localhost/res1'
-    id='a78478f20103ff8354d7834d0ba2fdb2' type='error'>
-  <error code='400' type='modify'>
-    <bad-rquest xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/>
-    <text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'>
-      Invalid inbox form field value, field=start, value=invalid
-    </text>
-  </error>
-</iq>
-```
-
-### Example Configuration
-
-```
-{mod_inbox, [{backend, rdbms},
-             {reset_markers, [displayed]},
-             {aff_changes, true},
-             {remove_on_kicked, true},
-             {groupchat, [muclight]}
-            ]},
-```
-

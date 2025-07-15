@@ -27,17 +27,19 @@
 -author('alexey@process-one.net').
 
 -export([listmech/1,
-         server_new/5,
+         server_new/6,
          server_start/4,
-         server_step/2]).
+         server_step/2,
+         default_modules/0]).
 
--include("mongoose.hrl").
+-ignore_xref([behaviour_info/1]).
 
 -type sasl_module() :: module().
 -type mechanism() :: binary().
 
 -record(sasl_state, {service    :: binary(),
                      myname     :: jid:server(),
+                     host_type  :: binary(),
                      realm      :: binary(),
                      mech_mod   :: sasl_module(),
                      mech_state :: any(),
@@ -49,8 +51,11 @@
 -type error() :: {error, binary() | {binary(), binary()}}
                | {error, binary() | {binary(), binary()}, jid:user()}.
 
--export_type([mechanism/0,
-              error/0]).
+-type sasl_result() :: {ok, mongoose_credentials:t()}
+                     | {continue, binary(), sasl_state()}
+                     | error().
+
+-export_type([sasl_module/0, mechanism/0, error/0, sasl_result/0, sasl_state/0]).
 
 -callback mechanism() -> mechanism().
 
@@ -76,18 +81,20 @@ check_credentials(_State, Creds) ->
             {ok, Creds}
     end.
 
--spec listmech(jid:server()) -> [mechanism()].
-listmech(Host) ->
-    [M:mechanism() || M <- get_modules(Host), is_module_supported(Host, M)].
+-spec listmech(binary()) -> [mechanism()].
+listmech(HostType) ->
+    [M:mechanism() || M <- get_modules(HostType), is_module_supported(HostType, M)].
 
 -spec server_new(Service :: binary(),
                  ServerFQDN :: jid:server(),
+                 HostType :: binary(),
                  UserRealm :: binary(),
                  _SecFlags :: [any()],
                  Creds :: mongoose_credentials:t()) -> sasl_state().
-server_new(Service, ServerFQDN, UserRealm, _SecFlags, Creds) ->
+server_new(Service, ServerFQDN, HostType, UserRealm, _SecFlags, Creds) ->
     #sasl_state{service = Service,
                 myname = ServerFQDN,
+                host_type = HostType,
                 realm = UserRealm,
                 creds = Creds}.
 
@@ -96,12 +103,11 @@ server_new(Service, ServerFQDN, UserRealm, _SecFlags, Creds) ->
       Mech       :: mechanism(),
       ClientIn   :: binary(),
       SocketData :: map(),
-      Result     :: {ok, mongoose_credentials:t()}
-                  | {'continue', _, sasl_state()}
-                  | error().
-server_start(State, Mech, ClientIn, SocketData) ->
-    Host = State#sasl_state.myname,
-    case [M || M <- get_modules(Host), M:mechanism() =:= Mech, is_module_supported(Host, M)] of
+      Result     :: sasl_result().
+server_start(#sasl_state{myname = Host, host_type = HostType} = State,
+             Mech, ClientIn, SocketData) ->
+    case [M || M <- get_modules(HostType), M:mechanism() =:= Mech,
+                                           is_module_supported(HostType, M)] of
         [Module] ->
             {ok, MechState} = Module:mech_new(Host, State#sasl_state.creds, SocketData),
             server_step(State#sasl_state{mech_mod = Module,
@@ -111,15 +117,15 @@ server_start(State, Mech, ClientIn, SocketData) ->
             {error, <<"no-mechanism">>}
     end.
 
-is_module_supported(Host, cyrsasl_oauth) ->
-    gen_mod:is_loaded(Host, mod_auth_token);
-is_module_supported(Host, Module) ->
-    mongoose_fips:supports_sasl_module(Module) andalso ejabberd_auth:supports_sasl_module(Host, Module).
+is_module_supported(HostType, cyrsasl_oauth) ->
+    gen_mod:is_loaded(HostType, mod_auth_token);
+is_module_supported(HostType, Module) ->
+    mod_fast_auth_token_generic_mech:supports_sasl_module(HostType, Module)
+        orelse (mongoose_fips:supports_sasl_module(Module) andalso
+                ejabberd_auth:supports_sasl_module(HostType, Module)).
 
 -spec server_step(State :: sasl_state(), ClientIn :: binary()) -> Result when
-      Result :: {ok, mongoose_credentials:t()}
-              | {'continue', _, sasl_state()}
-              | error().
+      Result     :: sasl_result().
 server_step(State, ClientIn) ->
     Module = State#sasl_state.mech_mod,
     MechState = State#sasl_state.mech_state,
@@ -135,12 +141,9 @@ server_step(State, ClientIn) ->
             {error, Error}
     end.
 
--spec get_modules(jid:server()) -> [sasl_module()].
-get_modules(Host) ->
-    case ejabberd_config:get_local_option({sasl_mechanisms, Host}) of
-        undefined -> ejabberd_config:get_local_option_or_default(sasl_mechanisms, default_modules());
-        Modules -> Modules
-    end.
+-spec get_modules(binary()) -> [sasl_module()].
+get_modules(HostType) ->
+    mongoose_config:get_opt([{auth, HostType}, sasl_mechanisms], default_modules()).
 
 default_modules() ->
     [cyrsasl_scram_sha512_plus,
@@ -155,4 +158,5 @@ default_modules() ->
      cyrsasl_scram_sha1,
      cyrsasl_plain,
      cyrsasl_anonymous,
-     cyrsasl_oauth].
+     cyrsasl_oauth]
+     ++ mod_fast_auth_token_generic_mech:sasl_modules().

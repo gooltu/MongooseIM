@@ -48,7 +48,8 @@ create_user({_User, Spec}) ->
 
 delete_user({_Name, Spec}) ->
     {User, Server, _Password} = get_usp(Spec),
-    rpc(mim(), ejabberd_auth_ldap, remove_user, [User, Server]).
+    HostType = domain_helper:host_type(),
+    rpc(mim(), ejabberd_auth_ldap, remove_user, [HostType, User, Server]).
 
 get_usp(Spec) ->
     Username = proplists:get_value(username, Spec),
@@ -57,7 +58,7 @@ get_usp(Spec) ->
     {Username, Server, Password}.
 
 get_ldap_base(Server) ->
-    list_to_binary(rpc(mim(), gen_mod, get_module_opt, [Server, mod_vcard, ldap_base, ""])).
+    rpc(mim(), gen_mod, get_module_opt, [Server, mod_vcard, [ldap, base]]).
 
 call_ldap(Server, F, Args) ->
     rpc(mim(), mongoose_wpool, call, [ldap, Server, default, {F, Args}]).

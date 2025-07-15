@@ -1,28 +1,60 @@
-### Module Description
+## Module Description
 
 Implements [XEP-0012: Last Activity](https://xmpp.org/extensions/xep-0012.html).
 
 Use with caution, as it was observed that a user disconnect spike might result in overloading the database with "last activity" writes.
 
-### Options
+## Options
 
-* **iqdisc** (default: `one_queue`)
-* **backend** (atom, default: `mnesia`): Storage backend. Currently `mnesia`, `rdbms` and `riak` are supported.
+### `modules.mod_last.iqdisc.type`
+* **Syntax:** string, one of `"one_queue"`, `"no_queue"`, `"queues"`, `"parallel"`
+* **Default:** `"one_queue"`
 
-##### Riak-specific options
+Strategy to handle incoming stanzas. For details, please refer to
+[IQ processing policies](../configuration/Modules.md#iq-processing-policies).
 
-* `bucket_type` (default `<<"last">>`) - Riak bucket type.
+### `modules.mod_last.backend`
+* **Syntax:** string, one of `"mnesia"`, `"rdbms"`
+* **Default:** `"mnesia"`
+* **Example:** `backend = "rdbms"`
 
-### Example Configuration
+Storage backend.
 
-` {mod_last, []} `
+## Example Configuration
 
-### Metrics
+```toml
+[modules.mod_last]
+  backend = "rdbms"
+```
 
-If you'd like to learn more about metrics in MongooseIM, please visit [MongooseIM metrics](../operation-and-maintenance/Mongoose-metrics.md) page.
+## Metrics
 
-| Backend action | Description (when it gets incremented) |
-| ---- | -------------------------------------- |
-| `get_last` | A timestamp is fetched from DB. |
-| `set_last_info` | A timestamp is stored in DB. |
+This module provides [backend metrics](../operation-and-maintenance/MongooseIM-metrics.md#backend-metrics).
+If you'd like to learn more about metrics in MongooseIM, please visit [MongooseIM metrics](../operation-and-maintenance/MongooseIM-metrics.md) page.
 
+Prometheus metrics have a `host_type` and `function` label associated with these metrics.
+Since Exometer doesn't support labels, the function as well as the host types, or word `global`, are part of the metric names, depending on the [`instrumentation.exometer.all_metrics_are_global`](../configuration/instrumentation.md#instrumentationexometerall_metrics_are_global) option.
+
+Backend in the action name can be either `rdbms` or `mnesia`.
+
+=== "Prometheus"
+
+    | Backend action | Type | Function | Description (when it gets incremented) |
+    | -------------- | ---- | -------- | -------------------------------------- |
+    | `mod_last_Backend_count` | counter | `get_last` | A timestamp is fetched from the database. |
+    | `mod_last_Backend_time` | histogram | `get_last` | Time spent fetching a timestamp from the database. |
+    | `mod_last_Backend_count` | counter | `set_last_info` |  A timestamp is stored in the database. |
+    | `mod_last_Backend_time` | histogram | `set_last_info` | Time spent storing a timestamp in the database. |
+    | `mod_last_Backend_count` | counter | `session_cleanup` | A session is cleaned up from the database. |
+    | `mod_last_Backend_time` | histogram | `session_cleanup` | Time spent cleaning up a session from the database. |
+
+=== "Exometer"
+
+    | Backend action | Type | Description (when it gets incremented) |
+    | -------------- | ---- | -------------------------------------- |
+    | `[HostType, mod_last_Backend, get_last, count]` | spiral | A timestamp is fetched from the database. |
+    | `[HostType, mod_last_Backend, get_last, time]` | histogram | Time spent fetching a timestamp from the database. |
+    | `[HostType, mod_last_Backend, set_last_info, count]` | spiral |  A timestamp is stored in the database. |
+    | `[HostType, mod_last_Backend, set_last_info, time]` | histogram | Time spent storing a timestamp in the database. |
+    | `[HostType, mod_last_Backend, session_cleanup, count]` | spiral | A session is cleaned up from the database. |
+    | `[HostType, mod_last_Backend, session_cleanup, time]` | histogram | Time spent cleaning up a session from the database. |

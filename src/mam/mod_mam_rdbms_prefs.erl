@@ -10,20 +10,17 @@
 %% Exports
 
 %% gen_mod handlers
--export([start/2, stop/1]).
+-behaviour(gen_mod).
+-export([start/2, stop/1, hooks/1, supported_features/0]).
 
 %% MAM hook handlers
 -behaviour(ejabberd_gen_mam_prefs).
--export([get_behaviour/5,
-         get_prefs/4,
-         set_prefs/7,
-         remove_archive/4]).
+-export([get_behaviour/3,
+         get_prefs/3,
+         set_prefs/3,
+         remove_archive/3]).
 
--import(mongoose_rdbms,
-        [escape_string/1,
-         escape_integer/1,
-         use_escaped_string/1,
-         use_escaped_integer/1]).
+-import(mongoose_rdbms, [prepare/4]).
 
 -include("mongoose.hrl").
 -include("jlib.hrl").
@@ -33,103 +30,93 @@
 %% ----------------------------------------------------------------------
 %% gen_mod callbacks
 %% Starting and stopping functions for users' archives
+-spec start(mongooseim:host_type(), _) -> ok.
+start(HostType, _Opts) ->
+    prepare_queries(HostType),
+    ok.
 
--spec start(jid:server(), _) -> 'ok'.
-start(Host, Opts) ->
-    case gen_mod:get_module_opt(Host, ?MODULE, pm, false) of
-        true ->
-            start_pm(Host, Opts);
-        false ->
-            ok
-    end,
-    case gen_mod:get_module_opt(Host, ?MODULE, muc, false) of
-        true ->
-            start_muc(Host, Opts);
-        false ->
-            ok
+-spec stop(mongooseim:host_type()) -> ok.
+stop(_HostType) ->
+    ok.
+
+-spec supported_features() -> [atom()].
+supported_features() ->
+    [dynamic_domains].
+
+hooks(HostType) ->
+    PM = gen_mod:get_module_opt(HostType, ?MODULE, pm, false),
+    MUC = gen_mod:get_module_opt(HostType, ?MODULE, muc, false),
+    maybe_pm_hooks(PM, HostType) ++ maybe_muc_hooks(MUC, HostType).
+
+maybe_pm_hooks(true, HostType) -> pm_hooks(HostType);
+maybe_pm_hooks(false, _HostType) -> [].
+
+maybe_muc_hooks(true, HostType) -> muc_hooks(HostType);
+maybe_muc_hooks(false, _HostType) -> [].
+
+pm_hooks(HostType) ->
+    [{mam_get_behaviour, HostType, fun ?MODULE:get_behaviour/3, #{}, 50},
+     {mam_get_prefs, HostType, fun ?MODULE:get_prefs/3, #{}, 50},
+     {mam_set_prefs, HostType, fun ?MODULE:set_prefs/3, #{}, 50},
+     {mam_remove_archive, HostType, fun ?MODULE:remove_archive/3, #{}, 50}].
+
+muc_hooks(HostType) ->
+    [{mam_muc_get_behaviour, HostType, fun ?MODULE:get_behaviour/3, #{}, 50},
+     {mam_muc_get_prefs, HostType, fun ?MODULE:get_prefs/3, #{}, 50},
+     {mam_muc_set_prefs, HostType, fun ?MODULE:set_prefs/3, #{}, 50},
+     {mam_muc_remove_archive, HostType, fun ?MODULE:remove_archive/3, #{}, 50}].
+
+%% Prepared queries
+prepare_queries(HostType) ->
+    prepare(mam_prefs_insert, mam_config, [user_id, remote_jid, behaviour],
+            <<"INSERT INTO mam_config(user_id, remote_jid, behaviour) "
+              "VALUES (?, ?, ?)">>),
+    prepare(mam_prefs_select, mam_config, [user_id],
+            <<"SELECT remote_jid, behaviour "
+              "FROM mam_config WHERE user_id=?">>),
+    prepare(mam_prefs_select_behaviour, mam_config,
+            [user_id, remote_jid],
+            <<"SELECT remote_jid, behaviour "
+              "FROM mam_config "
+              "WHERE user_id=? "
+                "AND (remote_jid='' OR remote_jid=?)">>),
+    prepare(mam_prefs_select_behaviour2, mam_config,
+            [user_id, remote_jid, remote_jid],
+            <<"SELECT remote_jid, behaviour "
+              "FROM mam_config "
+              "WHERE user_id=? "
+                "AND (remote_jid='' OR remote_jid=? OR remote_jid=?)">>),
+    OrdBy = order_by_remote_jid_in_delete(HostType),
+    prepare(mam_prefs_delete, mam_config, [user_id],
+            <<"DELETE FROM mam_config WHERE user_id=?", OrdBy/binary>>),
+    ok.
+
+order_by_remote_jid_in_delete(HostType) ->
+    case mongoose_rdbms:db_engine(HostType) of
+        mysql -> <<" ORDER BY remote_jid">>;
+        _ -> <<>>
     end.
-
-
--spec stop(jid:server()) -> 'ok'.
-stop(Host) ->
-    case gen_mod:get_module_opt(Host, ?MODULE, pm, false) of
-        true ->
-            stop_pm(Host);
-        false ->
-            ok
-    end,
-    case gen_mod:get_module_opt(Host, ?MODULE, muc, false) of
-        true ->
-            stop_muc(Host);
-        false ->
-            ok
-    end.
-
-
-%% ----------------------------------------------------------------------
-%% Add hooks for mod_mam
-
--spec start_pm(jid:server(), _) -> 'ok'.
-start_pm(Host, _Opts) ->
-    ejabberd_hooks:add(mam_get_behaviour, Host, ?MODULE, get_behaviour, 50),
-    ejabberd_hooks:add(mam_get_prefs, Host, ?MODULE, get_prefs, 50),
-    ejabberd_hooks:add(mam_set_prefs, Host, ?MODULE, set_prefs, 50),
-    ejabberd_hooks:add(mam_remove_archive, Host, ?MODULE, remove_archive, 50),
-    ok.
-
-
--spec stop_pm(jid:server()) -> 'ok'.
-stop_pm(Host) ->
-    ejabberd_hooks:delete(mam_get_behaviour, Host, ?MODULE, get_behaviour, 50),
-    ejabberd_hooks:delete(mam_get_prefs, Host, ?MODULE, get_prefs, 50),
-    ejabberd_hooks:delete(mam_set_prefs, Host, ?MODULE, set_prefs, 50),
-    ejabberd_hooks:delete(mam_remove_archive, Host, ?MODULE, remove_archive, 50),
-    ok.
-
-
-%% ----------------------------------------------------------------------
-%% Add hooks for mod_mam_muc_muc
-
--spec start_muc(jid:server(), _) -> 'ok'.
-start_muc(Host, _Opts) ->
-    ejabberd_hooks:add(mam_muc_get_behaviour, Host, ?MODULE, get_behaviour, 50),
-    ejabberd_hooks:add(mam_muc_get_prefs, Host, ?MODULE, get_prefs, 50),
-    ejabberd_hooks:add(mam_muc_set_prefs, Host, ?MODULE, set_prefs, 50),
-    ejabberd_hooks:add(mam_muc_remove_archive, Host, ?MODULE, remove_archive, 50),
-    ok.
-
-
--spec stop_muc(jid:server()) -> 'ok'.
-stop_muc(Host) ->
-    ejabberd_hooks:delete(mam_muc_get_behaviour, Host, ?MODULE, get_behaviour, 50),
-    ejabberd_hooks:delete(mam_muc_get_prefs, Host, ?MODULE, get_prefs, 50),
-    ejabberd_hooks:delete(mam_muc_set_prefs, Host, ?MODULE, set_prefs, 50),
-    ejabberd_hooks:delete(mam_muc_remove_archive, Host, ?MODULE, remove_archive, 50),
-    ok.
-
 
 %% ----------------------------------------------------------------------
 %% Internal functions and callbacks
 
--spec get_behaviour(Default :: mod_mam:archive_behaviour(),
-        Host :: jid:server(), ArchiveID :: mod_mam:archive_id(),
-        LocJID :: jid:jid(), RemJID :: jid:jid()) -> any().
-get_behaviour(DefaultBehaviour, Host, UserID, _LocJID, RemJID)
+-spec get_behaviour(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: mod_mam:archive_behaviour(),
+    Params :: ejabberd_gen_mam_prefs:get_behaviour_params(),
+    Extra :: gen_hook:extra().
+get_behaviour(DefaultBehaviour,
+              #{archive_id := UserID, remote := RemJID},
+              #{host_type := HostType})
         when is_integer(UserID) ->
     RemLJID      = jid:to_lower(RemJID),
-    BRemLBareJID = jid:to_binary(jid:to_bare(RemLJID)),
+    BRemLBareJID = jid:to_bare_binary(RemLJID),
     BRemLJID     = jid:to_binary(RemLJID),
-    SRemLBareJID = escape_string(BRemLBareJID),
-    SRemLJID     = escape_string(BRemLJID),
-    SUserID      = escape_integer(UserID),
-    %% CheckBare if resource is not empty
-    CheckBare    = RemJID#jid.lresource =/= <<>>,
-    case query_behaviour(Host, SUserID, SRemLJID, SRemLBareJID, CheckBare) of
+    case query_behaviour(HostType, UserID, BRemLJID, BRemLBareJID) of
         {selected, []} ->
-            DefaultBehaviour;
+            {ok, DefaultBehaviour};
         {selected, RemoteJid2Behaviour} ->
             DbBehaviour = choose_behaviour(BRemLJID, BRemLBareJID, RemoteJid2Behaviour),
-            decode_behaviour(DbBehaviour)
+            {ok, decode_behaviour(DbBehaviour)}
     end.
 
 -spec choose_behaviour(binary(), binary(), [{binary(), binary()}]) -> binary().
@@ -148,168 +135,83 @@ choose_behaviour(BRemLJID, BRemLBareJID, RemoteJid2Behaviour) ->
             end
     end.
 
--spec set_prefs(Result :: any(), Host :: jid:server(),
-        ArchiveID :: mod_mam:archive_id(), ArchiveJID :: jid:jid(),
-        DefaultMode :: mod_mam:archive_behaviour(),
-        AlwaysJIDs :: [jid:literal_jid()],
-        NeverJIDs :: [jid:literal_jid()]) -> any().
-set_prefs(_Result, Host, UserID, _ArcJID, DefaultMode, AlwaysJIDs, NeverJIDs) ->
+-spec set_prefs(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: term(),
+    Params :: ejabberd_gen_mam_prefs:set_prefs_params(),
+    Extra :: gen_hook:extra().
+set_prefs(_Result,
+          #{archive_id := UserID, default_mode := DefaultMode,
+            always_jids := AlwaysJIDs, never_jids := NeverJIDs},
+          #{host_type := HostType}) ->
     try
-        set_prefs1(Host, UserID, DefaultMode, AlwaysJIDs, NeverJIDs)
+        {ok, set_prefs1(HostType, UserID, DefaultMode, AlwaysJIDs, NeverJIDs)}
     catch _Type:Error ->
-        {error, Error}
+        {ok, {error, Error}}
     end.
 
-
-order_by_in_delete(Host) ->
-    case mongoose_rdbms:db_engine(Host) of
-        mysql ->
-                " ORDER BY remote_jid";
-        _ ->
-                ""
-    end.
-
-set_prefs1(Host, UserID, DefaultMode, AlwaysJIDs, NeverJIDs) ->
-    %% Lock keys in the same order to avoid deadlock
-    SUserID = escape_integer(UserID),
-    EscapedA = escape_string("A"),
-    EscapedN = escape_string("N"),
-    JidBehaviourA = [{JID, EscapedA} || JID <- AlwaysJIDs],
-    JidBehaviourN = [{JID, EscapedN} || JID <- NeverJIDs],
-    JidBehaviour = lists:keysort(1, JidBehaviourA ++ JidBehaviourN),
-    ValuesAN = [encode_config_row(SUserID, SBehaviour, escape_string(JID))
-                || {JID, SBehaviour} <- JidBehaviour],
-    SDefaultMode = escape_string(encode_behaviour(DefaultMode)),
-    DefaultValue = encode_first_config_row(SUserID, SDefaultMode, escape_string("")),
-    Values = [DefaultValue|ValuesAN],
-    DelQuery = ["DELETE FROM mam_config WHERE user_id = ",
-                mongoose_rdbms:use_escaped_integer(SUserID),
-                order_by_in_delete(Host)],
-    InsQuery = ["INSERT INTO mam_config(user_id, behaviour, remote_jid) "
-                "VALUES ", Values],
-
-    run_transaction_or_retry_on_abort(fun() ->
-            case sql_transaction_map(Host, [DelQuery, InsQuery]) of
-                {atomic, [{updated, _}, {updated, _}]} ->
-                    {atomic, ok};
-                Other ->
-                    Other
-            end
-        end, UserID, 5),
+set_prefs1(HostType, UserID, DefaultMode, AlwaysJIDs, NeverJIDs) ->
+    Rows = prefs_to_rows(UserID, DefaultMode, AlwaysJIDs, NeverJIDs),
+    %% MySQL sometimes aborts transaction with reason:
+    %% "Deadlock found when trying to get lock; try restarting transaction"
+    mongoose_rdbms:transaction_with_delayed_retry(HostType, fun() ->
+            {updated, _} =
+                mongoose_rdbms:execute(HostType, mam_prefs_delete, [UserID]),
+            [{updated, 1} = mongoose_rdbms:execute(HostType, mam_prefs_insert, Row) || Row <- Rows],
+            ok
+        end, #{user_id => UserID, retries => 5, delay => 100}),
     ok.
 
-%% Possible error with mysql
-%% Reason "Deadlock found when trying to get lock; try restarting transaction"
-%% triggered mod_mam_utils:error_on_sql_error
-run_transaction_or_retry_on_abort(F, UserID, Retries) ->
-    Result = F(),
-    case Result of
-        {atomic, _} ->
-            Result;
-        {aborted, Reason} when Retries > 0 ->
-            ?WARNING_MSG("event=\"Transaction aborted. Restart\", "
-                          "user_id=~p, reason=~p, retries=~p",
-                         [UserID, Reason, Retries]),
-            timer:sleep(100),
-            run_transaction_or_retry_on_abort(F, UserID, Retries-1);
-        _ ->
-            ?ERROR_MSG("event=\"Transaction failed\", "
-                        "user_id=~p, reason=~p, retries=~p",
-                         [UserID, Result, Retries]),
-            erlang:error({transaction_failed, #{user_id => UserID, result => Result}})
-    end.
+-spec get_prefs(Acc, Params, Extra) -> {ok, Acc} when
+    Acc ::  mod_mam:preference(),
+    Params :: ejabberd_gen_mam_prefs:get_prefs_params(),
+    Extra :: gen_hook:extra().
+get_prefs({GlobalDefaultMode, _, _}, #{archive_id := UserID}, #{host_type := HostType}) ->
+    {selected, Rows} = mongoose_rdbms:execute(HostType, mam_prefs_select, [UserID]),
+    {ok, decode_prefs_rows(Rows, GlobalDefaultMode, [], [])}.
 
--spec get_prefs(mod_mam:preference(), _Host :: jid:server(),
-        ArchiveID :: mod_mam:archive_id(), ArchiveJID :: jid:jid())
-            -> mod_mam:preference().
-get_prefs({GlobalDefaultMode, _, _}, Host, UserID, _ArcJID) ->
-    SUserID = escape_integer(UserID),
-    {selected, Rows} =
-    mod_mam_utils:success_sql_query(
-      Host,
-      ["SELECT remote_jid, behaviour "
-       "FROM mam_config "
-       "WHERE user_id=", use_escaped_integer(SUserID)]),
-    decode_prefs_rows(Rows, GlobalDefaultMode, [], []).
+-spec remove_archive(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: term(),
+    Params :: #{archive_id := mod_mam:archive_id() | undefined, owner => jid:jid(), room => jid:jid()},
+    Extra :: gen_hook:extra().
+remove_archive(Acc, #{archive_id := UserID}, #{host_type := HostType}) ->
+    remove_archive(HostType, UserID),
+    {ok, Acc}.
 
-
--spec remove_archive(mongoose_acc:t(), jid:server(), mod_mam:archive_id(), jid:jid()) ->
-    mongoose_acc:t().
-remove_archive(Acc, Host, UserID, _ArcJID) ->
-    remove_archive(Host, UserID),
-    Acc.
-
-remove_archive(Host, UserID) ->
-    SUserID = escape_integer(UserID),
+remove_archive(HostType, UserID) ->
     {updated, _} =
-    mod_mam_utils:success_sql_query(
-      Host, ["DELETE FROM mam_config WHERE user_id=", use_escaped_integer(SUserID)]).
+        mongoose_rdbms:execute(HostType, mam_prefs_delete, [UserID]).
 
--spec query_behaviour(jid:server(),
-                      SUserID :: mongoose_rdbms:escaped_integer(),
-                      SRemLJID :: mongoose_rdbms:escaped_string(),
-                      SRemLBareJID :: mongoose_rdbms:escaped_string(),
-                      CheckBare :: boolean()
+-spec query_behaviour(HostType :: mongooseim:host_type(),
+                      UserID :: non_neg_integer(),
+                      BRemLJID :: binary(),
+                      BRemLBareJID :: binary()
         ) -> any().
-query_behaviour(Host, SUserID, SRemLJID, SRemLBareJID, CheckBare) ->
-    Result =
-    mod_mam_utils:success_sql_query(
-      Host,
-      ["SELECT remote_jid, behaviour "
-       "FROM mam_config "
-       "WHERE user_id=", use_escaped_integer(SUserID), " "
-         "AND (remote_jid='' OR remote_jid=", use_escaped_string(SRemLJID),
-               case CheckBare of
-                    false ->
-                        "";
-                    true ->
-                       [" OR remote_jid=", use_escaped_string(SRemLBareJID)]
-               end,
-         ")"]),
-    ?DEBUG("query_behaviour query returns ~p", [Result]),
-    Result.
+query_behaviour(HostType, UserID, BRemLJID, BRemLJID) ->
+    mongoose_rdbms:execute(HostType, mam_prefs_select_behaviour,
+                           [UserID, BRemLJID]); %% check just bare jid
+query_behaviour(HostType, UserID, BRemLJID, BRemLBareJID) ->
+    mongoose_rdbms:execute(HostType, mam_prefs_select_behaviour2,
+                           [UserID, BRemLJID, BRemLBareJID]).
 
 %% ----------------------------------------------------------------------
 %% Helpers
 
--spec encode_behaviour(always | never | roster) -> string().
-encode_behaviour(roster) -> "R";
-encode_behaviour(always) -> "A";
-encode_behaviour(never)  -> "N".
-
+-spec encode_behaviour(always | never | roster) -> binary().
+encode_behaviour(roster) -> <<"R">>;
+encode_behaviour(always) -> <<"A">>;
+encode_behaviour(never)  -> <<"N">>.
 
 -spec decode_behaviour(binary()) -> always | never | roster.
 decode_behaviour(<<"R">>) -> roster;
 decode_behaviour(<<"A">>) -> always;
 decode_behaviour(<<"N">>) -> never.
 
--spec encode_first_config_row(SUserID :: mongoose_rdbms:escaped_integer(),
-                              SBehaviour :: mongoose_rdbms:escaped_string(),
-                              SJID :: mongoose_rdbms:escaped_string()) ->
-    mongoose_rdbms:sql_query_part().
-encode_first_config_row(SUserID, SBehaviour, SJID) ->
-    ["(", use_escaped_integer(SUserID),
-     ", ", use_escaped_string(SBehaviour),
-     ", ", use_escaped_string(SJID), ")"].
-
-
--spec encode_config_row(SUserID :: mongoose_rdbms:escaped_integer(),
-                        SBehaviour :: mongoose_rdbms:escaped_string(),
-                        SJID :: mongoose_rdbms:escaped_string()) ->
-    mongoose_rdbms:sql_query_part().
-encode_config_row(SUserID, SBehaviour, SJID) ->
-    [", (", use_escaped_integer(SUserID),
-     ", ", use_escaped_string(SBehaviour),
-     ", ", use_escaped_string(SJID), ")"].
-
-
--spec sql_transaction_map(jid:server(), [mongoose_rdbms:sql_query()]) -> any().
-sql_transaction_map(LServer, Queries) ->
-    AtomicF = fun() ->
-        [mod_mam_utils:success_sql_query(LServer, Query) || Query <- Queries]
-    end,
-    mongoose_rdbms:sql_transaction(LServer, AtomicF).
-
+prefs_to_rows(UserID, DefaultMode, AlwaysJIDs, NeverJIDs) ->
+    AlwaysRows = [[UserID, JID, encode_behaviour(always)] || JID <- AlwaysJIDs],
+    NeverRows  = [[UserID, JID, encode_behaviour(never)] || JID <- NeverJIDs],
+    DefaultRow = [UserID, <<>>, encode_behaviour(DefaultMode)],
+    %% Lock keys in the same order to avoid deadlock
+    [DefaultRow|lists:sort(AlwaysRows ++ NeverRows)].
 
 -spec decode_prefs_rows([{binary() | jid:jid(), binary()}],
         DefaultMode :: mod_mam:archive_behaviour(),

@@ -1,0 +1,9 @@
+"""
+Allow user to manage own account.
+"""
+type AccountUserMutation @protected{
+  "Remove an account"
+  unregister: String
+  "Change the password of an account"
+  changePassword(newPassword: String!): String
+}

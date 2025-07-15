@@ -60,12 +60,14 @@ priv/mibs/EJABBERD-MIB.bin
 ebin/ejabberd.app
 rel/configure.vars.config
 rel/vars.config
+rel/vars-toml.config
 compile_commands.json
 # Compilation/test ephemera
 *.d
 Mnesia.mongooseim@*
 compile.log
 ct.log
+eunit.log
 deps.log
 dialyzer
 configure.out
@@ -121,6 +123,7 @@ big_tests/src/mim_ct_rest.erl
 big_tests/src/mim_ct_rest_handler.erl
 big_tests/src/mim_ct_sup.erl
 big_tests/priv/ssl
+big_tests/tests/mongooseimctl_SUITE_data/roster.template
 test_preset.log
 
 codecov.json
@@ -130,3 +133,7 @@ big_tests/auto_big_tests.spec
 *.rpm
 
 tools/pkg/packages/
+tools/xep_tool/xeplist.xml
+
+doc/mongooseim.doap
+doc/user-guide/Supported-XEPs.md

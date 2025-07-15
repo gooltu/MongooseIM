@@ -26,41 +26,8 @@
 -include("mongoose.hrl").
 
 %% API
--export([begin_trans/0,
-         query_archive_id/3,
-         search_vcard/3,
-         count_offline_messages/4]).
+-export([begin_trans/0]).
 
 
 begin_trans() ->
     [<<"BEGIN TRANSACTION;">>].
-
-search_vcard(LServer, RestrictionSQL, infinity) ->
-    do_search_vcard(LServer, RestrictionSQL, <<"">>);
-search_vcard(LServer, RestrictionSQL, Limit) when is_integer(Limit) ->
-    LimitBin = integer_to_binary(Limit),
-    do_search_vcard(LServer, RestrictionSQL, <<" TOP ", LimitBin/binary, " ">>).
-
-do_search_vcard(LServer, RestrictionSQL, Limit) ->
-    mongoose_rdbms:sql_query(
-    LServer,
-    [<<"select", Limit/binary, "username, server, fn, family, given, middle, "
-     "nickname, bday, ctry, locality, "
-     "email, orgname, orgunit from vcard_search ">>,
-     RestrictionSQL, ";"]).
-
-query_archive_id(Host, SServer, SUserName) ->
-    mongoose_rdbms:sql_query(
-        Host,
-        ["SELECT TOP 1 id "
-        "FROM mam_server_user "
-        "WHERE server=", mongoose_rdbms:use_escaped_string(SServer),
-        " AND user_name=", mongoose_rdbms:use_escaped_string(SUserName)]).
-
-count_offline_messages(LServer, SUser, SServer, Limit) ->
-    mongoose_rdbms:sql_query(
-        LServer,
-        [<<"SELECT TOP ">>, integer_to_list(Limit),
-         <<"count(*) FROM offline_message "
-         "WHERE server=">>, mongoose_rdbms:use_escaped_string(SServer),
-         <<" AND username=">>, mongoose_rdbms:use_escaped_string(SUser)]).

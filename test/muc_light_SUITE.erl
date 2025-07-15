@@ -1,14 +1,15 @@
 -module(muc_light_SUITE).
--compile(export_all).
+-compile([export_all, nowarn_export_all]).
 
 -include_lib("proper/include/proper.hrl").
 -include_lib("eunit/include/eunit.hrl").
--include_lib("common_test/include/ct.hrl").
 -include("mod_muc_light.hrl").
--include("jlib.hrl").
 -include("mongoose_rsm.hrl").
+-include("mongoose.hrl").
 
 -define(DOMAIN, <<"localhost">>).
+
+-import(config_parser_helper, [default_mod_config/1]).
 
 %% ------------------------------------------------------------------
 %% Common Test callbacks
@@ -18,8 +19,7 @@ all() ->
     [
      {group, aff_changes},
      {group, rsm_disco},
-     {group, codec},
-     {group, configuration}
+     {group, codec}
     ].
 
 groups() ->
@@ -32,22 +32,17 @@ groups() ->
                               rsm_disco_success,
                               rsm_disco_item_not_found
                              ]},
-     {codec, [sequence], [codec_calls]},
-     {configuration, [parallel], [
-                                  simple_config_items_are_parsed,
-                                  full_config_items_are_parsed,
-                                  invalid_binary_default_value_is_rejected,
-                                  invalid_integer_default_value_is_rejected,
-                                  invalid_float_default_value_is_rejected,
-                                  unicode_config_fields_are_supported
-                                 ]}
+     {codec, [sequence], [codec_calls]}
     ].
 
 init_per_suite(Config) ->
     application:ensure_all_started(jid),
-    Config.
+    mongoose_config:set_opts(opts()),
+    async_helper:start(Config, mongoose_instrument, start_link, []).
 
 end_per_suite(Config) ->
+    async_helper:stop_all(Config),
+    mongoose_config:erase_opts(),
     Config.
 
 init_per_group(rsm_disco, Config) ->
@@ -59,16 +54,14 @@ end_per_group(_, Config) ->
     Config.
 
 init_per_testcase(codec_calls, Config) ->
+    meck_mongoose_subdomain_core(),
     ok = mnesia:create_schema([node()]),
     ok = mnesia:start(),
     {ok, _} = application:ensure_all_started(exometer_core),
-    ets:new(local_config, [named_table]),
-    ejabberd_hooks:start_link(),
+    mongooseim_helper:start_link_loaded_hooks(),
     ejabberd_router:start_link(),
     mim_ct_sup:start_link(ejabberd_sup),
-    mongoose_subhosts:init(),
-    gen_mod:start(),
-    mod_muc_light:start(?DOMAIN, []),
+    mongoose_modules:start(),
     ets:new(testcalls, [named_table]),
     ets:insert(testcalls, {hooks, 0}),
     ets:insert(testcalls, {handlers, 0}),
@@ -77,14 +70,21 @@ init_per_testcase(_, Config) ->
     Config.
 
 end_per_testcase(codec_calls, Config) ->
-    mod_muc_light:stop(?DOMAIN),
+    mongoose_modules:stop(),
     mnesia:stop(),
-    mongoose_subhosts:stop(),
     mnesia:delete_schema([node()]),
     application:stop(exometer_core),
+    meck:unload(),
     Config;
 end_per_testcase(_, Config) ->
     Config.
+
+opts() ->
+    #{hosts => [host_type()],
+      host_types => [],
+      component_backend => mnesia,
+      {modules, host_type()} => #{mod_muc_light => default_mod_config(mod_muc_light)},
+      instrumentation => config_parser_helper:default_config([instrumentation])}.
 
 %% ------------------------------------------------------------------
 %% Test cases
@@ -114,124 +114,48 @@ rsm_disco_item_not_found(_Config) ->
 codec_calls(_Config) ->
     AffUsers = [{{<<"alice">>, <<"localhost">>}, member}, {{<<"bob">>, <<"localhost">>}, member}],
     Sender = jid:from_binary(<<"bob@localhost/bbb">>),
-    RoomUS = {<<"pokoik">>, <<"localhost">>},
+    RoomJid = jid:make(<<"pokoik">>, <<"muc.localhost">>, <<>>),
     HandleFun = fun(_, _, _) -> count_call(handler) end,
-    ejabberd_hooks:add(filter_room_packet,
-                       <<"localhost">>,
-                       fun(Acc, _EvData) -> count_call(hook), Acc end,
-                       50),
+    gen_hook:add_handler(filter_room_packet,
+                         <<"localhost">>,
+                         fun ?MODULE:filter_room_packet_handler/3,
+                         #{},
+                         50),
 
     % count_call/1 should've been called twice - by handler fun (for each affiliated user,
     % we have one) and by a filter_room_packet hook handler.
 
+    Acc = mongoose_acc:new(#{ location => ?LOCATION,
+                              lserver => <<"localhost">>,
+                              host_type => <<"localhost">>,
+                              element => undefined,
+                              from_jid => jid:make_noprep(<<"a">>, <<"localhost">>, <<>>),
+                              to_jid => jid:make_noprep(<<>>, <<"muc.localhost">>, <<>>) }),
     mod_muc_light_codec_modern:encode({#msg{id = <<"ajdi">>}, AffUsers},
-                                      Sender, RoomUS, HandleFun),
+                                      Sender, RoomJid, HandleFun, Acc),
     % 1 filter packet, sent 1 msg to 2 users
     check_count(1, 2),
     mod_muc_light_codec_modern:encode({set, #affiliations{}, [], []},
-                                      Sender, RoomUS, HandleFun),
+                                      Sender, RoomJid, HandleFun, Acc),
     % 1 filter packet, sent 1 IQ response to Sender
     check_count(1, 1),
     mod_muc_light_codec_modern:encode({set, #create{id = <<"ajdi">>, aff_users = AffUsers}, false},
-                                      Sender, RoomUS, HandleFun),
+                                      Sender, RoomJid, HandleFun, Acc),
     % 1 filter, 1 IQ response to Sender, 1 notification to 2 users
     check_count(1, 3),
     mod_muc_light_codec_modern:encode({set, #config{id = <<"ajdi">>}, AffUsers},
-        Sender, RoomUS, HandleFun),
+        Sender, RoomJid, HandleFun, Acc),
     % 1 filter, 1 IQ response to Sender, 1 notification to 2 users
     check_count(1, 3),
     mod_muc_light_codec_legacy:encode({#msg{id = <<"ajdi">>}, AffUsers},
-        Sender, RoomUS, HandleFun),
+        Sender, RoomJid, HandleFun, Acc),
     % 1 filter, 1 msg to 2 users
     check_count(1, 2),
     ok.
 
-%% ----------------- Room config schema ----------------------
-
-simple_config_items_are_parsed(_Config) ->
-    Definition = [
-                  {"roomname", "TARDIS"},
-                  {"subject", "Time Travel"},
-                  {"incarnation", "13"},
-                  {"spoilers", "false"}
-                 ],
-    Schema = mod_muc_light_room_config:schema_from_definition(Definition),
-
-    ExpectedFields = #{
-      <<"roomname">> => {<<"TARDIS">>, roomname, binary},
-      <<"subject">> => {<<"Time Travel">>, subject, binary},
-      <<"incarnation">> => {<<"13">>, incarnation, binary},
-      <<"spoilers">> => {<<"false">>, spoilers, binary}
-     },
-    ?assertEqual(ExpectedFields, mod_muc_light_room_config:schema_fields(Schema)),
-
-    ExpectedRevIndex = #{
-      roomname => <<"roomname">>,
-      subject => <<"subject">>,
-      incarnation => <<"incarnation">>,
-      spoilers => <<"spoilers">>
-     },
-    ?assertEqual(ExpectedRevIndex, mod_muc_light_room_config:schema_reverse_index(Schema)).
-
-
-full_config_items_are_parsed(_Config) ->
-    Definition = [
-                  {"roomname", "TARDIS", roomname, binary},
-                  {"subject", "Time Travel", subject, binary},
-                  {"incarnation", 13, incarnation, integer},
-                  {"height", 1.67, height, float}
-                 ],
-    Schema = mod_muc_light_room_config:schema_from_definition(Definition),
-
-    ExpectedFields = #{
-      <<"roomname">> => {<<"TARDIS">>, roomname, binary},
-      <<"subject">> => {<<"Time Travel">>, subject, binary},
-      <<"incarnation">> => {13, incarnation, integer},
-      <<"height">> => {1.67, height, float}
-     },
-    ?assertEqual(ExpectedFields, mod_muc_light_room_config:schema_fields(Schema)),
-
-    ExpectedRevIndex = #{
-      roomname => <<"roomname">>,
-      subject => <<"subject">>,
-      incarnation => <<"incarnation">>,
-      height => <<"height">>
-     },
-    ?assertEqual(ExpectedRevIndex, mod_muc_light_room_config:schema_reverse_index(Schema)).
-
-
-invalid_binary_default_value_is_rejected(_Config) ->
-    ?assertError(_, mod_muc_light_room_config:schema_from_definition([{"roomname", 12345}])),
-    ?assertError(_, mod_muc_light_room_config:schema_from_definition([{"roomname", 12345,
-                                                                       roomname, binary}])).
-
-invalid_integer_default_value_is_rejected(_Config) ->
-    ?assertError(_, mod_muc_light_room_config:schema_from_definition([{"incarnation", 123.45,
-                                                                       incarnation, integer}])).
-
-invalid_float_default_value_is_rejected(_Config) ->
-    ?assertError(_, mod_muc_light_room_config:schema_from_definition([{"height", 12345,
-                                                                       height, float}])).
-
-unicode_config_fields_are_supported(_Config) ->
-    Definition = [{"zażółćgęśląjaźń", "gżegżółka"},
-                  {"Рентгеноэлектрокардиографический", 42,
-                   'Рентгеноэлектрокардиографический', integer}],
-    Schema = mod_muc_light_room_config:schema_from_definition(Definition),
-
-    ExpectedFields = #{
-      <<"zażółćgęśląjaźń"/utf8>> => {<<"gżegżółka"/utf8>>, 'zażółćgęśląjaźń', binary},
-      <<"Рентгеноэлектрокардиографический"/utf8>> =>
-            {42, 'Рентгеноэлектрокардиографический', integer}
-     },
-    ?assertEqual(ExpectedFields, mod_muc_light_room_config:schema_fields(Schema)),
-
-    ExpectedRevIndex = #{
-      'zażółćgęśląjaźń' => <<"zażółćgęśląjaźń"/utf8>>,
-      'Рентгеноэлектрокардиографический' => <<"Рентгеноэлектрокардиографический"/utf8>>
-     },
-    ?assertEqual(ExpectedRevIndex, mod_muc_light_room_config:schema_reverse_index(Schema)).
-
+filter_room_packet_handler(Acc, _Params, _Extra) ->
+    count_call(hook),
+    {ok, Acc}.
 
 %% ------------------------------------------------------------------
 %% Properties and validators
@@ -240,7 +164,7 @@ unicode_config_fields_are_supported(_Config) ->
 prop_aff_change_success() ->
     ?FORALL({AffUsers, Changes, Joining, Leaving, WithOwner}, change_aff_params(),
             begin
-                case mod_muc_light_utils:change_aff_users(AffUsers, Changes) of
+                case mod_muc_light_utils:change_aff_users(host_type(), AffUsers, Changes) of
                     {ok, NewAffUsers0, AffUsersChanged, Joining0, Leaving0} ->
                         Joining = lists:sort(Joining0),
                         Leaving = lists:sort(Leaving0),
@@ -254,7 +178,7 @@ prop_aff_change_success() ->
                         % are there no owners or there is exactly one?
                         true = validate_owner(NewAffUsers0, false, WithOwner),
                         % changes list applied to old list should produce the same result
-                        {ok, NewAffUsers1, _, _, _} = mod_muc_light_utils:change_aff_users(AffUsers, AffUsersChanged),
+                        {ok, NewAffUsers1, _, _, _} = mod_muc_light_utils:change_aff_users(host_type(), AffUsers, AffUsersChanged),
                         NewAffUsers0 = NewAffUsers1,
                         true;
                     _ ->
@@ -273,7 +197,8 @@ validate_owner([], _, _) -> true.
 prop_aff_change_bad_request() ->
     ?FORALL({AffUsers, Changes}, bad_change_aff(),
             begin
-                {error, bad_request} = mod_muc_light_utils:change_aff_users(AffUsers, Changes),
+                {error, {bad_request, _}} =
+                    mod_muc_light_utils:change_aff_users(host_type(), AffUsers, Changes),
                 true
             end).
 
@@ -377,7 +302,7 @@ owner_problem(AffUsers, Changes, false) ->
          {AffUsers, insert({User, owner}, Changes, InsertPos)});
 owner_problem(AffUsers, Changes, true) ->
     % Promote two users to owner
-    ?LET({{User1, _Aff}, {User2, _Aff}, InsertPos1, InsertPos2},
+    ?LET({{User1, Aff}, {User2, Aff}, InsertPos1, InsertPos2},
          {aff_user(5), aff_user(5), integer(1, length(Changes)), integer(1, length(Changes))},
          {AffUsers, insert({User2, owner},
                            insert({User1, owner}, Changes, InsertPos1),
@@ -526,3 +451,13 @@ check_count(Hooks, Handlers) ->
     ?assertEqual(Handlers, Ha),
     ets:insert(testcalls, {hooks, 0}),
     ets:insert(testcalls, {handlers, 0}).
+
+meck_mongoose_subdomain_core() ->
+    meck:new(mongoose_subdomain_core),
+    meck:expect(mongoose_subdomain_core, register_subdomain,
+                fun(_HostType, _SubdomainPattern, _PacketHandler) -> ok end),
+    meck:expect(mongoose_subdomain_core, unregister_subdomain,
+                fun(_HostType, _SubdomainPattern) -> ok end).
+
+host_type() ->
+    ?DOMAIN.

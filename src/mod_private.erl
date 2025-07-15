@@ -31,144 +31,140 @@
 
 -export([start/2,
          stop/1,
-         process_sm_iq/4,
-         remove_user/3]).
+         hooks/1,
+         supported_features/0,
+         config_spec/0,
+         process_iq/5,
+         remove_user/3,
+         remove_domain/3]).
 
--export([get_personal_data/2]).
+-export([get_personal_data/3]).
 
 -export([config_metrics/1]).
 
 -include("mongoose.hrl").
 -include("jlib.hrl").
+-include("mongoose_config_spec.hrl").
 -xep([{xep, 49}, {version, "1.2"}]).
-
-%% ------------------------------------------------------------------
-%% Backend callbacks
-
--callback init(Host, Opts) -> ok when
-    Host    :: binary(),
-    Opts    :: list().
-
--callback multi_set_data(LUser, LServer, NS2XML) -> Result when
-    LUser   :: binary(),
-    LServer :: binary(),
-    NS2XML  :: [{NS, XML}],
-    NS      :: binary(),
-    XML     :: #xmlel{},
-    Reason  :: term(),
-    Result  :: ok | {aborted, Reason} | {error, Reason}.
-
--callback multi_get_data(LUser, LServer, NS2Def) -> [XML | Default] when
-    LUser   :: binary(),
-    LServer :: binary(),
-    NS2Def  :: [{NS, Default}],
-    NS      :: binary(),
-    Default :: term(),
-    XML     :: #xmlel{}.
-
--callback remove_user(LUser, LServer) -> any() when
-    LUser   :: binary(),
-    LServer :: binary().
-
--callback get_all_nss(LUser, LServer) -> NSs when
-    LUser   :: binary(),
-    LServer :: binary(),
-    NSs     :: [binary()].
 
 %%--------------------------------------------------------------------
 %% gdpr callback
 %%--------------------------------------------------------------------
 
--spec get_personal_data(gdpr:personal_data(), jid:jid()) -> gdpr:personal_data().
-get_personal_data(Acc, #jid{ luser = LUser, lserver = LServer }) ->
+-spec get_personal_data(Acc, Params, Extra) -> {ok, Acc} when
+      Acc :: gdpr:personal_data(),
+      Params :: #{jid := jid:jid()},
+      Extra :: gen_hook:extra().
+get_personal_data(Acc, #{jid := #jid{luser = LUser, lserver = LServer}}, #{host_type := HostType}) ->
     Schema = ["ns", "xml"],
-    NSs = mod_private_backend:get_all_nss(LUser, LServer),
+    NSs = mod_private_backend:get_all_nss(HostType, LUser, LServer),
     Entries = lists:map(
                 fun(NS) ->
-                        Data = mod_private_backend:multi_get_data(LUser, LServer, [{NS, default}]),
-                        { NS, exml:to_binary(Data) }
+                        Data = mod_private_backend:multi_get_data(
+                                 HostType, LUser, LServer, [{NS, default}]),
+                        {NS, exml:to_binary(Data)}
                 end, NSs),
-    [{private, Schema, Entries} | Acc].
+    NewAcc = [{private, Schema, Entries} | Acc],
+    {ok, NewAcc}.
 
 %% ------------------------------------------------------------------
 %% gen_mod callbacks
 
-start(Host, Opts) ->
-    gen_mod:start_backend_module(?MODULE, Opts, [multi_get_data, multi_set_data]),
-    mod_private_backend:init(Host, Opts),
-    IQDisc = gen_mod:get_opt(iqdisc, Opts, one_queue),
-    ejabberd_hooks:add(remove_user, Host, ?MODULE, remove_user, 50),
-    ejabberd_hooks:add(anonymous_purge_hook, Host, ?MODULE, remove_user, 50),
-    ejabberd_hooks:add(get_personal_data, Host, ?MODULE, get_personal_data, 50),
-    gen_iq_handler:add_iq_handler(ejabberd_sm, Host, ?NS_PRIVATE,
-                                  ?MODULE, process_sm_iq, IQDisc).
+-spec start(HostType :: mongooseim:host_type(), Opts :: gen_mod:module_opts()) -> ok | {error, atom()}.
+start(HostType, #{iqdisc := IQDisc} = Opts) ->
+    mod_private_backend:init(HostType, Opts),
+    gen_iq_handler:add_iq_handler_for_domain(HostType, ?NS_PRIVATE, ejabberd_sm,
+                                             fun ?MODULE:process_iq/5, #{}, IQDisc).
 
-stop(Host) ->
-    ejabberd_hooks:delete(remove_user, Host, ?MODULE, remove_user, 50),
-    ejabberd_hooks:delete(anonymous_purge_hook, Host, ?MODULE, remove_user, 50),
-    ejabberd_hooks:delete(get_personal_data, Host, ?MODULE, get_personal_data, 50),
-    gen_iq_handler:remove_iq_handler(ejabberd_sm, Host, ?NS_PRIVATE).
+-spec stop(HostType :: mongooseim:host_type()) -> ok | {error, not_registered}.
+stop(HostType) ->
+    gen_iq_handler:remove_iq_handler_for_domain(HostType, ?NS_PRIVATE, ejabberd_sm).
 
+supported_features() -> [dynamic_domains].
+
+-spec hooks(mongooseim:host_type()) -> gen_hook:hook_list().
+hooks(HostType) ->
+    [{remove_user, HostType, fun ?MODULE:remove_user/3, #{}, 50},
+     {remove_domain, HostType, fun ?MODULE:remove_domain/3, #{}, 50},
+     {anonymous_purge, HostType, fun ?MODULE:remove_user/3, #{}, 50},
+     {get_personal_data, HostType, fun ?MODULE:get_personal_data/3, #{}, 50}].
+
+config_spec() ->
+    #section{
+       items = #{<<"iqdisc">> => mongoose_config_spec:iqdisc(),
+                 <<"backend">> => #option{type = atom,
+                                          validate = {module, mod_private}}},
+       defaults = #{<<"iqdisc">> => one_queue,
+                    <<"backend">> => rdbms}
+    }.
 
 %% ------------------------------------------------------------------
 %% Handlers
 
-remove_user(Acc, User, Server) ->
-    LUser = jid:nodeprep(User),
-    LServer = jid:nameprep(Server),
-    R = mod_private_backend:remove_user(LUser, LServer),
-    mongoose_lib:log_if_backend_error(R, ?MODULE, ?LINE, {Acc, User, Server}),
-    Acc.
+-spec remove_user(Acc, Params, Extra) -> {ok, Acc} when
+      Acc :: mongoose_acc:t(),
+      Params :: #{jid := jid:jid()},
+      Extra :: gen_hook:extra().
+remove_user(Acc, #{jid := #jid{luser = LUser, lserver = LServer}}, #{host_type := HostType}) ->
+    R = mod_private_backend:remove_user(HostType, LUser, LServer),
+    mongoose_lib:log_if_backend_error(R, ?MODULE, ?LINE, {Acc, LUser, LServer}),
+    {ok, Acc}.
 
-process_sm_iq(
-        From = #jid{luser = LUser, lserver = LServer},
-        To   = #jid{},
-        Acc,
-        IQ   = #iq{type = Type, sub_el = SubElem = #xmlel{children = Elems}}) ->
-    IsKnown = lists:member(LServer, ?MYHOSTS),
-    IsEqual = compare_bare_jids(From, To),
-    Strategy = choose_strategy(IsKnown, IsEqual, Type),
+-spec remove_domain(Acc, Params, Extra) -> {ok , Acc} when
+      Acc :: mongoose_domain_api:remove_domain_acc(),
+      Params :: #{domain := jid:lserver()},
+      Extra :: gen_hook:extra().
+remove_domain(Acc, #{domain := Domain}, #{host_type := HostType}) ->
+    mod_private_backend:remove_domain(HostType, Domain),
+    {ok, Acc}.
+
+process_iq(Acc,
+           From = #jid{lserver = LServer, luser = LUser},
+           To = #jid{lserver = LServer, luser = LUser},
+           IQ = #iq{type = Type, sub_el = SubElem = #xmlel{children = Elems}},
+           _Extra) ->
+    HostType = mongoose_acc:host_type(Acc),
+    IsEqual = jid:are_bare_equal(From, To),
+    Strategy = choose_strategy(IsEqual, Type),
     Res = case Strategy of
         get ->
             NS2XML = to_map(Elems),
-            XMLs = mod_private_backend:multi_get_data(LUser, LServer, NS2XML),
+            XMLs = mod_private_backend:multi_get_data(HostType, LUser, LServer, NS2XML),
             IQ#iq{type = result, sub_el = [SubElem#xmlel{children = XMLs}]};
         set ->
             NS2XML = to_map(Elems),
-            Result = mod_private_backend:multi_set_data(LUser, LServer, NS2XML),
+            Result = mod_private_backend:multi_set_data(HostType, LUser, LServer, NS2XML),
             case Result of
                 ok ->
                     IQ#iq{type = result, sub_el = [SubElem]};
                 {error, Reason} ->
-                    ?ERROR_MSG("~p:multi_set_data failed ~p for ~ts@~ts.",
-                               [mod_private_backend, Reason, LUser, LServer]),
+                    ?LOG_ERROR(#{what => multi_set_data_failed, reason => Reason,
+                                 user => LUser, server => LServer}),
                     error_iq(IQ, mongoose_xmpp_errors:internal_server_error());
                 {aborted, Reason} ->
-                    ?ERROR_MSG("~p:multi_set_data aborted ~p for ~ts@~ts.",
-                               [mod_private_backend, Reason, LUser, LServer]),
+                    ?LOG_ERROR(#{what => multi_set_data_aborted, reason => Reason,
+                                 user => LUser, server => LServer}),
                     error_iq(IQ, mongoose_xmpp_errors:internal_server_error())
             end;
-        not_allowed ->
-            error_iq(IQ, mongoose_xmpp_errors:not_allowed());
         forbidden ->
             error_iq(IQ, mongoose_xmpp_errors:forbidden())
     end,
+    {Acc, Res};
+process_iq(Acc, _From, _To, IQ, _Extra) ->
+    Txt = <<"Only requests from/to your JID are allowed">>,
+    Err = mongoose_xmpp_errors:forbidden(<<"en">>, Txt),
+    Res = error_iq(IQ, Err),
     {Acc, Res}.
 
 %% ------------------------------------------------------------------
 %% Helpers
 
-choose_strategy(true,  true, get) -> get;
-choose_strategy(true,  true, set) -> set;
-choose_strategy(false, _,    _  ) -> not_allowed;
-choose_strategy(_,     _,    _  ) -> forbidden.
+choose_strategy(true, get) -> get;
+choose_strategy(true, set) -> set;
+choose_strategy(_,    _  ) -> forbidden.
 
-compare_bare_jids(#jid{luser = LUser, lserver = LServer},
-                  #jid{luser = LUser, lserver = LServer}) -> true;
-compare_bare_jids(_, _) -> false.
-
-element_to_namespace(#xmlel{attrs = Attrs}) ->
-    xml:get_attr_s(<<"xmlns">>, Attrs);
+element_to_namespace(#xmlel{} = El) ->
+    exml_query:attr(El, <<"xmlns">>, <<>>);
 element_to_namespace(_) ->
     <<>>.
 
@@ -181,6 +177,6 @@ is_valid_namespace(Namespace) -> Namespace =/= <<>>.
 error_iq(IQ=#iq{sub_el=SubElem}, ErrorStanza) ->
     IQ#iq{type = error, sub_el = [SubElem, ErrorStanza]}.
 
-config_metrics(Host) ->
-    OptsToReport = [{backend, mnesia}], %list of tuples {option, defualt_value}
-    mongoose_module_metrics:opts_for_module(Host, ?MODULE, OptsToReport).
+-spec config_metrics(mongooseim:host_type()) -> [{gen_mod:opt_key(), gen_mod:opt_value()}].
+config_metrics(HostType) ->
+    mongoose_module_metrics:opts_for_module(HostType, ?MODULE, [backend]).

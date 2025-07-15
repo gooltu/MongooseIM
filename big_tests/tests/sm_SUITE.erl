@@ -1,51 +1,94 @@
+%% Stream Management tests
 -module(sm_SUITE).
--compile(export_all).
 
+-compile([export_all, nowarn_export_all]).
 -include_lib("exml/include/exml.hrl").
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("escalus/include/escalus.hrl").
 -include_lib("common_test/include/ct.hrl").
 
--define(MOD_SM, mod_stream_management).
--define(CONSTRAINT_CHECK_TIMEOUT, 5000).
+%% Injected code callbacks
+-export([rpc_start_hook_handler/3,
+         rpc_stop_hook_handler/2,
+         hook_handler_fn/3,
+         regression_handler/5]).
+
+-export([rpc_start_filter_hook_handler/3,
+         rpc_stop_filter_hook_handler/2,
+         filter_hook_handler_fn/3]).
 
 -import(distributed_helper, [mim/0,
                              require_rpc_nodes/1,
                              rpc/4]).
 
--import(vcard_update, [discard_vcard_update/1,
-                       server_string/1]).
+-import(domain_helper, [host_type/0]).
 
--import(escalus_stanza, [setattr/3]).
+-import(sm_helper, [connect_fresh/3,
+                    connect_fresh/4,
+                    connect_spec/2,
+                    connect_spec/3,
+                    connect_same/2,
+                    connect_same/3,
+                    connect_resume/2,
+                    process_initial_stanza/1,
+                    send_initial_presence/1,
+                    get_ack/1,
+                    ack_initial_presence/1]).
 
--define(BIG_BIG_BIG_TIMEOUT, 3600).
--define(SHORT_RESUME_TIMEOUT, 3).
+-define(MOD_SM, mod_stream_management).
+-define(CONSTRAINT_CHECK_TIMEOUT, 5000).
+-define(LONG_TIMEOUT, 3600).
+-define(SHORT_TIMEOUT, 1).
 -define(SMALL_SM_BUFFER, 3).
+-define(PING_REQUEST_TIMEOUT, 2).
+-define(PING_INTERVAL, 5).
 
 %%--------------------------------------------------------------------
 %% Suite configuration
 %%--------------------------------------------------------------------
 
+suite() ->
+    require_rpc_nodes([mim]) ++ escalus:suite().
+
 all() ->
-    [{group, parallel},
-     {group, parallel_manual_ack_freq_1},
-     {group, stale_h},
-     {group, stream_mgmt_disabled},
-     server_requests_ack_freq_2,
-     {group, unacknowledged_message_hook}
-     ].
+    [{group, ws_tests},
+     {group, tcp_tests}].
 
 groups() ->
-    G = [{parallel, [parallel], parallel_test_cases()},
-         {parallel_manual_ack_freq_1, [parallel], parallel_manual_ack_test_cases()},
-         {stale_h, [], stale_h_test_cases()},
-         {stream_mgmt_disabled, [], stream_mgmt_disabled_cases()},
-         {manual_ack_freq_long_session_timeout, [parallel], [preserve_order]},
-         {unacknowledged_message_hook, [parallel], unacknowledged_message_hook()}],
-    ct_helper:repeat_all_until_all_ok(G).
+    [
+     {ws_tests, [], ws_tests()},
+     {tcp_tests, [], tcp_tests()},
+     {parallel, [parallel], parallel_cases() ++ [aggressively_pipelined_resume]},
+     {parallel_ws, [parallel], parallel_cases() ++ [aggressively_pipelined_resume_ws]},
+     {parallel_large_buffer, [parallel], parallel_large_buffer_cases()},
+     {parallel_manual_ack_freq_1, [parallel], parallel_manual_ack_freq_1_cases()},
+     {manual_ack_freq_2, [], manual_ack_freq_2_cases()},
+     {stale_h, [], stale_h_cases()},
+     {parallel_unacknowledged_message_hook, [parallel], parallel_unacknowledged_message_hook_cases()},
+     {resume_timeout, [parallel], resume_timeout_cases()}
+    ].
 
+ws_tests() ->
+    [{group, parallel_ws},
+     {group, parallel_large_buffer},
+     {group, parallel_manual_ack_freq_1},
+     {group, manual_ack_freq_2},
+     {group, stale_h},
+     {group, parallel_unacknowledged_message_hook},
+     {group, resume_timeout},
+     ping_timeout].
 
-parallel_test_cases() ->
+tcp_tests() ->
+    [{group, parallel},
+     {group, parallel_large_buffer},
+     {group, parallel_manual_ack_freq_1},
+     {group, manual_ack_freq_2},
+     {group, stale_h},
+     {group, parallel_unacknowledged_message_hook},
+     {group, resume_timeout},
+     ping_timeout].
+
+parallel_cases() ->
     [server_announces_sm,
      server_enables_sm_before_session,
      server_enables_sm_after_session,
@@ -60,6 +103,9 @@ parallel_test_cases() ->
      h_ok_after_session_enabled_before_session,
      h_ok_after_session_enabled_after_session,
      h_ok_after_a_chat,
+     h_ok_after_presence,
+     h_ok_after_iq,
+     h_ok_after_non_xmpp_stanza,
      h_non_given_closes_stream_gracefully,
      resend_unacked_on_reconnection,
      session_established,
@@ -69,341 +115,396 @@ parallel_test_cases() ->
      resume_session_with_wrong_sid_returns_item_not_found,
      resume_session_with_wrong_namespace_is_a_noop,
      resume_dead_session_results_in_item_not_found,
-     aggressively_pipelined_resume,
+     resume_session_kills_old_C2S_gracefully,
+     carboncopy_works,
+     carboncopy_works_after_resume,
      replies_are_processed_by_resumed_session,
      subscription_requests_are_buffered_properly,
-     messages_are_properly_flushed_during_resumption,
-     messages_are_properly_flushed_during_resumption_p1_fsm_old
-    ].
+     messages_are_properly_flushed_during_resumption].
 
-parallel_manual_ack_test_cases() ->
+parallel_large_buffer_cases() ->
+    [resend_unacked_from_stopped_sessions,
+     resend_unacked_from_terminated_sessions,
+     resend_unacked_from_replaced_sessions,
+     relay_unacked_from_stopped_sessions,
+     relay_unacked_from_terminated_sessions,
+     relay_unacked_from_replaced_sessions].
+
+parallel_manual_ack_freq_1_cases() ->
     [client_acks_more_than_sent,
      too_many_unacked_stanzas,
-     resend_unacked_after_resume_timeout,
-     resume_session_state_send_message,
+     resume_session_state_send_message_with_ack,
+     resume_session_state_send_message_without_ack,
      resume_session_state_stop_c2s,
      server_requests_ack_after_session,
      resend_more_offline_messages_than_buffer_size,
-     server_requests_ack
-     ].
+     server_requests_ack].
 
-stale_h_test_cases() ->
-    [
-     resume_expired_session_returns_correct_h,
+manual_ack_freq_2_cases() ->
+    [server_requests_ack_freq_2].
+
+resume_timeout_cases() ->
+    [resend_unacked_after_resume_timeout,
+     resend_unacked_to_different_res_after_resume_timeout].
+
+stale_h_cases() ->
+    [resume_expired_session_returns_correct_h,
      gc_repeat_after_never_means_no_cleaning,
-     gc_repeat_after_timeout_does_clean
-    ].
+     gc_repeat_after_timeout_does_clean].
 
 stream_mgmt_disabled_cases() ->
-    [
-     no_crash_if_stream_mgmt_disabled_but_client_requests_stream_mgmt,
-     no_crash_if_stream_mgmt_disabled_but_client_requests_stream_mgmt_with_resumption
-    ].
+    [no_crash_if_stream_mgmt_disabled_but_client_requests_stream_mgmt,
+     no_crash_if_stream_mgmt_disabled_but_client_requests_stream_mgmt_with_resumption].
 
-unacknowledged_message_hook() ->
+manual_ack_freq_long_session_timeout_cases() ->
+    [preserve_order].
+
+parallel_unacknowledged_message_hook_cases() ->
     [unacknowledged_message_hook_bounce,
      unacknowledged_message_hook_offline,
-     unacknowledged_message_hook_resume].
-
-suite() ->
-    require_rpc_nodes([mim]) ++ escalus:suite().
-
-domain() ->
-    ct:get_config({hosts, mim, domain}).
-
-stream_management_with_stale_h(RepeatAfter, Geriatric) ->
-  [{mod_stream_management,
-    [
-     {ack_freq, 1},
-     {resume_timeout, ?SHORT_RESUME_TIMEOUT},
-     {stale_h, [{enabled, true},
-                {stale_h_repeat_after, RepeatAfter},
-                {stale_h_geriatric, Geriatric}]}]}].
+     unacknowledged_message_hook_resume,
+     unacknowledged_message_hook_filter].
 
 %%--------------------------------------------------------------------
 %% Init & teardown
 %%--------------------------------------------------------------------
 
 init_per_suite(Config) ->
-    NewConfig1 = escalus_ejabberd:setup_option(ack_freq(never), Config),
-    NewConfig = escalus_ejabberd:setup_option(buffer_max(?SMALL_SM_BUFFER), NewConfig1),
-    NewConfigWithSM = escalus_users:update_userspec(NewConfig, alice, stream_management, true),
-    mongoose_helper:inject_module(?MODULE),
-    escalus:init_per_suite(NewConfigWithSM).
+    escalus:init_per_suite(Config).
 
 end_per_suite(Config) ->
-    NewConfig = escalus_ejabberd:reset_option(ack_freq(never), Config),
-    NewConfig1 = escalus_ejabberd:reset_option(buffer_max(?SMALL_SM_BUFFER), NewConfig),
-    escalus_fresh:clean(),
-    escalus:end_per_suite(NewConfig1).
+    escalus:end_per_suite(Config).
 
+init_per_group(ws_tests, Config) ->
+    NewConfig = dynamic_modules:save_modules(host_type(), Config),
+    mongoose_helper:inject_module(?MODULE),
+    NewConfigWithSM = escalus_users:update_userspec(NewConfig, geralt, stream_management, true),
+    [{user, geralt} | NewConfigWithSM];
 
-init_per_group(G, Config) when G =:= unacknowledged_message_hook;
-                               G =:= manual_ack_freq_long_session_timeout ->
-    true = rpc(mim(), ?MOD_SM, set_ack_freq, [1]),
-    escalus_users:update_userspec(Config, alice, manual_ack, true);
-init_per_group(parallel_manual_ack_freq_1, Config) ->
-    true = rpc(mim(), ?MOD_SM, set_ack_freq, [1]),
-    rpc(mim(), ?MOD_SM, set_resume_timeout, [?SHORT_RESUME_TIMEOUT]),
-    escalus_users:update_userspec(Config, alice, manual_ack, true);
+init_per_group(tcp_tests, Config) ->
+    NewConfig = dynamic_modules:save_modules(host_type(), Config),
+    mongoose_helper:inject_module(?MODULE),
+    NewConfigWithSM = escalus_users:update_userspec(NewConfig, alice, stream_management, true),
+    [{user, alice} | NewConfigWithSM];
+
+init_per_group(Group, Config) when Group =:= parallel_unacknowledged_message_hook;
+                                   Group =:= manual_ack_freq_long_session_timeout;
+                                   Group =:= parallel_manual_ack_freq_1;
+                                   Group =:= manual_ack_freq_2 ->
+    dynamic_modules:ensure_modules(host_type(), required_modules(group, Group)),
+    Config;
 init_per_group(stale_h, Config) ->
-    escalus_users:update_userspec(Config, alice, manual_ack, true);
+    Config;
 init_per_group(stream_mgmt_disabled, Config) ->
-    Config2 = dynamic_modules:save_modules(domain(), Config),
-    dynamic_modules:stop(domain(), ?MOD_SM),
+    dynamic_modules:stop(host_type(), ?MOD_SM),
     rpc(mim(), mnesia, delete_table, [sm_session]),
-    escalus_users:update_userspec(Config2, alice, manual_ack, true);
-init_per_group(_GroupName, Config) ->
+    Config;
+init_per_group(Group, Config) ->
+    dynamic_modules:ensure_modules(host_type(), required_modules(group, Group)),
     Config.
 
-end_per_group(stream_mgmt_disabled, Config) ->
-    dynamic_modules:restore_modules(domain(), Config);
-end_per_group(G, Config) when G =:= unacknowledged_message_hook;
-                              G =:= manual_ack_freq_long_session_timeout ->
-    true = rpc(mim(), ?MOD_SM, set_ack_freq, [never]),
-    Config;
-end_per_group(parallel_manual_ack_freq_1, Config) ->
-    true = rpc(mim(), ?MOD_SM, set_ack_freq, [never]),
-    rpc(mim(), ?MOD_SM, set_resume_timeout, [600]),
-    Config;
-end_per_group(_GroupName, Config) ->
-    Config.
-
-
-set_gc_parameters(RepeatAfter, Geriatric, Config) ->
-    Config2 = dynamic_modules:save_modules(domain(), Config),
-    dynamic_modules:ensure_modules(
-      domain(), stream_management_with_stale_h(RepeatAfter, Geriatric)),
-    Config2.
-
-register_smid(IntSmidId) ->
-    S = {SMID = make_smid(), IntSmidId},
-    ok = rpc(mim(), ?MOD_SM, register_stale_smid_h, [SMID, IntSmidId]),
-    S.
-
-register_some_smid_h(Config) ->
-    TestSmids = lists:map(fun register_smid/1, lists:seq(1, 3)),
-    [{smid_test, TestSmids} | Config].
+end_per_group(Group, Config) when Group =:= ws_tests; Group =:= tcp_tests ->
+    escalus_fresh:clean(),
+    dynamic_modules:restore_modules(Config);
+end_per_group(_Group, _Config) ->
+    ok.
 
 init_per_testcase(resume_expired_session_returns_correct_h = CN, Config) ->
-    Config2 = set_gc_parameters(?BIG_BIG_BIG_TIMEOUT, ?BIG_BIG_BIG_TIMEOUT, Config),
-    rpc(mim(), ?MOD_SM, set_resume_timeout, [?SHORT_RESUME_TIMEOUT]),
-    true = rpc(mim(), ?MOD_SM, set_ack_freq, [1]),
+    dynamic_modules:ensure_modules(host_type(), required_modules(testcase, CN)),
+    escalus:init_per_testcase(CN, Config);
+init_per_testcase(CN, Config) when CN =:= gc_repeat_after_never_means_no_cleaning;
+                                   CN =:= gc_repeat_after_timeout_does_clean ->
+    dynamic_modules:ensure_modules(host_type(), required_modules(testcase, CN)),
+    Config2 = register_some_smid_h(Config),
     escalus:init_per_testcase(CN, Config2);
-init_per_testcase(gc_repeat_after_never_means_no_cleaning = CN, Config) ->
-    Config2 = set_gc_parameters(?BIG_BIG_BIG_TIMEOUT, ?SHORT_RESUME_TIMEOUT, Config),
-    Config3 = register_some_smid_h(Config2),
-    escalus:init_per_testcase(CN, Config3);
-init_per_testcase(gc_repeat_after_timeout_does_clean = CN, Config) ->
-    Config2 = set_gc_parameters(?SHORT_RESUME_TIMEOUT, ?SHORT_RESUME_TIMEOUT, Config),
-    Config3 = register_some_smid_h(Config2),
-    escalus:init_per_testcase(CN, Config3);
+init_per_testcase(ping_timeout = CN, Config) ->
+    ok = rpc(mim(), meck, new, [mod_ping, [passthrough, no_link]]),
+    dynamic_modules:ensure_modules(host_type(), required_modules(testcase, CN)),
+    escalus:init_per_testcase(CN, Config);
 init_per_testcase(server_requests_ack_freq_2 = CN, Config) ->
-    true = rpc(mim(), ?MOD_SM, set_ack_freq, [2]),
     escalus:init_per_testcase(CN, Config);
 init_per_testcase(replies_are_processed_by_resumed_session = CN, Config) ->
-    register_handler(<<"localhost">>),
+    register_handler(),
     escalus:init_per_testcase(CN, Config);
 init_per_testcase(CaseName, Config) ->
     escalus:init_per_testcase(CaseName, Config).
 
 end_per_testcase(CN, Config) when CN =:= resume_expired_session_returns_correct_h;
                                   CN =:= gc_repeat_after_never_means_no_cleaning;
-                                  CN =:= gc_repeat_after_timeout_does_clean
-                                   ->
-    dynamic_modules:stop(domain(), ?MOD_SM),
-    rpc(mim(), ejabberd_sup, stop_child, [stream_management_stale_h]),
-    dynamic_modules:restore_modules(domain(), Config),
-    escalus:end_per_testcase(CN, Config);
-end_per_testcase(server_requests_ack_freq_2 = CN, Config) ->
-    true = rpc(mim(), ?MOD_SM, set_ack_freq, [never]),
+                                  CN =:= gc_repeat_after_timeout_does_clean ->
+    Name = rpc(mim(), gen_mod, get_module_proc, [host_type(), stream_management_stale_h]),
+    rpc(mim(), ejabberd_sup, stop_child, [Name]),
     escalus:end_per_testcase(CN, Config);
 end_per_testcase(replies_are_processed_by_resumed_session = CN, Config) ->
-    unregister_handler(<<"localhost">>),
+    unregister_handler(),
+    escalus:end_per_testcase(CN, Config);
+end_per_testcase(ping_timeout = CN, Config) ->
+    rpc(mim(), meck, unload, [mod_ping]),
     escalus:end_per_testcase(CN, Config);
 end_per_testcase(CaseName, Config) ->
     escalus:end_per_testcase(CaseName, Config).
+
+%% Module configuration per group (in case of stale_h group it is per testcase)
+
+required_modules(Scope, Name) ->
+    SMConfig = case required_sm_opts(Scope, Name) of
+                   stopped -> stopped;
+                   ExtraOpts -> maps:merge(common_sm_opts(), ExtraOpts)
+               end,
+    [{mod_stream_management, config_parser_helper:mod_config(mod_stream_management, SMConfig)}] ++
+        required_mod_offline(Scope, Name) ++ required_mod_ping(Scope, Name).
+
+required_mod_offline(group, parallel_large_buffer) ->
+    [{mod_offline_stub, #{}}];
+required_mod_offline(_, _) ->
+    Backend = mongoose_helper:mnesia_or_rdbms_backend(),
+    [{mod_offline, config_parser_helper:mod_config(mod_offline, #{backend => Backend})}].
+
+required_mod_ping(testcase, ping_timeout) ->
+    [{mod_ping, config_parser_helper:mod_config(mod_ping, mod_ping_opts())}];
+required_mod_ping(_, _) ->
+    [].
+
+required_sm_opts(group, parallel) ->
+    #{ack_freq => never};
+required_sm_opts(group, parallel_ws) ->
+    #{ack_freq => never};
+required_sm_opts(group, parallel_large_buffer) ->
+    #{ack_freq => never, buffer_max => 1000};
+required_sm_opts(group, parallel_manual_ack_freq_1) ->
+    #{ack_freq => 1,
+      resume_timeout => ?LONG_TIMEOUT};
+required_sm_opts(group, manual_ack_freq_2) ->
+    #{ack_freq => 2};
+required_sm_opts(group, stream_mgmt_disabled) ->
+    stopped;
+required_sm_opts(group, parallel_unacknowledged_message_hook) ->
+    #{ack_freq => 1};
+required_sm_opts(group, manual_ack_freq_long_session_timeout) ->
+    #{ack_freq => 1, buffer_max => 1000};
+required_sm_opts(group, resume_timeout) ->
+    #{ack_freq => 1, resume_timeout => ?SHORT_TIMEOUT};
+required_sm_opts(testcase, resume_expired_session_returns_correct_h) ->
+    #{ack_freq => 1,
+      resume_timeout => ?SHORT_TIMEOUT,
+      stale_h => stale_h(?LONG_TIMEOUT, ?LONG_TIMEOUT)};
+required_sm_opts(testcase, gc_repeat_after_never_means_no_cleaning) ->
+    #{stale_h => stale_h(?LONG_TIMEOUT, ?SHORT_TIMEOUT)};
+required_sm_opts(testcase, gc_repeat_after_timeout_does_clean) ->
+    #{stale_h => stale_h(?SHORT_TIMEOUT, ?SHORT_TIMEOUT)};
+required_sm_opts(testcase, ping_timeout) ->
+    #{ack_freq => 1,
+      resume_timeout => ?SHORT_TIMEOUT}.
+
+common_sm_opts() ->
+    Backend = ct_helper:get_internal_database(),
+    #{buffer_max => ?SMALL_SM_BUFFER, backend => Backend}.
+
+stale_h(RepeatAfter, Geriatric) ->
+    #{enabled => true,
+      repeat_after => RepeatAfter,
+      geriatric => Geriatric}.
+
+make_smid() ->
+    base64:encode(crypto:strong_rand_bytes(21)).
+
+register_smid(IntSmidId) ->
+    S = {SMID = make_smid(), IntSmidId},
+    ok = rpc(mim(), ?MOD_SM, register_stale_smid_h, [host_type(), SMID, IntSmidId]),
+    S.
+
+register_some_smid_h(Config) ->
+    TestSmids = lists:map(fun register_smid/1, lists:seq(1, 3)),
+    [{smid_test, TestSmids} | Config].
+
+mod_ping_opts() ->
+    #{send_pings => true,
+      ping_interval => ?PING_INTERVAL,
+      ping_req_timeout => ?PING_REQUEST_TIMEOUT,
+      timeout_action => kill}.
 
 %%--------------------------------------------------------------------
 %% Tests
 %%--------------------------------------------------------------------
 
 server_announces_sm(Config) ->
-    AliceSpec = escalus_fresh:freshen_spec(Config, alice),
-    {ok, #client{props = Props}, Features} = escalus_connection:start(AliceSpec,
+    UserSpec = escalus_fresh:freshen_spec(Config, ?config(user, Config)),
+    {ok, #client{props = Props}, Features} = escalus_connection:start(UserSpec,
                                                                       [start_stream]),
     true = escalus_session:can_use_stream_management(Props, Features).
 
 
 server_enables_sm_before_session(Config) ->
-    AliceSpec = escalus_fresh:create_fresh_user(Config, alice),
-    Steps = connection_steps_to_enable_stream_mgmt(after_bind),
-    {ok, _, _} = escalus_connection:start(AliceSpec, Steps).
+    connect_fresh(Config, ?config(user, Config), sm_after_bind).
 
 server_enables_sm_after_session(Config) ->
-    AliceSpec = escalus_fresh:create_fresh_user(Config, alice),
-    Steps = connection_steps_to_enable_stream_mgmt(after_session),
-    {ok, _, _} = escalus_connection:start(AliceSpec, Steps).
+    connect_fresh(Config, ?config(user, Config), sm_after_session).
 
 server_returns_failed_after_start(Config) ->
-    server_returns_failed(Config, []).
+    User = connect_fresh(Config, ?config(user, Config), before_auth),
+    server_returns_failed(User).
 
 server_returns_failed_after_auth(Config) ->
-    server_returns_failed(Config, [authenticate]).
+    User = connect_fresh(Config, ?config(user, Config), auth),
+    server_returns_failed(User).
 
 server_enables_resumption(Config) ->
-    AliceSpec = escalus_fresh:create_fresh_user(Config, alice),
-    %% Assert matches {ok, _, _, _}
-    Steps = connection_steps_to_enable_stream_resumption(),
-    {ok, Alice, _} = escalus_connection:start(AliceSpec, Steps),
-    escalus_connection:stop(Alice).
+    User = connect_fresh(Config, ?config(user, Config), sr_presence),
+    escalus_connection:stop(User).
 
-server_returns_failed(Config, ConnActions) ->
-    AliceSpec = escalus_fresh:create_fresh_user(Config, alice),
-    {ok, Alice, _} = escalus_connection:start(AliceSpec,
-                                                 [start_stream,
-                                                  stream_features,
-                                                  maybe_use_ssl]
-                                                 ++ ConnActions),
-    escalus_connection:send(Alice, escalus_stanza:enable_sm()),
+server_returns_failed(User) ->
+    escalus_connection:send(User, escalus_stanza:enable_sm()),
     escalus:assert(is_sm_failed, [<<"unexpected-request">>],
-                   escalus_connection:get_stanza(Alice, enable_sm_failed)).
+                   escalus_connection:get_stanza(User, enable_sm_failed)).
 
 client_enables_sm_twice_fails_with_correct_error_stanza(Config) ->
-    AliceSpec = escalus_fresh:create_fresh_user(Config, alice),
-    Steps = connection_steps_to_session(),
-    {ok, Alice, Features} = escalus_connection:start(AliceSpec, Steps),
-    escalus_session:stream_management(Alice, Features),
-    escalus_connection:send(Alice, escalus_stanza:enable_sm()),
+    User = connect_fresh(Config, ?config(user, Config), sm_before_session),
+    escalus_connection:send(User, escalus_stanza:enable_sm()),
     escalus:assert(is_sm_failed, [<<"unexpected-request">>],
-                   escalus_connection:get_stanza(Alice, enable_sm_failed)),
+                   escalus_connection:get_stanza(User, enable_sm_failed)),
     escalus:assert(is_stream_end,
-                   escalus_connection:get_stanza(Alice, enable_sm_failed)),
-    true = escalus_connection:wait_for_close(Alice,timer:seconds(5)).
+                   escalus_connection:get_stanza(User, enable_sm_failed)),
+    true = escalus_connection:wait_for_close(User, timer:seconds(5)).
 
 session_resumed_then_old_session_is_closed_gracefully_with_correct_error_stanza(Config) ->
     %% GIVEN USER WITH STREAM RESUMPTION ENABLED
-    {Alice, AliceSpec, SMID, SMH} =
-        get_stream_resumption_enabled_fresh_user_smid_and_h(Config, alice),
+    User = connect_fresh(Config, ?config(user, Config), sr_presence),
+    SMH = escalus_connection:get_sm_h(User),
     %% WHEN USER RESUMES SESSION FROM NEW CLIENT
-    Steps2 = connection_steps_to_stream_resumption(SMID, SMH),
-    {ok, Alice2, _} = escalus_connection:start(AliceSpec, Steps2),
-    process_initial_stanza(Alice2),
+    User2 = connect_resume(User, SMH),
+    process_initial_stanza(User2),
     %% THEN: Old session is gracefully closed with the correct error stanza
     escalus:assert(is_stream_error, [<<"conflict">>, <<>>],
-                   escalus_connection:get_stanza(Alice, close_old_stream)),
+                   escalus_connection:get_stanza(User, close_old_stream)),
     escalus:assert(is_stream_end,
-                   escalus_connection:get_stanza(Alice, close_old_stream)),
-    true = escalus_connection:wait_for_close(Alice,timer:seconds(5)),
-    true = escalus_connection:is_connected(Alice2),
-    escalus_connection:stop(Alice2).
+                   escalus_connection:get_stanza(User, close_old_stream)),
+    true = escalus_connection:wait_for_close(User, timer:seconds(5)),
+    true = escalus_connection:is_connected(User2),
+    escalus_connection:stop(User2).
 
 session_resumed_and_old_session_dead_doesnt_route_error_to_new_session(Config) ->
     %% GIVEN USER WITH STREAM RESUMPTION ENABLED
-    {Alice, AliceSpec, SMID, SMH} =
-        get_stream_resumption_enabled_fresh_user_smid_and_h(Config, alice),
+    User = connect_fresh(Config, ?config(user, Config), sr_presence),
     %% WHEN FIRST SESSION DIES AND USER RESUMES FROM NEW CLIENT
-    escalus_connection:kill(Alice),
-    Steps2 = connection_steps_to_stream_resumption(SMID, SMH),
-    {ok, Alice2, _} = escalus_connection:start(AliceSpec, Steps2),
-    process_initial_stanza(Alice2),
+    User2 = sm_helper:kill_and_connect_resume(User),
+    process_initial_stanza(User2),
     %% THEN new session does not have any message rerouted
-    false = escalus_client:has_stanzas(Alice2),
-    true = escalus_connection:is_connected(Alice2),
-    escalus_connection:stop(Alice2).
+    false = escalus_client:has_stanzas(User2),
+    true = escalus_connection:is_connected(User2),
+    escalus_connection:stop(User2).
 
 basic_ack(Config) ->
-    AliceSpec = escalus_fresh:create_fresh_user(Config, alice),
-    Steps = connection_steps_to_enable_stream_mgmt(after_session),
-    {ok, Alice, _} = escalus_connection:start(AliceSpec, Steps),
-    escalus_connection:send(Alice, escalus_stanza:roster_get()),
+    User = connect_fresh(Config, ?config(user, Config), sm_after_session),
+    escalus_connection:send(User, escalus_stanza:roster_get()),
     escalus:assert(is_roster_result,
-                   escalus_connection:get_stanza(Alice, roster_result)),
-    escalus_connection:send(Alice, escalus_stanza:sm_request()),
+                   escalus_connection:get_stanza(User, roster_result)),
+    escalus_connection:send(User, escalus_stanza:sm_request()),
     escalus:assert(is_sm_ack,
-                   escalus_connection:get_stanza(Alice, stream_mgmt_ack)).
+                   escalus_connection:get_stanza(User, stream_mgmt_ack)).
 
 %% Test that "h" value is valid when:
 %% - SM is enabled *before* the session is established
 %% - <r/> is sent *before* the session is established
 h_ok_before_session(Config) ->
-    AliceSpec = escalus_fresh:create_fresh_user(Config, alice),
-    Steps = connection_steps_to_enable_stream_mgmt(after_bind),
-    {ok, Alice, _} = escalus_connection:start(AliceSpec, Steps),
-    escalus_connection:send(Alice, escalus_stanza:sm_request()),
-    escalus:assert(is_sm_ack, [0],
-                   escalus_connection:get_stanza(Alice, stream_mgmt_ack)).
+    User = connect_fresh(Config, ?config(user, Config), sm_after_bind),
+    assert_h(User, 0).
 
 %% Test that "h" value is valid when:
 %% - SM is enabled *before* the session is established
 %% - <r/> is sent *after* the session is established
 h_ok_after_session_enabled_before_session(Config) ->
-    AliceSpec = escalus_fresh:create_fresh_user(Config, alice),
-    Steps = connection_steps_to_enable_stream_mgmt(after_bind) ++ [session],
-    {ok, Alice, _} = escalus_connection:start(AliceSpec, Steps),
-    escalus_connection:send(Alice, escalus_stanza:sm_request()),
-    escalus:assert(is_sm_ack, [1],
-                   escalus_connection:get_stanza(Alice, stream_mgmt_ack)).
+    User = connect_fresh(Config, ?config(user, Config), sm_before_session),
+    assert_h(User, 1).
 
 %% Test that "h" value is valid when:
 %% - SM is enabled *after* the session is established
 %% - <r/> is sent *after* the session is established
 h_ok_after_session_enabled_after_session(Config) ->
-    AliceSpec = escalus_fresh:create_fresh_user(Config, alice),
-    Steps = connection_steps_to_enable_stream_mgmt(after_session),
-    {ok, Alice, _} = escalus_connection:start(AliceSpec, Steps),
-    escalus_connection:send(Alice, escalus_stanza:roster_get()),
+    User = connect_fresh(Config, ?config(user, Config), sm_after_session),
+    escalus_connection:send(User, escalus_stanza:roster_get()),
     escalus:assert(is_roster_result,
-                   escalus_connection:get_stanza(Alice, roster_result)),
-    escalus_connection:send(Alice, escalus_stanza:sm_request()),
-    escalus:assert(is_sm_ack, [1],
-                   escalus_connection:get_stanza(Alice, stream_mgmt_ack)).
+                   escalus_connection:get_stanza(User, roster_result)),
+    assert_h(User, 1).
 
 %% Test that "h" value is valid after exchanging a few messages.
 h_ok_after_a_chat(ConfigIn) ->
-    Config = escalus_users:update_userspec(ConfigIn, alice,
+    Config = escalus_users:update_userspec(ConfigIn, ?config(user, ConfigIn),
                                            stream_management, true),
-    escalus:fresh_story(Config, [{alice,1}, {bob,1}], fun(Alice, Bob) ->
-        NDiscarded = discard_vcard_update(Alice),
-        escalus:send(Alice, escalus_stanza:chat_to(Bob, <<"Hi, Bob!">>)),
+    escalus:fresh_story(Config, [{?config(user, Config), 1}, {bob,1}], fun(User, Bob) ->
+        assert_h(User, 1),
+        escalus:send(User, escalus_stanza:chat_to(Bob, <<"Hi, Bob!">>)),
         escalus:assert(is_chat_message, [<<"Hi, Bob!">>],
                        escalus:wait_for_stanza(Bob)),
-        escalus:send(Bob, escalus_stanza:chat_to(Alice, <<"Hi, Alice!">>)),
-        escalus:assert(is_chat_message, [<<"Hi, Alice!">>],
-                       escalus:wait_for_stanza(Alice)),
-        escalus:send(Bob, escalus_stanza:chat_to(Alice, <<"How's life?">>)),
+        escalus:send(Bob, escalus_stanza:chat_to(User, <<"Hi, User!">>)),
+        escalus:assert(is_chat_message, [<<"Hi, User!">>],
+                       escalus:wait_for_stanza(User)),
+        escalus:send(Bob, escalus_stanza:chat_to(User, <<"How's life?">>)),
         escalus:assert(is_chat_message, [<<"How's life?">>],
-                       escalus:wait_for_stanza(Alice)),
-        escalus:send(Alice, escalus_stanza:chat_to(Bob, <<"Pretty !@#$%^$">>)),
+                       escalus:wait_for_stanza(User)),
+        escalus:send(User, escalus_stanza:chat_to(Bob, <<"Pretty !@#$%^$">>)),
         escalus:assert(is_chat_message, [<<"Pretty !@#$%^$">>],
                        escalus:wait_for_stanza(Bob)),
-        escalus:send(Alice, escalus_stanza:sm_request()),
-        escalus:assert(is_sm_ack, [3], escalus:wait_for_stanza(Alice)),
+        assert_h(User, 3),
         %% Ack, so that unacked messages don't go into offline store.
-        escalus:send(Alice, escalus_stanza:sm_ack(3 + NDiscarded))
+        escalus:send(User, escalus_stanza:sm_ack(3))
     end).
+
+h_ok_after_presence(Config) ->
+    User = connect_fresh(Config, ?config(user, Config), sm_before_session),
+    assert_h(User, 1),
+    Presence = escalus_stanza:presence(<<"available">>),
+    escalus:send(User, Presence),
+    escalus:assert(is_presence, escalus:wait_for_stanza(User)),
+    assert_h(User, 2),
+    escalus:send(User, Presence),
+    escalus:assert(is_presence, escalus:wait_for_stanza(User)),
+    assert_h(User, 3).
+
+h_ok_after_iq(Config) ->
+    User = connect_fresh(Config, ?config(user, Config), sm_before_session),
+    assert_h(User, 1),
+    Iq = escalus_stanza:iq_get(<<"invalid_ns">>, []),
+    escalus_client:send(User, Iq),
+    escalus:assert(is_iq_error, escalus:wait_for_stanza(User)),
+    assert_h(User, 2),
+    escalus_client:send(User, Iq),
+    escalus:assert(is_iq_error, escalus:wait_for_stanza(User)),
+    assert_h(User, 3).
+
+h_ok_after_non_xmpp_stanza(Config) ->
+    User = connect_fresh(Config, ?config(user, Config), sm_before_session),
+    assert_h(User, 1),
+    %% SM stanzas are not counted
+    assert_h(User, 1),
+    %% CSI stanzas are not counted
+    CsiActive = csi_helper:csi_stanza(<<"active">>),
+    escalus_client:send(User, CsiActive),
+    assert_h(User, 1),
+    %% any non-xmpp stanza is not counted
+    Stanza =  #xmlel{name = <<"dummy_stanza">>},
+    escalus_client:send(User, Stanza),
+    assert_h(User, 1).
 
 h_non_given_closes_stream_gracefully(ConfigIn) ->
     AStanza = #xmlel{name = <<"a">>,
-               attrs = [{<<"xmlns">>, <<"urn:xmpp:sm:3">>}]},
-    Config = escalus_users:update_userspec(ConfigIn, alice,
+                     attrs = #{<<"xmlns">> => <<"urn:xmpp:sm:3">>}},
+    Config = escalus_users:update_userspec(ConfigIn, ?config(user, ConfigIn),
                                            stream_management, true),
-    escalus:fresh_story(Config, [{alice,1}], fun(Alice) ->
-        C2SPid = mongoose_helper:get_session_pid(Alice, mim()),
-        escalus:send(Alice, AStanza),
+    escalus:fresh_story(Config, [{?config(user, Config), 1}], fun(User) ->
+        C2SPid = mongoose_helper:get_session_pid(User),
+        escalus:send(User, AStanza),
         escalus:assert(is_stream_error,
                        [<<"policy-violation">>, <<>>],
-                       escalus:wait_for_stanza(Alice)),
+                       escalus:wait_for_stanza(User)),
         mongoose_helper:wait_for_pid_to_die(C2SPid),
-        escalus:assert(is_stream_end, escalus_connection:get_stanza(Alice, stream_end)),
-        true = escalus_connection:wait_for_close(Alice,timer:seconds(5))
+        escalus:assert(is_stream_end, escalus_connection:get_stanza(User, stream_end)),
+        true = escalus_connection:wait_for_close(User, timer:seconds(5))
     end).
 
 client_acks_more_than_sent(Config) ->
-    AliceSpec = escalus_fresh:create_fresh_user(Config, alice),
-    {ok, Alice, _} = escalus_connection:start(AliceSpec),
-    escalus:send(Alice, escalus_stanza:sm_ack(5)),
-    StreamErrorStanza = escalus:wait_for_stanza(Alice),
+    User = connect_fresh(Config, ?config(user, Config), sm_after_session),
+    escalus:send(User, escalus_stanza:sm_ack(5)),
+    StreamErrorStanza = escalus:wait_for_stanza(User),
     %% Assert "undefined-condition" children
     escalus:assert(is_stream_error, [<<"undefined-condition">>, <<>>], StreamErrorStanza),
     %% Assert "handled-count-too-high" children with correct attributes
@@ -414,652 +515,877 @@ client_acks_more_than_sent(Config) ->
     <<"5">> = exml_query:attr(HandledCountSubElement, <<"h">>),
     <<"0">> = exml_query:attr(HandledCountSubElement, <<"send-count">>),
     %% Assert graceful stream end
-    escalus:assert(is_stream_end, escalus_connection:get_stanza(Alice, stream_end)),
-    true = escalus_connection:wait_for_close(Alice,timer:seconds(5)).
+    escalus:assert(is_stream_end, escalus_connection:get_stanza(User, stream_end)),
+    true = escalus_connection:wait_for_close(User, timer:seconds(5)).
 
 too_many_unacked_stanzas(Config) ->
-    {Bob, _} = given_fresh_user(Config, bob),
-    {Alice, _} = given_fresh_user(Config, alice),
-    escalus:wait_for_stanza(Alice), %% wait for ack request
-    [escalus:send(Bob, escalus_stanza:chat_to(Alice,
-        <<(integer_to_binary(N))/binary, ": Hi, Alice!">>))
+    Bob = connect_fresh(Config, bob, presence),
+    User = connect_fresh(Config, ?config(user, Config), sm_presence, manual),
+    get_ack(User),
+    [escalus:send(Bob, escalus_stanza:chat_to(User,
+        <<(integer_to_binary(N))/binary, ": Hi, User!">>))
      || N <- lists:seq(1,?SMALL_SM_BUFFER)],
-    escalus:wait_for_stanzas(Alice, ?SMALL_SM_BUFFER * 2), % messages and ack requests
+    escalus:wait_for_stanzas(User, ?SMALL_SM_BUFFER * 2), % messages and ack requests
     escalus:assert(is_stream_error, [<<"resource-constraint">>,
                                      <<"too many unacked stanzas">>],
-                   %% wait for deffered buffer check
-                   escalus:wait_for_stanza(Alice, ?CONSTRAINT_CHECK_TIMEOUT + 1000)).
+                   %% wait for deferred buffer check
+                   escalus:wait_for_stanza(User, ?CONSTRAINT_CHECK_TIMEOUT + 1000)).
 
 server_requests_ack(Config) ->
     server_requests_ack(Config, 1).
 
-server_requests_ack(Config, N) ->
-    {Bob, _} = given_fresh_user(Config, bob),
-    {Alice, _} = given_fresh_user(Config, alice),
-    %% ack request after initial presence
-    maybe_assert_ack_request(1, N, Alice),
-    StanzasRec = maybe_discard_vcard_update(1, N, Alice),
-    ct:print("discarded"),
-    escalus:send(Bob, escalus_stanza:chat_to(Alice, <<"Hi, Alice!">>)),
-    escalus:assert(is_chat_message, [<<"Hi, Alice!">>],
-                   escalus:wait_for_stanza(Alice)),
-    maybe_assert_ack_request(StanzasRec + 1, N, Alice).
+server_requests_ack_freq_2(Config) ->
+    server_requests_ack(Config, 2).
 
-maybe_assert_ack_request(StanzasRec, AckRequests, Alice) ->
-    ct:print("StanzasRec: ~p, AckRequests: ~p", [StanzasRec, AckRequests]),
+server_requests_ack(Config, N) ->
+    Bob = connect_fresh(Config, bob, presence),
+    User = connect_fresh(Config, ?config(user, Config), sm_presence, manual),
+    %% ack request after initial presence
+    maybe_assert_ack_request(1, N, User),
+    escalus:send(Bob, escalus_stanza:chat_to(User, <<"Hi, User!">>)),
+    escalus:assert(is_chat_message, [<<"Hi, User!">>],
+                   escalus:wait_for_stanza(User)),
+    maybe_assert_ack_request(2, N, User).
+
+maybe_assert_ack_request(StanzasRec, AckRequests, User) ->
+    ct:log("StanzasRec: ~p, AckRequests: ~p", [StanzasRec, AckRequests]),
     case StanzasRec rem AckRequests of
         0 ->
-            escalus:assert(is_sm_ack_request, escalus:wait_for_stanza(Alice));
+            escalus:assert(is_sm_ack_request, escalus:wait_for_stanza(User));
         _ ->
             ok
     end,
     StanzasRec.
 
-maybe_discard_vcard_update(StanzasRec, AckFreq, Alice) ->
-    case discard_vcard_update(Alice) of
-        0 ->
-            StanzasRec;
-        1 ->
-            maybe_assert_ack_request(StanzasRec + 1, AckFreq, Alice)
-    end.
-
-server_requests_ack_freq_2(Config) ->
-    Config1 = escalus_users:update_userspec(Config, alice, manual_ack, true),
-    server_requests_ack(Config1, 2).
-
 server_requests_ack_after_session(Config) ->
-    AliceSpec = escalus_fresh:create_fresh_user(Config, alice),
-    Steps = connection_steps_to_enable_stream_mgmt(after_bind) ++ [session],
-    {ok, Alice, _} = escalus_connection:start(AliceSpec, Steps),
-    escalus:assert(is_sm_ack_request, escalus_connection:get_stanza(Alice, stream_mgmt_req)).
-
+    User = connect_fresh(Config, ?config(user, Config), sm_before_session, manual),
+    escalus:assert(is_sm_ack_request, escalus_connection:get_stanza(User, stream_mgmt_req)).
 
 resend_more_offline_messages_than_buffer_size(Config) ->
-    ConnSteps = connection_steps_to_session(),
-
-    %% connect bob and alice
-    BobSpec = escalus_fresh:create_fresh_user(Config, bob),
-    {ok, Bob, _} = escalus_connection:start(BobSpec),
-    escalus_connection:send(Bob, escalus_stanza:presence(<<"available">>)),
-    escalus_connection:get_stanza(Bob, presence),
-    AliceSpec = escalus_fresh:create_fresh_user(Config, alice),
+    %% connect bob and user
+    Bob = connect_fresh(Config, bob, presence),
+    UserSpec = escalus_fresh:create_fresh_user(Config, ?config(user, Config)),
 
     % sent some messages - more than unacked buffer size
     MessagesToSend = ?SMALL_SM_BUFFER + 1,
-    JID = common_helper:get_bjid(AliceSpec),
-    [escalus_connection:send(Bob, escalus_stanza:chat_to(JID, integer_to_binary(I)))
+    UserJid = common_helper:get_bjid(UserSpec),
+    [escalus_connection:send(Bob, escalus_stanza:chat_to(UserJid, integer_to_binary(I)))
      || I <- lists:seq(1, MessagesToSend)],
+    mongoose_helper:wait_for_n_offline_messages(UserJid, MessagesToSend),
 
-    % connect alice who wants to receive all messages from offline storage
-    {ok, Alice, _} = escalus_connection:start(AliceSpec, ConnSteps++[stream_management]),
-    escalus_connection:send(Alice, escalus_stanza:presence(<<"available">>)),
+    % connect user who wants to receive all messages from offline storage
+    User = connect_spec(UserSpec, sm_after_session, manual),
+    send_initial_presence(User),
+    escalus:wait_for_stanzas(User, MessagesToSend * 2), %messages and ack requests
 
-    escalus:wait_for_stanzas(Alice, MessagesToSend * 2), %messages and ack requests
-
-    escalus_connection:get_stanza(Alice, presence),
-    escalus:wait_for_stanza(Alice), % ack request
+    escalus_connection:get_stanza(User, presence),
+    get_ack(User), % ack request
 
     % confirm messages + presence
-    escalus_connection:send(Alice, escalus_stanza:sm_ack(4)),
+    escalus_connection:send(User, escalus_stanza:sm_ack(4)),
     % wait for check constraint message on server side
 
     ct:sleep(?CONSTRAINT_CHECK_TIMEOUT + 1000),
-    false = escalus_client:has_stanzas(Alice),
+    false = escalus_client:has_stanzas(User),
     % should not receive anything especially any stream errors
 
-    escalus_connection:stop(Alice),
+    escalus_connection:stop(User),
     escalus_connection:stop(Bob).
 
+%% Test cases for duplicate buffer
+
+-define(USER_NUM, 4).
+
+resend_unacked_from_stopped_sessions(Config) ->
+    Texts = [<<"msg-1">>],
+    {Bob, UserSpecs, Users} = connect_initial_users(Config),
+
+    %% Bob sends messages to User's bare jid
+    UserJid = escalus_users:get_jid(Config, hd(UserSpecs)),
+    sm_helper:send_messages(Bob, UserJid, Texts),
+    C2SPids = lists:map(fun mongoose_helper:get_session_pid/1, Users),
+    [sm_helper:wait_for_c2s_unacked_count(Pid, length(Texts)) || Pid <- C2SPids],
+
+    %% Each User's session checks messages and stops, rerouting unacked messages to online sessions.
+    %% This is why there is one extra copy of each message received in each subsequent iteration.
+    lists:foreach(fun({N, User}) ->
+                          DuplicatedTexts = lists:append(lists:duplicate(N, Texts)),
+                          receive_unacked_messages(User, DuplicatedTexts),
+                          escalus_connection:stop(User)
+                  end, lists:enumerate(Users)),
+    escalus_connection:stop(Bob).
+
+resend_unacked_from_terminated_sessions(Config) ->
+    Texts = [<<"msg-1">>],
+    {Bob, UserSpecs, Users} = connect_initial_users(Config),
+
+    %% User disconnects all sessions abruptly
+    lists:foreach(fun escalus_connection:kill/1, Users),
+    C2SPids = lists:map(fun mongoose_helper:get_session_pid/1, Users),
+    lists:foreach(fun sm_helper:wait_until_resume_session/1, C2SPids),
+
+    %% Bob sends messages to User's bare jid
+    UserJid = escalus_users:get_jid(Config, hd(UserSpecs)),
+    sm_helper:send_messages(Bob, UserJid, Texts),
+    [sm_helper:wait_for_c2s_unacked_count(Pid, length(Texts)) || Pid <- C2SPids],
+
+    %% User replaces each terminated session with a new one,
+    %% rerouting unacked messages to the new session
+    lists:foreach(fun(UserSpec) ->
+                          NewUser = connect_spec(UserSpec, session),
+                          receive_unacked_messages(NewUser, Texts),
+                          escalus_connection:stop(NewUser)
+                  end, UserSpecs),
+    escalus_connection:stop(Bob).
+
+resend_unacked_from_replaced_sessions(Config) ->
+    Texts = [<<"msg-1">>],
+    {Bob, UserSpecs, Users} = connect_initial_users(Config),
+
+    %% Bob sends messages to User's bare jid
+    UserJid = escalus_users:get_jid(Config, hd(UserSpecs)),
+    sm_helper:send_messages(Bob, UserJid, Texts),
+    C2SPids = lists:map(fun mongoose_helper:get_session_pid/1, Users),
+    [sm_helper:wait_for_c2s_unacked_count(Pid, length(Texts)) || Pid <- C2SPids],
+
+    %% User replaces each online session with a new one,
+    %% rerouting unacked messages to the new session
+    lists:foreach(fun(UserSpec) ->
+                          NewUser = connect_spec(UserSpec, session),
+                          receive_unacked_messages(NewUser, Texts),
+                          escalus_connection:stop(NewUser)
+                  end, UserSpecs),
+    escalus_connection:stop(Bob).
+
+connect_initial_users(Config) ->
+    Resources = [<<"res-", (integer_to_binary(I))/binary>> || I <- lists:seq(1, ?USER_NUM)],
+    Bob = connect_fresh(Config, bob, session),
+    BasicUserSpec = escalus_fresh:create_fresh_user(Config, ?config(user, Config)),
+    UserSpecs = [[{resource, Res} | BasicUserSpec] || Res <- Resources],
+    Users = [connect_spec(Spec, sm_after_session) || Spec <- UserSpecs],
+    {Bob, UserSpecs, Users}.
+
+relay_unacked_from_stopped_sessions(Config) ->
+    Texts = [<<"msg-1">>],
+    Resources = [<<"res-", (integer_to_binary(I))/binary>> || I <- lists:seq(1, ?USER_NUM)],
+    Bob = connect_fresh(Config, bob, session),
+    BasicUserSpec = escalus_fresh:create_fresh_user(Config, ?config(user, Config)),
+    UserSpecs = [[{resource, Res} | BasicUserSpec] || Res <- Resources],
+    FirstUser = connect_spec(hd(UserSpecs), sm_after_session),
+
+    %% Bob sends messages to User's bare jid
+    UserJid = escalus_users:get_jid(Config, hd(UserSpecs)),
+    sm_helper:send_messages(Bob, UserJid, Texts),
+
+    %% Each User's session resends unacked messages to the next one
+    RelayF = fun(NextSpec, CurUser) ->
+                     receive_unacked_messages(CurUser, Texts),
+                     NewUser = connect_spec(NextSpec, sm_before_session),
+                     escalus_connection:stop(CurUser),
+                     NewUser
+             end,
+    LastUser = lists:foldl(RelayF, FirstUser, tl(UserSpecs)),
+    escalus_connection:stop(LastUser),
+    escalus_connection:stop(Bob).
+
+relay_unacked_from_terminated_sessions(Config) ->
+    Texts = [<<"msg-1">>],
+    Bob = connect_fresh(Config, bob, session),
+    UserSpec = escalus_fresh:create_fresh_user(Config, ?config(user, Config)),
+    FirstUser = connect_spec(UserSpec, sm_after_session),
+
+    %% Bob sends messages to User's bare jid
+    UserJid = escalus_users:get_jid(Config, UserSpec),
+    sm_helper:send_messages(Bob, UserJid, Texts),
+
+    %% Each User's session resends unacked messages to the next one
+    RelayF = fun(NextSpec, CurUser) ->
+                     receive_unacked_messages(CurUser, Texts),
+                     escalus_connection:kill(CurUser),
+                     C2SPid = mongoose_helper:get_session_pid(CurUser),
+                     sm_helper:wait_until_resume_session(C2SPid),
+                     connect_spec(NextSpec, sm_before_session)
+             end,
+    LastUser = lists:foldl(RelayF, FirstUser, lists:duplicate(?USER_NUM - 1, UserSpec)),
+    escalus_connection:stop(LastUser),
+    escalus_connection:stop(Bob).
+
+relay_unacked_from_replaced_sessions(Config) ->
+    Texts = [<<"msg-1">>],
+    Bob = connect_fresh(Config, bob, session),
+    UserSpec = escalus_fresh:create_fresh_user(Config, ?config(user, Config)),
+    FirstUser = connect_spec(UserSpec, sm_after_session),
+
+    %% Bob sends messages to User's bare jid
+    UserJid = escalus_users:get_jid(Config, UserSpec),
+    sm_helper:send_messages(Bob, UserJid, Texts),
+
+    %% Each User's session resends unacked messages to the next one
+    RelayF = fun(NextSpec, CurUser) ->
+                     receive_unacked_messages(CurUser, Texts),
+                     connect_spec(NextSpec, sm_before_session)
+             end,
+    LastUser = lists:foldl(RelayF, FirstUser, lists:duplicate(?USER_NUM - 1, UserSpec)),
+    escalus_connection:stop(LastUser),
+    escalus_connection:stop(Bob).
+
+%% Receive expected messages and wait a bit to ensure no extra messages arrive
+receive_unacked_messages(User, Texts) ->
+    sm_helper:wait_for_messages(User, Texts),
+    timer:sleep(100),
+    escalus_assert:has_no_stanzas(User).
+
 resend_unacked_on_reconnection(Config) ->
-    Messages = [<<"msg-1">>, <<"msg-2">>, <<"msg-3">>],
-    {Bob, _} = given_fresh_user(Config, bob),
-    {Alice, AliceSpec0} = given_fresh_user(Config, alice),
-    discard_vcard_update(Alice),
-    %% Bob sends some messages to Alice.
-    [escalus:send(Bob, escalus_stanza:chat_to(Alice, Msg))
-     || Msg <- Messages],
-    %% Alice receives the messages.
-    Stanzas = escalus:wait_for_stanzas(Alice, length(Messages)),
-    [escalus:assert(is_chat_message, [Msg], Stanza)
-     || {Msg, Stanza} <- lists:zip(Messages, Stanzas)],
-    %% Alice disconnects without acking the messages.
-    C2SRef = monitor_session(Alice),
-    escalus_connection:stop(Alice),
-    %% TODO There's a race condition between the C2S process and mod_offline,
-    %% so we have to wait for C2S termination.
-    %% For details please see https://github.com/esl/MongooseIM/pull/2007
-    ok = wait_for_process_termination(C2SRef),
-    escalus_connection:stop(Bob),
+    Texts = three_texts(),
+    Bob = connect_fresh(Config, bob, presence),
+    User = connect_fresh(Config, ?config(user, Config), sm_presence),
+    UserSpec = sm_helper:client_to_spec0(User),
+    %% Bob sends some messages to User.
+    sm_helper:send_messages(Bob, User, Texts),
+    %% User receives the messages.
+    sm_helper:wait_for_messages(User, Texts),
+    %% User disconnects ending stream gracefully, but without acking the messages.
+    sm_helper:stop_client_and_wait_for_termination(User),
     %% Messages go to the offline store.
-    %% Alice receives the messages from the offline store.
-    AliceSpec = [{manual_ack, true} | AliceSpec0],
-    {ok, NewAlice, _} = escalus_connection:start(AliceSpec),
-    escalus_connection:send(NewAlice, escalus_stanza:presence(<<"available">>)),
-    OfflineMsgs = [escalus_connection:get_stanza(NewAlice, {msg, I})
-                   || I <- lists:seq(1, length(Messages))],
-    [escalus:assert(is_chat_message, [Msg], Stanza)
-     || {Msg, Stanza} <- lists:zip(Messages, OfflineMsgs)],
-    %% Alice acks the delayed messages so they won't go again
+    %% User receives the messages from the offline store.
+    NewUser = connect_spec(UserSpec, session, manual),
+    send_initial_presence(NewUser),
+    sm_helper:wait_for_delayed_messages(NewUser, Texts),
+    %% User acks the delayed messages so they won't go again
     %% to the offline store.
-    escalus_connection:send(NewAlice, escalus_stanza:sm_ack(3)).
+    escalus_connection:send(NewUser, escalus_stanza:sm_ack(3)),
+    % user receives initial presence response
+    P = escalus:wait_for_stanza(NewUser),
+    escalus:assert(is_presence, P),
+    escalus_connection:stop(NewUser).
 
+%% Remove wait_for_n_offline_messages and you will get anything, but preserve_order
+%% TODO Test without wait_for_n_offline_messages. It would require changes in SM
+%%      and more strict tests, reproducing delays in SM and in mod_offline.
 preserve_order(Config) ->
-    ConnSteps = connection_steps_to_session(),
+    %% connect bob and user
+    Bob = connect_fresh(Config, bob, presence),
+    User = connect_fresh(Config, ?config(user, Config), sr_presence, manual),
+    UserSpec = sm_helper:client_to_spec(User),
+    escalus_connection:send(Bob, escalus_stanza:chat_to_short_jid(User, <<"1">>)),
 
-    %% connect bob and alice
-    BobSpec = escalus_fresh:create_fresh_user(Config, bob),
-    {ok, Bob, _} = escalus_connection:start(BobSpec),
-    escalus_connection:send(Bob, escalus_stanza:presence(<<"available">>)),
-    escalus_connection:get_stanza(Bob, presence),
+    %% kill user connection
+    escalus_connection:kill(User),
+    C2SPid = mongoose_helper:get_session_pid(User),
+    sm_helper:wait_until_resume_session(C2SPid),
 
-    AliceSpec = escalus_fresh:create_fresh_user(Config, alice),
-    {ok, Alice, _} = escalus_connection:start(AliceSpec, ConnSteps++[stream_resumption]),
-    escalus_connection:send(Alice, escalus_stanza:presence(<<"available">>)),
-    escalus_connection:get_stanza(Alice, presence),
+    escalus_connection:send(Bob, escalus_stanza:chat_to_short_jid(User, <<"2">>)),
+    escalus_connection:send(Bob, escalus_stanza:chat_to_short_jid(User, <<"3">>)),
 
-    escalus:assert(is_sm_ack_request, escalus_connection:get_stanza(Alice, ack)),
-    escalus_connection:send(Bob, escalus_stanza:chat_to(common_helper:get_bjid(AliceSpec), <<"1">>)),
+    NewUser = connect_spec(UserSpec, session, manual),
+    escalus_connection:send(NewUser, escalus_stanza:enable_sm([resume])),
 
-    %% kill alice connection
-    escalus_connection:kill(Alice),
-    wait_until_disconnected(AliceSpec),
+    escalus_connection:send(Bob, escalus_stanza:chat_to_short_jid(User, <<"4">>)),
+    escalus_connection:send(Bob, escalus_stanza:chat_to_short_jid(User, <<"5">>)),
 
-    escalus_connection:send(Bob, escalus_stanza:chat_to(common_helper:get_bjid(AliceSpec), <<"2">>)),
-    escalus_connection:send(Bob, escalus_stanza:chat_to(common_helper:get_bjid(AliceSpec), <<"3">>)),
+    %% Without this check we will get stuff out of order
+    mongoose_helper:wait_for_n_offline_messages(NewUser, 5),
 
-    {ok, NewAlice, _} = escalus_connection:start(AliceSpec, ConnSteps),
-    escalus_connection:send(NewAlice, escalus_stanza:enable_sm([resume])),
+    send_initial_presence(NewUser),
+    %% Without this check we can get "6, 1, 2, 3, 4, 5" messages in the next receive_all_ordered
+    mongoose_helper:wait_for_n_offline_messages(NewUser, 0),
+    escalus_connection:send(Bob, escalus_stanza:chat_to_short_jid(User, <<"6">>)),
 
-    escalus_connection:send(Bob, escalus_stanza:chat_to(common_helper:get_bjid(AliceSpec), <<"4">>)),
-    escalus_connection:send(Bob, escalus_stanza:chat_to(common_helper:get_bjid(AliceSpec), <<"5">>)),
-
-    escalus_connection:send(NewAlice, escalus_stanza:presence(<<"available">>)),
-    escalus_connection:send(Bob, escalus_stanza:chat_to(common_helper:get_bjid(AliceSpec), <<"6">>)),
-
-    receive_all_ordered(NewAlice,1),
+    %% "2, 3, 4, 5, 6, 1" is possible (where only 1 is from offline storage, the rest is from sm)
+    receive_all_ordered(NewUser, 6),
 
     % replace connection
-    {ok, NewAlice2, _} = escalus_connection:start(AliceSpec, ConnSteps),
+    NewUser2 = connect_spec(UserSpec, session, manual),
     % allow messages to go to the offline storage
-    ct:sleep(1000),
+    mongoose_helper:wait_for_n_offline_messages(NewUser, 6),
 
-    escalus_connection:send(NewAlice2, escalus_stanza:presence(<<"available">>)),
+    send_initial_presence(NewUser2),
 
     % receves messages in correct order
-    receive_all_ordered(NewAlice2, 1),
+    receive_all_ordered(NewUser2, 6),
 
     escalus_connection:stop(Bob),
-    escalus_connection:stop(NewAlice2).
+    escalus_connection:stop(NewUser2).
 
-receive_all_ordered(Conn, N) ->
-    case catch escalus_connection:get_stanza(Conn, msg) of
-        #xmlel{} = Stanza ->
-            NN = case Stanza#xmlel.name of
-                     <<"message">> ->
-                         %ct:pal("~p~n", [Stanza]),
-                         escalus:assert(is_chat_message, [integer_to_binary(N)], Stanza),
-                         N + 1;
-                     _ ->
-                         N
-                 end,
-            receive_all_ordered(Conn, NN);
-        _Error ->
-            ok
+receive_all_ordered(Conn, Last) ->
+    receive_all_ordered(Conn, 1, Last, []).
+
+%% Receive messages from N to Last.
+%% Ignores acks and presences.
+%% Handles case when out of order and when not enough stanzas.
+receive_all_ordered(_Conn, N, Last, Acc) when N > Last ->
+    Texts = lists:map(fun integer_to_binary/1, lists:seq(1, Last)),
+    sm_helper:assert_messages(Acc, Texts);
+receive_all_ordered(Conn, N, Last, Acc) ->
+    Stanzas = escalus:wait_for_stanzas(Conn, 1),
+    case Stanzas of
+        [#xmlel{name = <<"message">>}] ->
+            receive_all_ordered(Conn, N + 1, Last, Acc ++ Stanzas);
+        [_] -> %% Ack or presence
+            receive_all_ordered(Conn, N, Last, Acc);
+        [] ->
+            ct:fail({timeout_waiting, N, Acc})
     end.
 
 resend_unacked_after_resume_timeout(Config) ->
-    ConnSteps = connection_steps_to_session(),
+    %% connect bob and user
+    Bob = connect_fresh(Config, bob, presence),
+    User = connect_fresh(Config, ?config(user, Config), sr_presence),
+    UserSpec = sm_helper:client_to_spec(User),
 
-    %% connect bob and alice
-    BobSpec = escalus_fresh:create_fresh_user(Config, bob),
-    {ok, Bob, _} = escalus_connection:start(BobSpec),
-    escalus_connection:send(Bob, escalus_stanza:presence(<<"available">>)),
-    escalus_connection:get_stanza(Bob, presence),
-
-    AliceSpec = escalus_fresh:create_fresh_user(Config, alice),
-    {ok, Alice, _} = escalus_connection:start(AliceSpec, ConnSteps++[stream_resumption]),
-    escalus_connection:send(Alice, escalus_stanza:presence(<<"available">>)),
-    escalus_connection:get_stanza(Alice, presence),
-
-    escalus:assert(is_sm_ack_request, escalus_connection:get_stanza(Alice, ack)),
-
-    escalus_connection:send(Bob, escalus_stanza:chat_to(common_helper:get_bjid(AliceSpec), <<"msg-1">>)),
-    %% kill alice connection
-    escalus_connection:kill(Alice),
+    escalus_connection:send(Bob, escalus_stanza:chat_to(User, <<"msg-1">>)),
+    %% kill user connection
+    escalus_connection:kill(User),
 
     %% ensure there is no session
-    wait_until_disconnected(AliceSpec),
-    0 = length(get_user_alive_resources(AliceSpec)),
+    C2SPid = mongoose_helper:get_session_pid(User),
+    sm_helper:wait_until_resume_session(C2SPid),
 
-    %% alice come back and receives unacked message
-    {ok, NewAlice, _} = escalus_connection:start(AliceSpec, ConnSteps),
-    escalus_connection:send(NewAlice, escalus_stanza:presence(<<"available">>)),
+    %% user comes back
+    NewUser = connect_spec(UserSpec, session),
+    send_initial_presence(NewUser),
 
-    Stanzas =[escalus_connection:get_stanza(NewAlice, msg),
-              escalus_connection:get_stanza(NewAlice, msg)],
+    %% resume timeout passes
+    timer:sleep(timer:seconds(?SHORT_TIMEOUT + 1)),
 
-    escalus_new_assert:mix_match([is_presence,
-                                  is_chat(<<"msg-1">>)],
-                                 Stanzas),
+    %% user receives unacked message and initial presence
+    UnackedStanzas = escalus:wait_for_stanzas(NewUser, 2),
+    escalus_new_assert:mix_match([is_presence, is_chat(<<"msg-1">>)],
+                                 UnackedStanzas),
+    [UnackedMsg] = lists:filter(fun escalus_pred:is_message/1, UnackedStanzas),
+    sm_helper:assert_delayed(UnackedMsg),
+    escalus_assert:has_no_stanzas(NewUser),
 
     escalus_connection:stop(Bob),
-    escalus_connection:stop(NewAlice).
+    escalus_connection:stop(NewUser).
+
+
+resend_unacked_to_different_res_after_resume_timeout(Config) ->
+    %% connect bob and user
+    Bob = connect_fresh(Config, bob, presence),
+    User = connect_fresh(Config, ?config(user, Config), sr_presence),
+    UserSpec = sm_helper:client_to_spec(User),
+
+    escalus_connection:send(Bob, escalus_stanza:chat_to_short_jid(User, <<"msg-1">>)),
+    %% kill user connection
+    escalus_connection:kill(User),
+
+    %% ensure there is no session
+    C2SPid = mongoose_helper:get_session_pid(User),
+    sm_helper:wait_until_resume_session(C2SPid),
+
+    %% user comes back with different resource
+    NewUser = connect_spec([{resource, <<"2nd_resource">>} | UserSpec], session),
+    send_initial_presence(NewUser),
+
+    %% resume timeout passes
+    timer:sleep(timer:seconds(?SHORT_TIMEOUT + 1)),
+
+    %% user receives unacked message and presence, as well as initial presence response
+    %% the order of the messages may change, especially on CI, so we test all of them
+    UnackedStanzas = escalus:wait_for_stanzas(NewUser, 3),
+    escalus_new_assert:mix_match([is_presence, is_chat(<<"msg-1">>), is_presence], UnackedStanzas),
+    [UnackedMsg] = lists:filter(fun escalus_pred:is_message/1, UnackedStanzas),
+    sm_helper:assert_delayed(UnackedMsg),
+
+    escalus_assert:has_no_stanzas(NewUser),
+
+    escalus_connection:stop(Bob),
+    escalus_connection:stop(NewUser).
+
+ping_timeout(Config) ->
+    %% make sure there are no leftover stanzas in the history
+    ?assertEqual([], get_stanzas_filtered_by_mod_ping()),
+
+    %% connect User and wait for the session to close
+    User = connect_fresh(Config, ?config(user, Config), sr_presence),
+
+    escalus_client:wait_for_stanza(User),
+    % The additional time was 1 second. This sometimes resulted in connection termination,
+    % therefore the value was lowered to 0.5 seconds
+    ct:sleep(?PING_REQUEST_TIMEOUT + ?PING_INTERVAL + timer:seconds(0.5)),
+
+    %% attempt to resume the session after the connection drop
+    NewUser = sm_helper:kill_and_connect_with_resume_session_without_waiting_for_result(User),
+
+    %% after resume_timeout, we expect the session to be closed
+    escalus_connection:get_stanza(NewUser, failed_resumption),
+
+    %% bind a new session and expect unacknowledged messages to be resent
+    escalus_session:session(escalus_session:bind(NewUser)),
+    send_initial_presence(NewUser),
+
+    %% Check if the error stanza was handled by mod_ping.
+    %% There is a slight chance of more than one error stanza,
+    %% so the processing happens in lists:foreach.
+
+    check_stanzas_filtered_by_mod_ping(),
+
+    %% stop the connection
+    escalus_connection:stop(NewUser).
 
 resume_expired_session_returns_correct_h(Config) ->
-    %% connect bob and alice
-    {Bob, _, _, _} =
-        get_stream_resumption_enabled_fresh_user_smid_and_h(Config, bob),
-    {Alice, AliceSpec, SMID, SMH} =
-        get_stream_resumption_enabled_fresh_user_smid_and_h(Config, alice),
-    escalus:assert(is_sm_ack_request, escalus_connection:get_stanza(Alice, ack)),
-    %% Bob sends a message to Alice, and Alice receives it but doesn't acknowledge
-    escalus_connection:send(Bob, escalus_stanza:chat_to(common_helper:get_bjid(AliceSpec), <<"msg-1">>)),
-    escalus:wait_for_stanza(Alice),
-    %% kill alice connection
-    escalus_connection:kill(Alice),
-    %% ensure there is no session
-    wait_until_disconnected(AliceSpec),
-    %% alice comes back, but too late, so resumption doesn't work,
+    %% connect bob and user
+    Bob = connect_fresh(Config, bob, sr_presence),
+    User = connect_fresh(Config, ?config(user, Config), sr_presence, manual),
+    get_ack(User),
+
+    %% Bob sends a message to User, and User receives it but doesn't acknowledge
+    escalus_connection:send(Bob, escalus_stanza:chat_to_short_jid(User, <<"msg-1">>)),
+    escalus:assert(is_chat_message, [<<"msg-1">>], escalus:wait_for_stanza(User)),
+    %% user comes back, but too late, so resumption doesn't work,
     %% but she receives the previous h = 1 anyway
-    {ok, NewAlice, _} = escalus_connection:start(AliceSpec, connection_steps_to_authenticate()),
-    escalus_connection:send(NewAlice, escalus_stanza:resume(SMID, SMH)),
-    FailedResumption = escalus_connection:get_stanza(NewAlice, failed_resumption),
+    %% NewUser is also manual ack
+    NewUser = sm_helper:kill_and_connect_with_resume_session_without_waiting_for_result(User),
+    FailedResumption = escalus_connection:get_stanza(NewUser, failed_resumption),
     <<"1">> = exml_query:attr(FailedResumption, <<"h">>),
     %% And we can continue with bind and session
-    escalus_session:session(escalus_session:bind(NewAlice)),
-    escalus_connection:send(NewAlice, escalus_stanza:presence(<<"available">>)),
-    Stanzas = [escalus_connection:get_stanza(NewAlice, msg),
-               escalus_connection:get_stanza(NewAlice, msg)],
+    escalus_session:session(escalus_session:bind(NewUser)),
+    send_initial_presence(NewUser),
+    Stanzas = [escalus_connection:get_stanza(NewUser, {msg, 1}),
+               escalus_connection:get_stanza(NewUser, {msg, 2})],
     escalus_new_assert:mix_match([is_presence, is_chat(<<"msg-1">>)], Stanzas),
     escalus_connection:stop(Bob),
-    escalus_connection:stop(NewAlice).
+    escalus_connection:stop(NewUser).
 
 gc_repeat_after_never_means_no_cleaning(Config) ->
-    true = rpc(mim(), ?MOD_SM, set_stale_h_repeat_after, [?BIG_BIG_BIG_TIMEOUT]),
     [{SMID1, _}, {SMID2, _}, {SMID3, _}] = ?config(smid_test, Config),
-    {stale_h, 1} = rpc(mim(), ?MOD_SM, get_session_from_smid, [SMID1]),
-    {stale_h, 2} = rpc(mim(), ?MOD_SM, get_session_from_smid, [SMID2]),
-    {stale_h, 3} = rpc(mim(), ?MOD_SM, get_session_from_smid, [SMID3]).
+    {stale_h, 1} = rpc(mim(), ?MOD_SM, get_session_from_smid, [host_type(), SMID1]),
+    {stale_h, 2} = rpc(mim(), ?MOD_SM, get_session_from_smid, [host_type(), SMID2]),
+    {stale_h, 3} = rpc(mim(), ?MOD_SM, get_session_from_smid, [host_type(), SMID3]).
+
 gc_repeat_after_timeout_does_clean(Config) ->
     [{SMID1, _} | _ ] = ?config(smid_test, Config),
-    mongoose_helper:wait_until(fun() ->
-                                       rpc(mim(), ?MOD_SM, get_stale_h, [SMID1])
-                               end,
-                               {error, smid_not_found},
-                               #{name => smid_garbage_collected}).
+    wait_helper:wait_until(fun() ->
+                                   rpc(mim(), ?MOD_SM, get_stale_h, [host_type(), SMID1])
+                           end,
+                           {error, smid_not_found},
+                           #{name => smid_garbage_collected}).
 
-resume_session_state_send_message(Config) ->
-    ConnSteps = connection_steps_to_session(),
+resume_session_state_send_message_without_ack(Config) ->
+    resume_session_state_send_message_generic(Config, no_ack).
 
-    %% connect bob and alice
+resume_session_state_send_message_with_ack(Config) ->
+    resume_session_state_send_message_generic(Config, ack).
 
-    BobSpec = escalus_fresh:create_fresh_user(Config, bob),
-    {ok, Bob, _} = escalus_connection:start(BobSpec),
-    escalus_connection:send(Bob, escalus_stanza:presence(<<"available">>)),
-    escalus_connection:get_stanza(Bob, presence),
-
-    AliceSpec = escalus_fresh:create_fresh_user(Config, alice),
-    {ok, Alice, _} = escalus_connection:start(AliceSpec, ConnSteps++[stream_resumption]),
-    escalus_connection:send(Alice, escalus_stanza:presence(<<"available">>)),
-    escalus_connection:get_stanza(Alice, presence),
-    %% Ack the presence stanza
-    escalus:assert(is_sm_ack_request, escalus_connection:get_stanza(Alice, ack)),
-    escalus:send(Alice, escalus_stanza:sm_ack(1)),
-
-    escalus_connection:send(Bob, escalus_stanza:chat_to(common_helper:get_bjid(AliceSpec), <<"msg-1">>)),
-    %% kill alice connection
-    {ok, C2SPid} = get_session_pid(AliceSpec, escalus_client:resource(Alice)),
-    escalus_connection:kill(Alice),
-    wait_for_c2s_state_change(C2SPid, resume_session),
-
-    1 = length(get_user_alive_resources(AliceSpec)),
+resume_session_state_send_message_generic(Config, AckInitialPresence) ->
+    %% connect bob and user
+    Bob = connect_fresh(Config, bob, presence),
+    User = connect_fresh(Config, ?config(user, Config), sr_presence, manual),
+    maybe_ack_initial_presence(User, AckInitialPresence),
+    escalus_connection:send(Bob, escalus_stanza:chat_to_short_jid(User, <<"msg-1">>)),
+    %% kill user connection
+    C2SPid = mongoose_helper:get_session_pid(User),
+    escalus_connection:kill(User),
+    sm_helper:wait_until_resume_session(C2SPid),
+    sm_helper:assert_alive_resources(User, 1),
 
     %% send some messages and check if c2s can handle it
-    escalus_connection:send(Bob, escalus_stanza:chat_to(common_helper:get_bjid(AliceSpec), <<"msg-2">>)),
-    escalus_connection:send(Bob, escalus_stanza:chat_to(common_helper:get_bjid(AliceSpec), <<"msg-3">>)),
+    escalus_connection:send(Bob, escalus_stanza:chat_to_short_jid(User, <<"msg-2">>)),
+    escalus_connection:send(Bob, escalus_stanza:chat_to_short_jid(User, <<"msg-3">>)),
+    %% suspend the process to ensure that User has enough time to reconnect,
+    %% before resumption timeout occurs.
+    ok = rpc(mim(), sys, suspend, [C2SPid]),
 
-    %% alice comes back and receives unacked message
-    {ok, NewAlice, _} = escalus_connection:start(AliceSpec, ConnSteps),
-    escalus_connection:send(NewAlice, escalus_stanza:presence(<<"available">>)),
-
-    Stanzas = [escalus_connection:get_stanza(NewAlice, msg) || _ <- lists:seq(1,4) ],
+    %% user comes back and receives unacked message
+    NewUser = connect_same(User, presence),
+    %% now we can resume c2s process of the old connection
+    %% and let it process session resumption timeout
+    ok = rpc(mim(), sys, resume, [C2SPid]),
+    Stanzas = escalus:wait_for_stanzas(NewUser, 3),
 
     % what about order ?
-    % alice receive presence from herself and 3 unacked messages from bob
-    escalus_new_assert:mix_match([is_presence,
-                                  is_chat(<<"msg-1">>),
+    % user receive presence from herself and 3 unacked messages from bob
+    escalus_new_assert:mix_match([is_chat(<<"msg-1">>),
                                   is_chat(<<"msg-2">>),
                                   is_chat(<<"msg-3">>)],
                                  Stanzas),
     escalus_connection:stop(Bob),
-    escalus_connection:stop(NewAlice).
+    escalus_connection:stop(NewUser).
 
 %%for instance it can be done by mod ping
 resume_session_state_stop_c2s(Config) ->
-    ConnSteps = connection_steps_to_session(),
+    Bob = connect_fresh(Config, bob, presence),
+    User = connect_fresh(Config, ?config(user, Config), sr_presence, manual),
 
-    %% connect bob and alice
-    BobSpec = escalus_fresh:create_fresh_user(Config, bob),
-    {ok, Bob, _} = escalus_connection:start(BobSpec, ConnSteps),
-    escalus_connection:send(Bob, escalus_stanza:presence(<<"available">>)),
-    escalus_connection:get_stanza(Bob, presence),
+    get_ack(User),
+    ack_initial_presence(User),
 
-    AliceSpec = escalus_fresh:create_fresh_user(Config, alice),
-    {ok, Alice, _} = escalus_connection:start(AliceSpec, ConnSteps++[stream_resumption]),
-    escalus_connection:send(Alice, escalus_stanza:presence(<<"available">>)),
-    escalus_connection:get_stanza(Alice, presence),
-
-    escalus:assert(is_sm_ack_request, escalus_connection:get_stanza(Alice, ack)),
-    %% Ack presence
-    escalus_connection:send(Alice, escalus_stanza:sm_ack(1)),
-
-    escalus_connection:send(Bob, escalus_stanza:chat_to(common_helper:get_bjid(AliceSpec), <<"msg-1">>)),
+    escalus_connection:send(Bob, escalus_stanza:chat_to_short_jid(User, <<"msg-1">>)),
+    escalus:assert(is_chat_message, [<<"msg-1">>], escalus_connection:get_stanza(User, msg)),
 
     %% get pid of c2s
-    {ok, C2SPid} = get_session_pid(AliceSpec, escalus_client:resource(Alice)),
+    C2SPid = mongoose_helper:get_session_pid(User),
     %% Wait c2s process to process our presence ack.
     %% Otherwise, we can receive two initial presences sometimes.
-    wait_for_c2s_unacked_count(C2SPid, 1),
+    sm_helper:wait_for_c2s_unacked_count(C2SPid, 1),
 
-    % kill alice connection
-    escalus_connection:kill(Alice),
+    % kill user connection
+    escalus_connection:kill(User),
     % session should be alive
-    1 = length(get_user_alive_resources(AliceSpec)),
-    rpc(mim(), ejabberd_c2s, stop, [C2SPid] ),
-    wait_for_c2s_state_change(C2SPid, resume_session),
+    sm_helper:assert_alive_resources(User, 1),
+    rpc(mim(), mongoose_c2s, stop, [C2SPid, normal]),
+    sm_helper:wait_until_resume_session(C2SPid),
+    %% suspend the process to ensure that User has enough time to reconnect,
+    %% before resumption timeout occurs.
+    ok = rpc(mim(), sys, suspend, [C2SPid]),
 
-    %% alice comes back and receives unacked message
-    {ok, NewAlice, _} = escalus_connection:start(AliceSpec, ConnSteps),
-    escalus_connection:send(NewAlice, escalus_stanza:presence(<<"available">>)),
+    %% user comes back and receives unacked message
+    NewUser = connect_same(User, presence, manual),
+    %% now we can resume c2s process of the old connection
+    %% and let it process session resumption timeout
+    ok = rpc(mim(), sys, resume, [C2SPid]),
 
-    Stanzas = [escalus_connection:get_stanza(NewAlice, msg),
-               escalus_connection:get_stanza(NewAlice, msg)],
-    escalus_new_assert:mix_match([is_presence, is_chat(<<"msg-1">>)], Stanzas),
-
-    escalus_connection:stop(NewAlice),
-    escalus_connection:stop(Bob).
+    escalus:assert(is_chat_message, [<<"msg-1">>], escalus_connection:get_stanza(NewUser, msg)),
+    escalus_connection:stop(Bob),
+    escalus_connection:stop(NewUser).
 
 %% This test only verifies the validity of helpers (get_session_pid,
-%% assert_no_offline_msgs, assert_c2s_state) written for wait_for_resumption
+%% get_c2s_state_name) written for wait_for_resumption
 %% testcase.
 session_established(Config) ->
-    AliceSpec = [{manual_ack, true}
-                 | escalus_fresh:create_fresh_user(Config, alice)],
-    {Alice, _} = given_fresh_user_with_spec(AliceSpec),
-    {ok, C2SPid} = get_session_pid(AliceSpec, server_string("escalus-default-resource")),
-    assert_no_offline_msgs(AliceSpec),
-    assert_c2s_state(C2SPid, session_established),
-    escalus_connection:stop(Alice).
+    User = connect_fresh(Config, ?config(user, Config), presence),
+    C2SPid = mongoose_helper:get_session_pid(User),
+    session_established = mongoose_helper:get_c2s_state_name(C2SPid),
+    escalus_connection:stop(User).
 
 %% Ensure that after a violent disconnection,
 %% the c2s waits for resumption (but don't resume yet).
 wait_for_resumption(Config) ->
-    AliceSpec = [{manual_ack, true}
-                 | escalus_fresh:create_fresh_user(Config, alice)],
-    {Bob, _} = given_fresh_user(Config, bob),
-    Messages = [<<"msg-1">>, <<"msg-2">>, <<"msg-3">>],
-    {C2SPid, _} = buffer_unacked_messages_and_die(Config, AliceSpec, Bob, Messages),
-    %% Ensure the c2s process is waiting for resumption.
-    assert_no_offline_msgs(AliceSpec),
-    wait_for_c2s_state_change(C2SPid, resume_session).
+    UserSpec = escalus_fresh:create_fresh_user(Config, ?config(user, Config)),
+    Bob = connect_fresh(Config, bob, session),
+    Texts = three_texts(),
+    {C2SPid, _} = buffer_unacked_messages_and_die(Config, UserSpec, Bob, Texts),
+    sm_helper:wait_until_resume_session(C2SPid).
+
+unacknowledged_message_hook_filter(Config) ->
+    FilterText = <<"filter">>,
+    Bob = connect_fresh(Config, bob, presence),
+    UserSpec = escalus_fresh:create_fresh_user(Config, ?config(user, Config)),
+    Resource = proplists:get_value(username, UserSpec),
+    HookHandlerExtra = start_filter_hook_listener(FilterText, Resource),
+    User = connect_spec([{resource, Resource} | UserSpec], sr_presence, manual),
+    %% Ack the presence stanza
+    get_ack(User),
+    ack_initial_presence(User),
+    Messages = [<<"msg-1">>, <<"msg-2">>, <<"msg-3">>, <<"msg-4">>],
+    All = [<<"msg-1">>, FilterText, <<"msg-2">>, FilterText, <<"msg-3">>, <<"msg-4">>],
+    [ escalus_connection:send(Bob, escalus_stanza:chat_to_short_jid(User, Body)) || Body <- All ],
+    %% kill user connection
+    C2SPid = mongoose_helper:get_session_pid(User),
+    escalus_connection:kill(User),
+    sm_helper:wait_until_resume_session(C2SPid),
+    sm_helper:assert_alive_resources(User, 1),
+    %% ensure second C2S is registered so all the messages are bounced properly
+    NewUser = connect_spec([{resource, <<"2">>}| UserSpec], sr_presence, manual),
+    send_initial_presence(NewUser),
+    sm_helper:wait_for_resource_count(NewUser, 2),
+    ok = rpc(mim(), sys, terminate, [C2SPid, normal]),
+    %% verify that the filtered message is never received
+    verify_no_receive_filtertext(NewUser, FilterText, Messages),
+    stop_hook_listener(HookHandlerExtra),
+    escalus_connection:stop(Bob).
+
+verify_no_receive_filtertext(_, _, []) ->
+    ok;
+verify_no_receive_filtertext(Client, FilterText, Messages) ->
+    case escalus:wait_for_stanzas(Client, 1, 500) of
+        [] -> ct:fail("Messages pending: ~p~n", [Messages]);
+        [St] ->
+            case exml_query:path(St, [{element, <<"body">>}, cdata]) of
+                undefined ->
+                    verify_no_receive_filtertext(Client, FilterText, Messages);
+                FilterText ->
+                    ct:fail("Composing forwarded from a different c2s process");
+                Message ->
+                    Pred = fun(Msg) -> Msg =/= Message end,
+                    {Pending, _} = lists:partition(Pred, Messages),
+                    verify_no_receive_filtertext(Client, FilterText, Pending)
+            end
+    end.
 
 unacknowledged_message_hook_resume(Config) ->
     unacknowledged_message_hook_common(fun unacknowledged_message_hook_resume/4, Config).
 
-unacknowledged_message_hook_resume(AliceSpec, Resource, SMID, _C2SPid) ->
-    {ok, NewAlice, _} = escalus_connection:start(AliceSpec, connection_steps_to_stream_resumption(SMID, 1)),
-    escalus_connection:send(NewAlice, escalus_stanza:presence(<<"available">>)),
-    {Resource, NewAlice}.
+unacknowledged_message_hook_resume(UserSpec, Resource, SMID, _C2SPid) ->
+    NewUser = connect_spec(UserSpec, {resume, SMID, 1}, manual),
+    send_initial_presence(NewUser),
+    {Resource, NewUser}.
 
 unacknowledged_message_hook_bounce(Config) ->
     unacknowledged_message_hook_common(fun unacknowledged_message_hook_bounce/4, Config).
 
-unacknowledged_message_hook_bounce(AliceSpec, Resource, _SMID, C2SPid) ->
-    ConnSteps = connection_steps_to_session() ++ [stream_resumption],
+unacknowledged_message_hook_bounce(UserSpec, Resource, _SMID, C2SPid) ->
     NewResource = <<"new_", Resource/binary>>,
-    NewSpec = lists:keystore(resource, 1, AliceSpec, {resource, NewResource}),
-    {ok, NewAlice, _} = escalus_connection:start(NewSpec, ConnSteps),
-    escalus_connection:send(NewAlice, escalus_stanza:presence(<<"available">>)),
+    NewSpec = lists:keystore(resource, 1, UserSpec, {resource, NewResource}),
+    NewUser = connect_spec(NewSpec, sr_session, manual),
+    send_initial_presence(NewUser),
     %% ensure second C2S is registered so all the messages are bounced properly
-    mongoose_helper:wait_until(fun() -> length(get_user_alive_resources(AliceSpec)) end, 2),
+    sm_helper:wait_for_resource_count(NewUser, 2),
     ok = rpc(mim(), sys, terminate, [C2SPid, normal]),
-    {NewResource, NewAlice}.
+    {NewResource, NewUser}.
 
 unacknowledged_message_hook_offline(Config) ->
     unacknowledged_message_hook_common(fun unacknowledged_message_hook_offline/4, Config).
 
-unacknowledged_message_hook_offline(AliceSpec, Resource, _SMID, C2SPid) ->
-    ConnSteps = connection_steps_to_session() ++ [stream_resumption],
+unacknowledged_message_hook_offline(UserSpec, Resource, _SMID, C2SPid) ->
     C2SRef = erlang:monitor(process, C2SPid),
-    %%reset the session, so old C2S process is stopped
-    {ok, NewAlice, _} = escalus_connection:start(AliceSpec, ConnSteps),
+    sm_helper:wait_for_process_termination(C2SRef),
+    %% reset the session, so old C2S process is stopped
+    NewUser = connect_spec(UserSpec, sr_session, manual),
     %% wait for old C2S termination before send presence. other way
     %% some of the latest unacknowledged messages can be bounced to
     %% the new C2S process instead of going to the mod_offline storage.
     %% looks like all the unacknowledged messages arrive to the new
     %% C2S, but the message sequence is broken (the bounced messages
     %% delivered before the messages from the mod_offline storage)
-    wait_for_process_termination(C2SRef),
-    escalus_connection:send(NewAlice, escalus_stanza:presence(<<"available">>)),
-    {Resource, NewAlice}.
+    send_initial_presence(NewUser),
+    {Resource, NewUser}.
 
 unacknowledged_message_hook_common(RestartConnectionFN, Config) ->
-    ConnSteps = connection_steps_to_session(),
+    %% connect bob and user
+    Bob = connect_fresh(Config, bob, presence),
 
-    %% connect bob and alice
-    BobSpec = escalus_fresh:create_fresh_user(Config, bob),
-    {ok, Bob, _} = escalus_connection:start(BobSpec),
-    escalus_connection:send(Bob, escalus_stanza:presence(<<"available">>)),
-    escalus_connection:get_stanza(Bob, presence),
-
-    AliceSpec0 = escalus_fresh:create_fresh_user(Config, alice),
-    Resource = proplists:get_value(username, AliceSpec0),
-    AliceSpec = [{resource, Resource} | AliceSpec0],
-    start_hook_listener(Resource),
-    {ok, Alice, _} = escalus_connection:start(AliceSpec, ConnSteps ++ [stream_resumption]),
-    SMID = proplists:get_value(smid, Alice#client.props),
-    escalus_connection:send(Alice, escalus_stanza:presence(<<"available">>)),
-    escalus_connection:get_stanza(Alice, presence),
+    UserSpec0 = escalus_fresh:create_fresh_user(Config, ?config(user, Config)),
+    Resource = proplists:get_value(username, UserSpec0),
+    UserSpec = [{resource, Resource} | UserSpec0],
+    HookHandlerExtra = start_hook_listener(Resource),
+    User = connect_spec(UserSpec, sr_presence, manual),
     %% Ack the presence stanza
-    escalus:assert(is_sm_ack_request, escalus_connection:get_stanza(Alice, ack)),
-    escalus:send(Alice, escalus_stanza:sm_ack(1)),
+    get_ack(User),
+    ack_initial_presence(User),
 
-    escalus_connection:send(Bob, escalus_stanza:chat_to(common_helper:get_bjid(AliceSpec), <<"msg-1">>)),
-    escalus_connection:send(Bob, escalus_stanza:chat_to(common_helper:get_bjid(AliceSpec), <<"msg-2">>)),
-    %% kill alice connection
-    {ok, C2SPid} = get_session_pid(AliceSpec, Resource),
-    escalus_connection:kill(Alice),
-    wait_for_c2s_state_change(C2SPid, resume_session),
-    1 = length(get_user_alive_resources(AliceSpec)),
+    SMID = sm_helper:client_to_smid(User),
+
+    escalus_connection:send(Bob, escalus_stanza:chat_to_short_jid(User, <<"msg-1">>)),
+    escalus_connection:send(Bob, escalus_stanza:chat_to_short_jid(User, <<"msg-2">>)),
+    %% kill user connection
+    C2SPid = mongoose_helper:get_session_pid(User),
+    escalus_connection:kill(User),
+    sm_helper:wait_until_resume_session(C2SPid),
+    sm_helper:assert_alive_resources(User, 1),
 
     escalus:assert(is_chat_message, [<<"msg-1">>], wait_for_unacked_msg_hook(0, Resource, 100)),
     escalus:assert(is_chat_message, [<<"msg-2">>], wait_for_unacked_msg_hook(0, Resource, 100)),
     ?assertEqual(timeout, wait_for_unacked_msg_hook(0, Resource, 100)),
 
     %% send some messages and check if c2s can handle it
-    escalus_connection:send(Bob, escalus_stanza:chat_to(common_helper:get_bjid(AliceSpec), <<"msg-3">>)),
-    escalus_connection:send(Bob, escalus_stanza:chat_to(common_helper:get_bjid(AliceSpec), <<"msg-4">>)),
+    escalus_connection:send(Bob, escalus_stanza:chat_to_short_jid(User, <<"msg-3">>)),
+    escalus_connection:send(Bob, escalus_stanza:chat_to_short_jid(User, <<"msg-4">>)),
     escalus:assert(is_chat_message, [<<"msg-3">>], wait_for_unacked_msg_hook(0, Resource, 100)),
     escalus:assert(is_chat_message, [<<"msg-4">>], wait_for_unacked_msg_hook(0, Resource, 100)),
     ?assertEqual(timeout, wait_for_unacked_msg_hook(0, Resource, 100)),
 
-    %% alice comes back and receives unacked message
-    {NewResource, NewAlice} = RestartConnectionFN(AliceSpec, Resource, SMID, C2SPid),
+    %% user comes back and receives unacked message
+    {NewResource, NewUser} = RestartConnectionFN(UserSpec, Resource, SMID, C2SPid),
 
-    mongoose_helper:wait_until(
+    wait_helper:wait_until(
         fun() ->
-            Stanza = escalus_connection:get_stanza(NewAlice, msg),
+            Stanza = escalus_connection:get_stanza(NewUser, msg),
             escalus:assert(is_chat_message, [<<"msg-4">>], Stanza),
             ok
         end, ok),
 
-    {ok, NewC2SPid} = get_session_pid(AliceSpec, NewResource),
-    escalus_connection:kill(NewAlice),
-    wait_for_c2s_state_change(NewC2SPid, resume_session),
+    NewC2SPid = mongoose_helper:get_session_pid(NewUser),
+    escalus_connection:kill(NewUser),
+    sm_helper:wait_until_resume_session(NewC2SPid),
 
     escalus:assert(is_chat_message, [<<"msg-1">>], wait_for_unacked_msg_hook(1, NewResource, 100)),
     escalus:assert(is_chat_message, [<<"msg-2">>], wait_for_unacked_msg_hook(1, NewResource, 100)),
     escalus:assert(is_chat_message, [<<"msg-3">>], wait_for_unacked_msg_hook(1, NewResource, 100)),
     escalus:assert(is_chat_message, [<<"msg-4">>], wait_for_unacked_msg_hook(1, NewResource, 100)),
     ?assertEqual(timeout, wait_for_unacked_msg_hook(0, Resource, 100)),
-
+    stop_hook_listener(HookHandlerExtra),
     escalus_connection:stop(Bob).
 
 resume_session(Config) ->
-    AliceSpec = [{manual_ack, true}
-                 | escalus_fresh:create_fresh_user(Config, alice)],
-    Messages = [<<"msg-1">>, <<"msg-2">>, <<"msg-3">>],
+    UserSpec = escalus_fresh:create_fresh_user(Config, ?config(user, Config)),
+    Texts = three_texts(),
     escalus:fresh_story(Config, [{bob, 1}], fun(Bob) ->
-        {_, SMID} = buffer_unacked_messages_and_die(Config, AliceSpec, Bob, Messages),
+        {_, SMID} = buffer_unacked_messages_and_die(Config, UserSpec, Bob, Texts),
         %% Resume the session.
-        Steps = connection_steps_to_stream_resumption(SMID, 2),
-        {ok, Alice, _} = escalus_connection:start(AliceSpec, Steps),
-        NDiscarded = discard_vcard_update(Alice),
-        %% Alice receives the unacked messages from the previous
+        User = connect_spec(UserSpec, {resume, SMID, 1}, manual),
+        %% User receives the unacked messages from the previous
         %% interrupted session.
-        Stanzas = [escalus_connection:get_stanza(Alice, {msg, I})
-                   || I <- lists:seq(1, 3)],
-        [escalus:assert(is_chat_message, [Msg], Stanza)
-         || {Msg, Stanza} <- lists:zip(Messages, Stanzas)],
-        %% Alice acks the received messages.
-        escalus_connection:send(Alice, escalus_stanza:sm_ack(5 + NDiscarded)),
-        escalus_connection:stop(Alice)
+        sm_helper:wait_for_messages(User, Texts),
+        %% User acks the received messages.
+        escalus_connection:send(User, escalus_stanza:sm_ack(5)),
+        escalus_connection:stop(User)
     end).
 
 resume_session_with_wrong_h_does_not_leak_sessions(Config) ->
-    AliceSpec = [{manual_ack, true}
-                 | escalus_fresh:create_fresh_user(Config, alice)],
-    Messages = [<<"msg-1">>, <<"msg-2">>, <<"msg-3">>],
+    UserSpec = escalus_fresh:create_fresh_user(Config, ?config(user, Config)),
+    Messages = three_texts(),
+    HostType = host_type(),
     escalus:fresh_story(Config, [{bob, 1}], fun(Bob) ->
-
-        {_, SMID} = buffer_unacked_messages_and_die(Config, AliceSpec, Bob, Messages),
+        {_, SMID} = buffer_unacked_messages_and_die(Config, UserSpec, Bob, Messages),
         %% Resume the session.
-        Steps = connection_steps_to_authenticate(),
-        {ok, Alice, _} = escalus_connection:start(AliceSpec, Steps),
-        Resumed = try_to_resume_stream(Alice, SMID, 30),
+        User = connect_spec(UserSpec, auth, manual),
+        Resumed = sm_helper:try_to_resume_stream(User, SMID, 30),
         escalus:assert(is_stream_error, [<<"undefined-condition">>, <<>>], Resumed),
-
-        [] = get_user_present_resources(AliceSpec),
-        {error, smid_not_found} = get_sid_by_stream_id(SMID),
-        escalus_connection:wait_for_close(Alice, timer:seconds(5))
+        escalus_connection:wait_for_close(User, timer:seconds(5)),
+        Fun = fun() ->
+                      [] = sm_helper:get_user_present_resources(User),
+                      sm_helper:get_sid_by_stream_id(HostType, SMID)
+              end,
+        wait_helper:wait_until(Fun, {error, smid_not_found}, #{name => smid_is_cleaned})
     end).
 
 resume_session_with_wrong_sid_returns_item_not_found(Config) ->
     session_resumption_expects_item_not_found(Config, <<"wrong-sid">>).
 
 resume_session_with_wrong_namespace_is_a_noop(Config) ->
-    AliceSpec = escalus_fresh:create_fresh_user(Config, alice),
-    Steps = connection_steps_to_authenticate(),
-    {ok, Alice, _} = escalus_connection:start(AliceSpec, Steps),
-    #xmlel{attrs = Attrs} = Resume = escalus_stanza:resume(<<"doesnt_matter">>, 4),
-    Attrs2 = lists:keyreplace(<<"xmlns">>, 1, Attrs, {<<"xmlns">>, <<"not-stream-mgnt">>}),
-    escalus_connection:send(Alice, Resume#xmlel{attrs = Attrs2}),
-    escalus_assert:has_no_stanzas(Alice),
-    [] = get_user_present_resources(AliceSpec),
-    true = escalus_connection:is_connected(Alice),
-    escalus_connection:stop(Alice).
+    User = connect_fresh(Config, ?config(user, Config), auth),
+    Resume = escalus_stanza:resume(<<"doesnt_matter">>, 4),
+    Attrs = Resume#xmlel.attrs,
+    NewAttrs = Attrs#{<<"xmlns">> => <<"not-stream-mgnt">>},
+    escalus_connection:send(User, Resume#xmlel{attrs = NewAttrs}),
+    escalus_assert:has_no_stanzas(User),
+    [] = sm_helper:get_user_present_resources(User),
+    true = escalus_connection:is_connected(User),
+    escalus_connection:stop(User).
 
 resume_dead_session_results_in_item_not_found(Config) ->
     SMID = base64:encode(crypto:strong_rand_bytes(21)),
     SID = {os:timestamp(), undefined},
-    rpc(mim(), ?MOD_SM, register_smid, [SMID, SID]),
+    HostType = host_type(),
+    rpc(mim(), ?MOD_SM, register_smid, [HostType, SMID, SID]),
     session_resumption_expects_item_not_found(Config, SMID).
 
 session_resumption_expects_item_not_found(Config, SMID) ->
-    AliceSpec = escalus_fresh:create_fresh_user(Config, alice),
-    Steps = connection_steps_to_authenticate(),
-    {ok, Alice, _} = escalus_connection:start(AliceSpec, Steps),
-    Resumed = try_to_resume_stream(Alice, SMID, 2),
+    User = connect_fresh(Config, ?config(user, Config), auth),
+    Resumed = sm_helper:try_to_resume_stream(User, SMID, 2),
     escalus:assert(is_sm_failed, [<<"item-not-found">>], Resumed),
-    [] = get_user_present_resources(AliceSpec),
-    true = escalus_connection:is_connected(Alice),
-    escalus_connection:stop(Alice).
+    [] = sm_helper:get_user_present_resources(User),
+    true = escalus_connection:is_connected(User),
+    escalus_connection:stop(User).
 
+resume_session_kills_old_C2S_gracefully(Config) ->
+    User = connect_fresh(Config, ?config(user, Config), sr_presence, manual),
+    C2SPid = mongoose_helper:get_session_pid(User),
 
-connection_steps_to_authenticate() ->
-    [start_stream,
-     stream_features,
-     maybe_use_ssl,
-     authenticate].
+    %% Monitor the C2S process and disconnect User.
+    MonitorRef = sm_helper:monitor_session(User),
+    escalus_client:kill_connection(Config, User),
 
-connection_steps_to_bind() ->
-    connection_steps_to_authenticate() ++ [bind].
+    %% Ensure the c2s process is waiting for resumption.
+    sm_helper:wait_until_resume_session(C2SPid),
 
-connection_steps_to_session() ->
-    connection_steps_to_bind() ++ [session].
+    %% Resume the session.
+    NewUser = connect_resume(User, 1),
 
-connection_steps_to_enable_stream_mgmt(after_session) ->
-    connection_steps_to_session() ++ [stream_management];
-connection_steps_to_enable_stream_mgmt(after_bind) ->
-    connection_steps_to_bind() ++ [stream_management].
+    %% C2S process should die gracefully with Reason=normal.
+    sm_helper:wait_for_process_termination(MonitorRef),
+    escalus_connection:stop(NewUser).
 
-connection_steps_to_enable_stream_resumption() ->
-    connection_steps_to_bind() ++ [session, stream_resumption].
+carboncopy_works(Config) ->
+    escalus:fresh_story(Config, [{?config(user, Config), 2}, {bob, 1}], fun(User1, User, Bob) ->
+        mongoose_helper:enable_carbons([User1, User]),
+        escalus_connection:send(Bob, escalus_stanza:chat_to(User1, <<"msg-4">>)),
+        sm_helper:wait_for_messages(User1, [<<"msg-4">>]),
+        carboncopy_helper:wait_for_carbon_chat_with_body(User, <<"msg-4">>, #{from => Bob, to => User1})
+    end).
 
-connection_steps_to_stream_resumption(SMID, H) ->
-    connection_steps_to_authenticate() ++ [mk_resume_stream(SMID, H)].
+carboncopy_works_after_resume(Config) ->
+    Texts = three_texts(),
+    escalus:fresh_story(Config, [{?config(user, Config), 1}, {bob, 1}], fun(User1, Bob) ->
+        UserSpec = [{resource, <<"res2">>} | sm_helper:client_to_spec(User1)],
+        F = fun(User2) ->
+            [escalus:assert(is_presence_with_type, [<<"available">>], escalus:wait_for_stanza(A)) || A <- [User1, User2]],
+            mongoose_helper:enable_carbons([User1, User2])
+            end,
+        {_, SMID} = buffer_unacked_messages_and_die(Config, UserSpec, Bob, Texts, F),
+        %% Resume the session.
+        User = connect_spec(UserSpec, {resume, SMID, 1}, manual),
+        wait_for_carbon_with_bodies(User1, Texts, #{from => Bob, to => User}),
+        %% Get a presence from User1 again
+        escalus:assert(is_presence_with_type, [<<"available">>], escalus:wait_for_stanza(User)),
+        %% User receives an IQ result from the carbon copy enable request
+        escalus:assert(is_iq_result, [], escalus:wait_for_stanza(User)),
+        %% User receives the unacked messages from the previous
+        %% interrupted session.
+        sm_helper:wait_for_messages(User, Texts),
+        %% User acks the received messages.
+        escalus_connection:send(User, escalus_stanza:sm_ack(5)),
+        %% Direct send
+        escalus_connection:send(Bob, escalus_stanza:chat_to(User1, <<"msg-4">>)),
+        sm_helper:wait_for_messages(User1, [<<"msg-4">>]),
+        carboncopy_helper:wait_for_carbon_chat_with_body(User, <<"msg-4">>, #{from => Bob, to => User1}),
+        escalus_connection:stop(User)
+    end).
 
-mk_resume_stream(SMID, PrevH) ->
-    fun (Conn = #client{props = Props}, Features) ->
-            Resumed = try_to_resume_stream(Conn, SMID, PrevH),
-            true = escalus_pred:is_sm_resumed(SMID, Resumed),
-            {Conn#client{props = [{smid, SMID} | Props]}, Features}
-    end.
+wait_for_carbon_with_bodies(Client, Texts, Params) ->
+    [carboncopy_helper:wait_for_carbon_chat_with_body(Client, Text, Params) || Text <- Texts].
 
-try_to_resume_stream(Conn, SMID, PrevH) ->
-    escalus_connection:send(Conn, escalus_stanza:resume(SMID, PrevH)),
-    escalus_connection:get_stanza(Conn, get_resumed).
+buffer_unacked_messages_and_die(Config, UserSpec, Bob, Texts) ->
+    F = fun(_Client) -> ok end,
+    buffer_unacked_messages_and_die(Config, UserSpec, Bob, Texts, F).
 
-buffer_unacked_messages_and_die(Config, AliceSpec, Bob, Messages) ->
-    Steps = connection_steps_to_enable_stream_resumption(),
-    {ok, Alice = #client{props = Props}, _} = escalus_connection:start(AliceSpec, Steps),
-    JID = common_helper:get_bjid(Props),
-    InitialPresence = setattr(escalus_stanza:presence(<<"available">>),
-                              <<"id">>, <<"presence1">>),
-    escalus_connection:send(Alice, InitialPresence),
-    Presence = escalus_connection:get_stanza(Alice, presence1),
-    escalus:assert(is_presence, Presence),
-    Res = server_string("escalus-default-resource"),
-    {ok, C2SPid} = get_session_pid(AliceSpec, Res),
-    escalus_connection:send(Alice, escalus_stanza:presence(<<"available">>)),
-    _Presence = escalus_connection:get_stanza(Alice, presence2),
-    discard_vcard_update(Alice),
-    %% Bobs sends some messages to Alice.
-    [escalus:send(Bob, escalus_stanza:chat_to(JID, Msg))
-     || Msg <- Messages],
-    %% Alice receives them, but doesn't ack.
-    Stanzas = [escalus_connection:get_stanza(Alice, {msg, I})
-               || I <- lists:seq(1, 3)],
-    [escalus:assert(is_chat_message, [Msg], Stanza)
-     || {Msg, Stanza} <- lists:zip(Messages, Stanzas)],
-    %% Alice's connection is violently terminated.
-    escalus_client:kill_connection(Config, Alice),
-    {C2SPid, proplists:get_value(smid, Props)}.
+buffer_unacked_messages_and_die(Config, UserSpec, Bob, Texts, F) ->
+    User = connect_spec(UserSpec, sr_presence, manual),
+    F(User),
+    C2SPid = mongoose_helper:get_session_pid(User),
+    %% Bobs sends some messages to User.
+    sm_helper:send_messages(Bob, User, Texts),
+    %% User receives them, but doesn't ack.
+    sm_helper:wait_for_messages(User, Texts),
+    %% User's connection is violently terminated.
+    escalus_client:kill_connection(Config, User),
+    sm_helper:wait_until_resume_session(C2SPid),
+    SMID = sm_helper:client_to_smid(User),
+    {C2SPid, SMID}.
 
 aggressively_pipelined_resume(Config) ->
-    AliceSpec = [{manual_ack, true}, {parser_opts, [{start_tag, <<"stream:stream">>}]}
-                 | escalus_fresh:create_fresh_user(Config, alice)],
-    UnackedMessages = [<<"msg-1">>, <<"msg-2">>, <<"msg-3">>],
+    UserSpec = [{manual_ack, true}, {parser_opts, [{start_tag, <<"stream:stream">>}]}
+                 | escalus_fresh:create_fresh_user(Config, ?config(user, Config))],
+    UnackedMessages = three_texts(),
     escalus:fresh_story(Config, [{bob, 1}], fun(Bob) ->
-        {_, SMID} = buffer_unacked_messages_and_die(Config, AliceSpec, Bob, UnackedMessages),
+        {_, SMID} = buffer_unacked_messages_and_die(Config, UserSpec, Bob, UnackedMessages),
         %% Resume the session.
-        Alice = escalus_connection:connect(AliceSpec),
+        User = escalus_connection:connect(UserSpec),
 
-        Username = proplists:get_value(username, AliceSpec),
-        Password = proplists:get_value(password, AliceSpec),
+        Username = proplists:get_value(username, UserSpec),
+        Password = proplists:get_value(password, UserSpec),
         Payload = <<0:8,Username/binary,0:8,Password/binary>>,
-        Server = proplists:get_value(server, AliceSpec),
+        Server = proplists:get_value(server, UserSpec),
 
         Stream = escalus_stanza:stream_start(Server, <<"jabber:client">>),
         Auth = escalus_stanza:auth(<<"PLAIN">>, [#xmlcdata{content = base64:encode(Payload)}]),
         AuthStream = escalus_stanza:stream_start(Server, <<"jabber:client">>),
         Resume = escalus_stanza:resume(SMID, 2),
 
-        escalus_client:send(Alice, [Stream, Auth, AuthStream, Resume]),
-        Messages = [escalus_connection:get_stanza(Alice, {get_resumed, I}) || I <- lists:seq(1, 6)],
+        escalus_client:send(User, [Stream, Auth, AuthStream, Resume]),
+        Messages = [escalus_connection:get_stanza(User, {get_resumed, I}) || I <- lists:seq(1, 6)],
         escalus:assert(is_sm_resumed, [SMID], lists:last(Messages)),
 
-        escalus_connection:stop(Alice)
+        escalus_connection:stop(User)
+    end).
+
+aggressively_pipelined_resume_ws(Config) ->
+    UserSpec = [{manual_ack, true} | escalus_fresh:create_fresh_user(Config, ?config(user, Config))],
+    UnackedMessages = three_texts(),
+    escalus:fresh_story(Config, [{bob, 1}], fun(Bob) ->
+        {_, SMID} = buffer_unacked_messages_and_die(Config, UserSpec, Bob, UnackedMessages),
+        %% Resume the session.
+        User = escalus_connection:connect(UserSpec),
+
+        Username = proplists:get_value(username, UserSpec),
+        Password = proplists:get_value(password, UserSpec),
+        Payload = <<0:8,Username/binary,0:8,Password/binary>>,
+        Server = proplists:get_value(server, UserSpec),
+
+        Stream = escalus_stanza:ws_open(Server),
+        Auth = escalus_stanza:auth(<<"PLAIN">>, [#xmlcdata{content = base64:encode(Payload)}]),
+        Resume = escalus_stanza:resume(SMID, 2),
+
+        escalus_client:send(User, [Stream]),
+        escalus_client:send(User, [Auth]),
+        escalus_client:send(User, [Stream]),
+        escalus_client:send(User, [Resume]),
+        Messages = [escalus_connection:get_stanza(User, {get_resumed, I}) || I <- lists:seq(1, 6)],
+        escalus:assert(is_sm_resumed, [SMID], lists:last(Messages)),
+
+        escalus_connection:stop(User)
     end).
 
 %% This is a regression test for a case when a session processes a request, which will
@@ -1070,110 +1396,109 @@ replies_are_processed_by_resumed_session(Config) ->
     %% GIVEN a session and registered special IQ handler (added in init_per_testcase),
     %% that waits for old session process to terminate (at this point new process
     %% has fully taken over) and then actually sends the reply.
-    AliceSpec = escalus_fresh:create_fresh_user(Config, alice),
-    Steps = connection_steps_to_enable_stream_resumption(),
-    {ok, Alice = #client{props = Props}, _} = escalus_connection:start(AliceSpec, Steps),
-    SMID = proplists:get_value(smid, Props),
-    SMH = escalus_connection:get_sm_h(Alice),
+    User = connect_fresh(Config, ?config(user, Config), sr_presence),
 
     %% WHEN a client sends IQ request to the special handler...
     IQReq = escalus_stanza:iq_get(regression_ns(), []),
-    escalus:send(Alice, IQReq),
+    escalus:send(User, IQReq),
+
+    % This test was flaky for ws_test, because there was not enaugh time
+    % between send and kill_and_connect_resume for the stanza to be properly
+    % processed. The sleep solves the problem for now.
+    timer:sleep(50),
 
     %% ... goes down and session is resumed.
-    escalus_client:kill_connection(Config, Alice),
-    Steps2 = connection_steps_to_stream_resumption(SMID, SMH),
-    {ok, Alice2, _} = escalus_connection:start(AliceSpec, Steps2),
+    User2 = sm_helper:kill_and_connect_resume(User),
 
     %% THEN the client receives the reply properly.
-    IQReply = escalus:wait_for_stanza(Alice2),
+    IQReply = escalus:wait_for_stanza(User2),
     escalus:assert(is_iq_result, [IQReq], IQReply),
-    escalus_connection:stop(Alice2).
+    escalus_connection:stop(User2).
 
 %% This is a regression test for a bug, which manifested in following scenario
 %% (due to improper presence sub requests buffering):
-%% 1. A is online, B is offline
-%% 2. A subscribes to B's presence;
-%% 3. B becomes online
-%% 4. A sends a message to B
-%% 5. B doesn't SM-ack the request or message, terminates the connection
-%% 6. B reconnects but with session *replace*, not resume
+%% 1. Bob is online, User is offline
+%% 2. Bob subscribes to User's presence;
+%% 3. User becomes online
+%% 4. Bob sends a message to User
+%% 5. User doesn't SM-ack the request or message, terminates the connection
+%% 6. User reconnects but with session *replace*, not resume
 %% 7. Packet rerouting crashes on the buffered sub request, preventing resending whole buffer
-%% 8. B doesn't receive the buffered message
+%% 8. User doesn't receive the buffered message
 subscription_requests_are_buffered_properly(Config) ->
-    AliceSpec = [{manual_ack, true} | escalus_fresh:create_fresh_user(Config, alice)],
+    UserSpec = escalus_fresh:create_fresh_user(Config, ?config(user, Config)),
     MsgBody = <<"buffered">>,
-    SubPredFun = fun(S) -> escalus_pred:is_presence_with_type(<<"subscribe">>, S) end,
-    AvailablePredFun = fun(S) -> escalus_pred:is_presence_with_type(<<"available">>, S) end,
-    MsgPredFun = fun(S) -> escalus_pred:is_chat_message(MsgBody, S) end,
-
     escalus:fresh_story(Config, [{bob, 1}], fun(Bob) ->
-        % GIVEN Bob's pending subscription to Alice's presence
-        AliceUser = proplists:get_value(username, AliceSpec),
-        AliceServer = proplists:get_value(server, AliceSpec),
-        AliceJid = <<AliceUser/binary, $@, AliceServer/binary>>,
-        escalus:send(Bob, escalus_stanza:presence_direct(AliceJid, <<"subscribe">>)),
+        % GIVEN Bob's pending subscription to User's presence
+        UserJid = common_helper:get_bjid(UserSpec),
+        escalus:send(Bob, escalus_stanza:presence_direct(UserJid, <<"subscribe">>)),
         _RosterPushReq = escalus:wait_for_stanza(Bob),
 
-        % WHEN Alice becomes online...
-        Steps = connection_steps_to_enable_stream_resumption(),
-        {ok, Alice, _} = escalus_connection:start(AliceSpec, Steps),
-        InitialPresence = escalus_stanza:presence(<<"available">>),
-        escalus_connection:send(Alice, InitialPresence),
-        AvailableAndSubPresences = escalus:wait_for_stanzas(Alice, 2),
-        escalus:assert_many([SubPredFun, AvailablePredFun], AvailableAndSubPresences),
+        % WHEN User becomes online...
+        User = connect_spec(UserSpec, sr_session, manual),
+        send_initial_presence(User),
+        %% subscribe could come before the initial presence
+        escalus:assert_many([is_presence(<<"available">>), is_presence(<<"subscribe">>)],
+                            escalus:wait_for_stanzas(User, 2)),
 
-        % ...and Bob sends a message to Alice...
-        escalus:send(Bob, escalus_stanza:chat_to(Alice, MsgBody)),
-        MsgStanza = escalus:wait_for_stanza(Alice),
+        % ...and Bob sends a message to User...
+        escalus:send(Bob, escalus_stanza:chat_to(User, MsgBody)),
+        MsgStanza = escalus:wait_for_stanza(User),
         escalus:assert(is_chat_message, [MsgBody], MsgStanza),
 
-        % ...and Alice terminates connection without acking anything...
-        escalus_client:kill_connection(Config, Alice),
+        % ...and User terminates connection without acking anything...
+        escalus_client:kill_connection(Config, User),
 
         % ...and reconnects with session replacement.
-        {ok, Alice2, _} = escalus_connection:start(AliceSpec, connection_steps_to_session()),
+        User2 = connect_spec(UserSpec, session, manual),
 
-        % THEN Alice receives (without sending initial presence):
-        % * buffered available presence (because it's addressed to full JID)
+        % THEN User receives (without sending initial presence):
         % * buffered Bob's message (like above)
-        % Alice DOESN'T receive:
+        % User DOESN'T receive:
         % * buffered subscription request because it is dropped by ejabberd_sm
         %   because it's treated like repeated sub request to bare JID, so it's not
         %   processed by any sub req handler (like mod_roster)
-        SubReqAndInitialPresence = escalus:wait_for_stanzas(Alice2, 2),
-        escalus:assert_many([AvailablePredFun, MsgPredFun], SubReqAndInitialPresence),
+        % * buffered available presence from User - because it is addressed to another SID
+        %   and User2 is a brand new session
+        escalus:assert(is_chat_message, [MsgBody], escalus:wait_for_stanza(User2)),
+        sm_helper:send_and_receive(Bob, User2, <<"flush1">>),
+        escalus_assert:has_no_stanzas(User2),
 
-        escalus_connection:stop(Alice2)
+        %% Only once an initial presence is sent, a subscription request is sent
+        send_initial_presence(User2),
+        escalus:assert_many([is_presence(<<"available">>), is_presence(<<"subscribe">>)],
+                            escalus:wait_for_stanzas(User2, 2)),
+
+        sm_helper:send_and_receive(Bob, User2, <<"flush2">>),
+        escalus_assert:has_no_stanzas(User2),
+
+        escalus_connection:stop(User2)
     end).
 
 %% This is a regression test for a bug, due to which messages sent to old session
 %% in a middle of state handover were not appended properly to SM buffer.
 %% Scenario to reproduce:
-%% 1. Online Bob and Alice
-%% 2. Alice kills the connecion
-%% 3. Alice's session is suspended
-%% 4. Alice resumes session with new connection. At this moment new session is still not
+%% 1. Online Bob and User
+%% 2. User kills the connection
+%% 3. User's session is suspended
+%% 4. User resumes session with new connection. At this moment new session is still not
 %%    present in session table. `resume` request is stuck in old proc mailbox.
-%% 5. Bob sends a message to Alice. Only old proc is present in session table so now
+%% 5. Bob sends a message to User. Only old proc is present in session table so now
 %%    old session has two messages in mailbox: `resume` and XML from Bob
 %% 6. We resume old process and it begins session handover
 %% 7. Bob's message is appended to SM buffer in "flush" step
 %% 8. With bug fixed, the message is retransmitted properly
 messages_are_properly_flushed_during_resumption(Config) ->
-    AliceSpec = escalus_fresh:create_fresh_user(Config, alice),
     escalus:fresh_story(Config, [{bob, 1}], fun(Bob) ->
-        % GIVEN (online Bob) and (Alice in resume state); Alice's session is suspended
-        Steps = connection_steps_to_enable_stream_resumption(),
-        {ok, Alice = #client{props = Props}, _} = escalus_connection:start(AliceSpec, Steps),
-        SMID = proplists:get_value(smid, Props),
-        InitialPresence = escalus_stanza:presence(<<"available">>),
-        escalus_connection:send(Alice, InitialPresence),
-        Presence = escalus:wait_for_stanza(Alice),
-        escalus:assert(is_presence, Presence),
-        SMH = escalus_connection:get_sm_h(Alice),
-        escalus_client:kill_connection(Config, Alice),
-        {ok, C2SPid} = get_session_pid(AliceSpec, server_string("escalus-default-resource")),
+        % GIVEN (online Bob) and (User in resume state); User's session is suspended
+        User = connect_fresh(Config, ?config(user, Config), sr_presence),
+        SMH = escalus_connection:get_sm_h(User),
+        escalus_client:kill_connection(Config, User),
+        %% The receiver process would stop now
+        C2SPid = mongoose_helper:get_session_pid(User),
+        sm_helper:wait_until_resume_session(C2SPid),
+
+        sm_helper:wait_for_queue_length(C2SPid, 0),
         ok = rpc(mim(), sys, suspend, [C2SPid]),
 
         % WHEN new session requests resumption
@@ -1183,113 +1508,76 @@ messages_are_properly_flushed_during_resumption(Config) ->
         % because new client start will block until old process is resumed
 
         MsgBody = <<"flush-regression">>,
-        spawn(fun() ->
-                      wait_for_queue_length(C2SPid, 1),
+        spawn_link(fun() ->
+                      sm_helper:wait_for_queue_length(C2SPid, 1),
 
                       % Bob sends a message...
-                      escalus:send(Bob, escalus_stanza:chat_to(Alice, MsgBody)),
+                      escalus:send(Bob, escalus_stanza:chat_to(User, MsgBody)),
 
-                      % ...we ensure that a message is enqueued in Alice's session...
+                      % ...we ensure that a message is enqueued in User's session...
                       % (2 messages = resume request + Bob's message)
-                      wait_for_queue_length(C2SPid, 2),
+                      sm_helper:wait_for_queue_length(C2SPid, 2),
 
                       % ...and old process is resumed.
                       ok = rpc(mim(), sys, resume, [C2SPid])
               end),
-
-        Steps2 = connection_steps_to_stream_resumption(SMID, SMH),
-        {ok, Alice2, _} = escalus_connection:start(AliceSpec, Steps2),
-
-        % THEN Alice's new session receives Bob's message
-        RecvMsg = escalus:wait_for_stanza(Alice2),
-        escalus:assert(is_chat_message, [MsgBody], RecvMsg)
-      end).
-
-messages_are_properly_flushed_during_resumption_p1_fsm_old(Config) ->
-    %% the same as messages_are_properly_flushed_during_resumption,
-    %% but tests that buffered by p1_fsm_old messages are delivered
-    AliceSpec = escalus_fresh:create_fresh_user(Config, alice),
-    escalus:fresh_story(Config, [{bob, 1}], fun(Bob) ->
-        Steps = connection_steps_to_enable_stream_resumption(),
-        {ok, Alice = #client{props = Props}, _} = escalus_connection:start(AliceSpec, Steps),
-        SMID = proplists:get_value(smid, Props),
-        InitialPresence = escalus_stanza:presence(<<"available">>),
-        escalus_connection:send(Alice, InitialPresence),
-        Presence = escalus:wait_for_stanza(Alice),
-        escalus:assert(is_presence, Presence),
-        SMH = escalus_connection:get_sm_h(Alice),
-        escalus_client:kill_connection(Config, Alice),
-        {ok, C2SPid} = get_session_pid(AliceSpec, server_string("escalus-default-resource")),
-        ok = rpc(mim(), sys, suspend, [C2SPid]),
-
-        %% send some dummy event. ignored by c2s but ensures that
-        %% p1_old_fsm buffers the messages, sent after this one
-        rpc(mim(), p1_fsm_old, send_all_state_event, [C2SPid, dummy_event]),
-
-        MsgBody = <<"flush-regression">>,
-        spawn(fun() ->
-                    wait_for_queue_length(C2SPid, 2),
-
-                    % Bob sends a message...
-                    escalus:send(Bob, escalus_stanza:chat_to(Alice, MsgBody)),
-
-                    % ...we ensure that a message is enqueued in Alice's session...
-                    % (2 messages = resume request + Bob's message)
-                    wait_for_queue_length(C2SPid, 3),
-
-                    % ...and old process is resumed.
-                    ok = rpc(mim(), sys, resume, [C2SPid])
-              end),
-
-        Steps2 = connection_steps_to_stream_resumption(SMID, SMH),
-        {ok, Alice2, _} = escalus_connection:start(AliceSpec, Steps2),
-
-        % THEN Alice's new session receives Bob's message
-        RecvMsg = escalus:wait_for_stanza(Alice2),
+        User2 = connect_resume(User, SMH),
+        % THEN User's new session receives Bob's message
+        RecvMsg = escalus:wait_for_stanza(User2),
         escalus:assert(is_chat_message, [MsgBody], RecvMsg)
       end).
 
 no_crash_if_stream_mgmt_disabled_but_client_requests_stream_mgmt(Config) ->
-    AliceSpec = escalus_fresh:create_fresh_user(Config, alice),
-    Steps = connection_steps_to_session(),
-    {ok, Alice, _Features} = escalus_connection:start(AliceSpec, Steps),
+    User = connect_fresh(Config, ?config(user, Config), session, manual),
     %% Should not crash anything!
-    escalus_connection:send(Alice, escalus_stanza:enable_sm()),
-    Response = escalus_connection:get_stanza(Alice, service_unavailable),
+    escalus_connection:send(User, escalus_stanza:enable_sm()),
+    Response = escalus_connection:get_stanza(User, service_unavailable),
     escalus:assert(is_sm_failed, [<<"feature-not-implemented">>], Response),
-    escalus_connection:stop(Alice).
+    escalus_connection:stop(User).
 
 no_crash_if_stream_mgmt_disabled_but_client_requests_stream_mgmt_with_resumption(Config) ->
-    AliceSpec = escalus_fresh:create_fresh_user(Config, alice),
-    Steps = connection_steps_to_session(),
-    {ok, Alice, _Features} = escalus_connection:start(AliceSpec, Steps),
+    User = connect_fresh(Config, ?config(user, Config), session, manual),
     %% Should not crash anything!
-    escalus_connection:send(Alice, escalus_stanza:enable_sm([resume])),
-    Response = escalus_connection:get_stanza(Alice, service_unavailable),
+    escalus_connection:send(User, escalus_stanza:enable_sm([resume])),
+    Response = escalus_connection:get_stanza(User, service_unavailable),
     escalus:assert(is_sm_failed, [<<"feature-not-implemented">>], Response),
-    escalus_connection:stop(Alice).
+    escalus_connection:stop(User).
 
 %%--------------------------------------------------------------------
 %% Helpers
 %%--------------------------------------------------------------------
 start_hook_listener(Resource) ->
     TestCasePid = self(),
-    rpc(mim(), ?MODULE, rpc_start_hook_handler, [TestCasePid, Resource]).
+    rpc(mim(), ?MODULE, rpc_start_hook_handler, [TestCasePid, Resource, host_type()]).
 
-rpc_start_hook_handler(TestCasePid, User) ->
-    LUser=jid:nodeprep(User),
-    Handler = fun(Acc, Jid) ->
-                {U, _S, R} = jid:to_lower(Jid),
-                case U of
-                    LUser ->
-                        Counter = mongoose_acc:get(sm_test, counter, 0, Acc),
-                        El = mongoose_acc:element(Acc),
-                        TestCasePid ! {sm_test, Counter, R, El},
-                        mongoose_acc:set_permanent(sm_test, counter, Counter + 1, Acc);
-                    _ -> Acc
-                end
-              end,
-    ejabberd_hooks:add(unacknowledged_message, <<"localhost">>, Handler, 50).
+stop_hook_listener(HookExtra) ->
+    rpc(mim(), ?MODULE, rpc_stop_hook_handler, [HookExtra, host_type()]).
+
+rpc_start_hook_handler(TestCasePid, User, HostType) ->
+    LUser = jid:nodeprep(User),
+    Extra = #{luser => LUser, pid => TestCasePid},
+    gen_hook:add_handler(unacknowledged_message, HostType,
+                         fun ?MODULE:hook_handler_fn/3,
+                         Extra, 50),
+    Extra.
+
+rpc_stop_hook_handler(HookExtra, HostType) ->
+    gen_hook:delete_handler(unacknowledged_message, HostType,
+                            fun ?MODULE:hook_handler_fn/3,
+                            HookExtra, 50).
+
+hook_handler_fn(Acc,
+                #{jid := Jid} = _Params,
+                #{luser := LUser, pid := TestCasePid} = _Extra) ->
+    {U, _S, R} = jid:to_lower(Jid),
+    case U of
+        LUser ->
+            Counter = mongoose_acc:get(sm_test, counter, 0, Acc),
+            El = mongoose_acc:element(Acc),
+            TestCasePid ! {sm_test, Counter, R, El},
+            {ok, mongoose_acc:set_permanent(sm_test, counter, Counter + 1, Acc)};
+        _ -> {ok, Acc}
+    end.
 
 wait_for_unacked_msg_hook(Counter, Res, Timeout) ->
     receive
@@ -1301,171 +1589,75 @@ wait_for_unacked_msg_hook(Counter, Res, Timeout) ->
         timeout
     end.
 
-get_stream_resumption_enabled_fresh_user_smid_and_h(Config, UserAtom) ->
-    UserSpec = escalus_fresh:create_fresh_user(Config, UserAtom),
-    Steps = connection_steps_to_enable_stream_resumption(),
-    {ok, User = #client{props = Props}, _} = escalus_connection:start(UserSpec, Steps),
-    process_initial_stanza(User),
-    SMID = proplists:get_value(smid, Props),
-    SMH = escalus_connection:get_sm_h(User),
-    {User, UserSpec, SMID, SMH}.
+start_filter_hook_listener(FilterText, Resource) ->
+    rpc(mim(), ?MODULE, rpc_start_filter_hook_handler, [FilterText, Resource, host_type()]).
 
-process_initial_stanza(User) ->
-    escalus:send(User, escalus_stanza:presence(<<"available">>)),
-    escalus:assert(is_presence, escalus:wait_for_stanza(User)).
+stop_filter_hook_listener(HookExtra) ->
+    rpc(mim(), ?MODULE, rpc_stop_filter_hook_handler, [HookExtra, host_type()]).
 
-discard_offline_messages(Config, UserName) ->
-    discard_offline_messages(Config, UserName, 1).
+rpc_start_filter_hook_handler(FilterText, User, HostType) ->
+    LUser = jid:nodeprep(User),
+    Extra = #{luser => LUser, filter_text => FilterText},
+    gen_hook:add_handler(filter_unacknowledged_messages, HostType,
+                         fun ?MODULE:filter_hook_handler_fn/3,
+                         Extra, 50),
+    Extra.
 
-discard_offline_messages(Config, UserName, H) when is_atom(UserName) ->
-    Spec = escalus_users:get_options(Config, UserName),
-    {ok, User, _} = escalus_connection:start(Spec),
-    escalus_connection:send(User, escalus_stanza:presence(<<"available">>)),
-    discard_offline_messages(Config, User, H);
-discard_offline_messages(Config, User, H) ->
-    Stanza = escalus_connection:get_stanza(User, maybe_offline_msg),
-    escalus_connection:send(User, escalus_stanza:sm_ack(H)),
-    case escalus_pred:is_presence(Stanza) of
-        true ->
-            ok;
-        false ->
-            discard_offline_messages(Config, User, H+1)
+rpc_stop_filter_hook_handler(HookExtra, HostType) ->
+    gen_hook:delete_handler(filter_unacknowledged_messages, HostType,
+                            fun ?MODULE:filter_hook_handler_fn/3,
+                            HookExtra, 50).
+
+filter_hook_handler_fn(Buffer,
+                       #{jid := Jid} = _Params,
+                       #{luser := LUser, filter_text := FilterText} = _Extra) ->
+    {U, _} = jid:to_lus(Jid),
+    case U of
+        LUser ->
+            F = fun(Acc) -> filter_text(Acc, FilterText) end,
+            NewBuffer = lists:filter(F, Buffer),
+            {ok, NewBuffer};
+        _ -> {ok, Buffer}
     end.
 
-buffer_max(BufferMax) ->
-    {buffer_max,
-     fun () ->
-             rpc(mim(), ?MOD_SM, get_buffer_max, [unset])
-     end,
-     fun (unset) ->
-             ct:pal("buffer_max was not set - setting to 'undefined'"),
-             rpc(mim(), ?MOD_SM, set_buffer_max, [undefined]);
-         (V) ->
-             rpc(mim(), ?MOD_SM, set_buffer_max, [V])
-     end,
-     BufferMax}.
-
-ack_freq(AckFreq) ->
-    {ack_freq,
-     fun () ->
-             rpc(mim(), ?MOD_SM, get_ack_freq, [unset])
-     end,
-     fun (unset) ->
-             ct:pal("ack_freq was not set - setting to 'undefined'"),
-             rpc(mim(), ?MOD_SM, set_ack_freq, [undefined]);
-         (V) ->
-             rpc(mim(), ?MOD_SM, set_ack_freq, [V])
-     end,
-     AckFreq}.
-
-assert_no_offline_msgs(Spec) ->
-    Username = escalus_utils:jid_to_lower(proplists:get_value(username, Spec)),
-    Server = proplists:get_value(server, Spec),
-    0 = mongoose_helper:total_offline_messages({Username, Server}).
-
-assert_no_offline_msgs() ->
-    0 = mongoose_helper:total_offline_messages().
-
-wait_for_c2s_state_change(C2SPid, NewStateName) ->
-    mongoose_helper:wait_until(fun() -> get_c2s_state(C2SPid) end, NewStateName,
-                                #{name => get_c2s_state, time_left => timer:seconds(5)}).
-
-wait_for_c2s_unacked_count(C2SPid, Count) ->
-    mongoose_helper:wait_until(fun() -> get_c2s_unacked_count(C2SPid) end, Count,
-                                #{name => get_c2s_state, time_left => timer:seconds(5)}).
-
-get_c2s_unacked_count(C2SPid) ->
-     Info = rpc(mim(), ejabberd_c2s, get_info, [C2SPid]),
-     maps:get(stream_mgmt_buffer_size, Info).
-
-assert_c2s_state(C2SPid, StateName) ->
-    StateName = get_c2s_state(C2SPid).
-
-get_c2s_state(C2SPid) when is_pid(C2SPid) ->
-    SysStatus = rpc(mim(), sys, get_status, [C2SPid]),
-    extract_state_name(SysStatus).
-
-extract_state_name(SysStatus) ->
-    {status, _Pid, {module, _},
-     [_, _, _, _, [_, {data, FSMData} | _]]} = SysStatus,
-    proplists:get_value("StateName", FSMData).
-
-wait_until_disconnected(UserSpec) ->
-    mongoose_helper:wait_until(fun() -> get_user_alive_resources(UserSpec) =:= [] end, true,
-                               #{name => get_user_alive_resources}).
-
-monitor_session(Client) ->
-    UserSpec = Client#client.props,
-    {resource, Res} = lists:keyfind(resource, 1, UserSpec),
-    {ok, C2SPid} = get_session_pid(UserSpec, Res),
-    erlang:monitor(process, C2SPid).
-
-wait_for_process_termination(C2SRef) ->
-    receive
-        {'DOWN', _MRef, _Type, C2SRef, _Info} ->
-            ok
-    after timer:seconds(1) ->
-              ok
-    end,
-    ok.
-
-get_session_pid(UserSpec, Resource) ->
-    {U, S} = get_us_from_spec(UserSpec),
-    JID = mongoose_helper:make_jid(U, S, Resource),
-    case rpc(mim(), ejabberd_sm, get_session_pid, [JID]) of
-        none ->
-            {error, no_found};
-        C2SPid ->
-            {ok, C2SPid}
+filter_text(Acc, FilterText) ->
+    case mongoose_acc:stanza_name(Acc) of
+        <<"message">> ->
+            El = mongoose_acc:element(Acc),
+            FilterText =/= exml_query:path(El, [{element, <<"body">>}, cdata]);
+        _ ->
+            true
     end.
-
-get_user_alive_resources(UserSpec) ->
-    {U, S} = get_us_from_spec(UserSpec),
-    JID = mongoose_helper:make_jid(U, S, <<>>),
-    rpc(mim(), ejabberd_sm, get_user_resources, [JID]).
-
-get_user_present_resources(UserSpec) ->
-    {U, S} = get_us_from_spec(UserSpec),
-    JID = mongoose_helper:make_jid(U, S, <<>>),
-    rpc(mim(), ejabberd_sm, get_user_present_resources, [JID]).
-
-get_sid_by_stream_id(SMID) ->
-    rpc(mim(), ?MOD_SM, get_sid, [SMID]).
-
-get_us_from_spec(UserSpec) ->
-    ConfigUS = [proplists:get_value(username, UserSpec),
-                proplists:get_value(server, UserSpec)],
-    [U, S] = [server_string(V) || V <- ConfigUS],
-    {U, S}.
-
-clear_session_table() ->
-    Node = ct:get_config({hosts, mim, node}),
-    SessionBackend  = rpc(mim(), ejabberd_sm_backend, backend, []),
-    rpc(mim(), SessionBackend, cleanup, [Node]).
-
-clear_sm_session_table() ->
-    rpc(mim(), mnesia, clear_table, [sm_session]).
 
 is_chat(Content) ->
     fun(Stanza) -> escalus_pred:is_chat_message(Content, Stanza) end.
 
-given_fresh_user(Config, UserName) ->
-    Spec = escalus_fresh:create_fresh_user(Config, UserName),
-    given_fresh_user_with_spec(Spec).
+is_presence(Type) ->
+    fun(Stanza) -> escalus_pred:is_presence_with_type(Type, Stanza) end.
 
-given_fresh_user_with_spec(Spec) ->
-    {ok, User = #client{props = Props}, _} = escalus_connection:start(Spec),
-    escalus:send(User, escalus_stanza:presence(<<"available">>)),
-    escalus:wait_for_stanza(User),
-    JID = common_helper:get_bjid(Props),
-    {User#client{jid  = JID}, Spec}.
+three_texts() ->
+    [<<"msg-1">>, <<"msg-2">>, <<"msg-3">>].
 
-wait_for_queue_length(Pid, Length) ->
-    mongoose_helper:wait_until(
-      fun() ->
-              rpc(mim(), erlang, process_info, [Pid, message_queue_len])
-      end, {message_queue_len, Length}).
+get_stanzas_filtered_by_mod_ping() ->
+    History = rpc(mim(), meck, history, [mod_ping]),
+    [Stanza ||
+        {_Pid,
+         {_Mod,
+          filter_local_packet = _Func,
+          [{_, _, _, Stanza} = _Acc, _Params, _Extra] = _Args
+         },
+         {stop, drop} = _Result
+        } <- History
+    ].
 
+check_stanzas_filtered_by_mod_ping() ->
+    Stanzas = get_stanzas_filtered_by_mod_ping(),
+    lists:foreach(fun(Stanza) ->
+        escalus:assert(is_iq_error, Stanza),
+        ?assertNotEqual(undefined,
+            exml_query:subelement_with_name_and_ns(Stanza, <<"ping">>, <<"urn:xmpp:ping">>))
+    end, Stanzas),
+    ?assert(length(Stanzas) > 0).
 %%--------------------------------------------------------------------
 %% IQ handler necessary for reproducing "replies_are_processed_by_resumed_session"
 %%--------------------------------------------------------------------
@@ -1473,14 +1665,18 @@ wait_for_queue_length(Pid, Length) ->
 regression_ns() ->
     <<"regression">>.
 
-register_handler(Host) ->
-    rpc(mim(), gen_iq_handler, add_iq_handler,
-        [ejabberd_sm, Host, regression_ns(), ?MODULE, regression_handler, one_queue]).
+register_handler() ->
+    HostType = host_type(),
+    rpc(mim(), gen_iq_handler, add_iq_handler_for_domain,
+        [HostType, regression_ns(), ejabberd_sm,
+         fun ?MODULE:regression_handler/5, #{}, one_queue]).
 
-unregister_handler(Host) ->
-    rpc(mim(), gen_iq_handler, remove_iq_handler, [ejabberd_sm, Host, regression_ns()]).
+unregister_handler() ->
+    HostType = host_type(),
+    rpc(mim(), gen_iq_handler, remove_iq_handler_for_domain,
+        [HostType, regression_ns(), ejabberd_sm]).
 
-regression_handler(_From, _To, Acc, IQ) ->
+regression_handler(Acc, _From, _To, IQ, _Extra) ->
     %% A bit of a hack - will no longer work when the SID format changes
     {_, Pid} = mongoose_acc:get(c2s, origin_sid, undefined, Acc),
     erlang:monitor(process, Pid),
@@ -1506,5 +1702,11 @@ wait_for_session(JID, Retries, SleepTime) ->
             ok
     end.
 
-make_smid() ->
-    base64:encode(crypto:strong_rand_bytes(21)).
+maybe_ack_initial_presence(User, ack) ->
+    ack_initial_presence(User);
+maybe_ack_initial_presence(_User, no_ack) ->
+    ok.
+
+assert_h(User, H) ->
+    escalus:send(User, escalus_stanza:sm_request()),
+    escalus:assert(is_sm_ack, [H], escalus:wait_for_stanza(User)).

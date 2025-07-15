@@ -15,7 +15,7 @@
 %%==============================================================================
 
 -module(mod_time_SUITE).
--compile(export_all).
+-compile([export_all, nowarn_export_all]).
 -include_lib("escalus/include/escalus.hrl").
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -29,8 +29,7 @@ all() ->
     [{group, mod_time}].
 
 groups() ->
-    G = [{mod_time, [], [ask_for_time, time_service_discovery]}],
-    ct_helper:repeat_all_until_all_ok(G).
+    [{mod_time, [parallel], [ask_for_time, time_service_discovery]}].
 
 suite() ->
     escalus:suite().
@@ -40,19 +39,19 @@ suite() ->
 %%--------------------------------------------------------------------
 
 init_per_suite(Config) ->
-    dynamic_modules:start(<<"localhost">>, mod_time, []),
+    dynamic_modules:start(domain_helper:host_type(), mod_time, config_parser_helper:default_mod_config(mod_time)),
     escalus:init_per_suite(Config).
 
 end_per_suite(Config) ->
-    dynamic_modules:stop(<<"localhost">>, mod_time),
+    dynamic_modules:stop(domain_helper:host_type(), mod_time),
+    escalus_fresh:clean(),
     escalus:end_per_suite(Config).
 
 init_per_group(mod_time, Config) ->
-    escalus:create_users(Config, escalus:get_users([alice])).
+    Config.
 
 end_per_group(mod_time, Config) ->
-    escalus:delete_users(Config, escalus:get_users([alice])).
-
+    Config.
 
 init_per_testcase(CaseName, Config) ->
     escalus:init_per_testcase(CaseName, Config).
@@ -65,7 +64,7 @@ end_per_testcase(CaseName, Config) ->
 %%--------------------------------------------------------------------
 
 ask_for_time(Config) ->
-    escalus:story(Config, [{alice, 1}], fun(Alice) ->
+    escalus:fresh_story(Config, [{alice, 1}], fun(Alice) ->
         Server = escalus_users:get_server(Config, alice),
         ID = escalus_stanza:id(),
         TimeStanza = time_request_stanza(Server, ID),
@@ -83,7 +82,7 @@ ask_for_time(Config) ->
 %%--------------------------------------------------------------------
 
 time_service_discovery(Config) ->
-    escalus:story(
+    escalus:fresh_story(
         Config, [{alice, 1}],
         fun(Client) ->
             ServJID = escalus_client:server(Client),
@@ -98,26 +97,26 @@ time_service_discovery(Config) ->
 
 time_request_stanza(Server, ID) ->
     #xmlel{name = <<"iq">>,
-           attrs = [{<<"type">>, <<"get">>},
-                    {<<"id">>, ID}, {<<"to">>, Server}],
+           attrs = #{<<"type">> => <<"get">>,
+                     <<"id">> => ID,
+                     <<"to">> => Server},
            children = [#xmlel{name = <<"time">>,
-                              attrs = [{<<"xmlns">>, ?NS_TIME}]}]}.
+                              attrs = #{<<"xmlns">> => ?NS_TIME}}]}.
 
-check_ns(#xmlel{name = <<"iq">>, attrs = _, children = [Child]}) ->
+check_ns(#xmlel{name = <<"iq">>, children = [Child]}) ->
     case Child of
-        #xmlel{name = <<"time">>, attrs = [{<<"xmlns">>, ?NS_TIME}], children = _} -> true;
+        #xmlel{name = <<"time">>, attrs = #{<<"xmlns">> := ?NS_TIME}, children = _} -> true;
         _ -> false
     end;
-
 check_ns(_) ->
     false.
 
-time_from_stanza(#xmlel{name = <<"iq">>, attrs = _, children = [Child]}) ->
+time_from_stanza(#xmlel{name = <<"iq">>, children = [Child]}) ->
     case Child of
-        #xmlel{name = <<"time">>, attrs = [{<<"xmlns">>, ?NS_TIME}], children = Times} ->
+        #xmlel{name = <<"time">>, attrs = #{<<"xmlns">> := ?NS_TIME}, children = Times} ->
             case Times of
-                [#xmlel{name = <<"tzo">>, attrs = _, children = [#xmlcdata{content = Tzo}]},
-                 #xmlel{name = <<"utc">>, attrs = _, children = [#xmlcdata{content = Utc}]}] ->
+                [#xmlel{name = <<"tzo">>, children = [#xmlcdata{content = Tzo}]},
+                 #xmlel{name = <<"utc">>, children = [#xmlcdata{content = Utc}]}] ->
                     {Tzo, Utc};
                 _ -> no_timezone
             end;

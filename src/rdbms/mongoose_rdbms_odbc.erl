@@ -16,11 +16,18 @@
 
 -module(mongoose_rdbms_odbc).
 -author('konrad.zemek@erlang-solutions.com').
--behaviour(mongoose_rdbms).
+-behaviour(mongoose_rdbms_backend).
+-include("mongoose_logger.hrl").
 
 -export([escape_binary/1, escape_string/1,
          unescape_binary/1, connect/2, disconnect/1,
          query/3, prepare/5, execute/4]).
+
+-type tabcol() :: {binary(), binary()}.
+
+-type options() :: #{settings := string(), atom() => any()}.
+
+-type result_tuple() :: tuple().
 
 %% API
 
@@ -34,11 +41,11 @@ escape_string(Iolist) ->
 
 -spec unescape_binary(binary()) -> binary().
 unescape_binary(Bin) when is_binary(Bin) ->
-    bin_to_hex:hex_to_bin(Bin).
+    binary:decode_hex(Bin).
 
--spec connect(Args :: any(), QueryTimeout :: non_neg_integer()) ->
+-spec connect(options(), QueryTimeout :: non_neg_integer()) ->
                      {ok, Connection :: term()} | {error, Reason :: any()}.
-connect(Settings, _QueryTimeout) when is_list(Settings) ->
+connect(#{settings := Settings}, _QueryTimeout) when is_list(Settings) ->
     %% We need binary_strings=off to distinguish between:
     %% - UTF-16 encoded NVARCHARs - encoded as binaries.
     %% - Binaries/regular strings - encoded as list of small integers.
@@ -73,19 +80,30 @@ query(Connection, Query, Timeout) ->
 
 -spec prepare(Connection :: term(), Name :: atom(), Table :: binary(),
               Fields :: [binary()], Statement :: iodata()) ->
-                     {ok, {[binary()], [fun((term()) -> tuple())]}}.
-prepare(Connection, _Name, Table, Fields, Statement) ->
-    {ok, TableDesc} = eodbc:describe_table(Connection, unicode:characters_to_list(Table)),
-    SplitQuery = binary:split(iolist_to_binary(Statement), <<"?">>, [global]),
-    ServerType = server_type(),
-    ParamMappers = [field_name_to_mapper(ServerType, TableDesc, Field) || Field <- Fields],
-    {ok, {SplitQuery, ParamMappers}}.
+                     {ok, {binary(), [fun((term()) -> tuple())]}}.
+prepare(Connection, Name, Table, Fields, Statement) ->
+    TabCols = fields_to_tabcol(Fields, Table),
+    try prepare2(Connection, TabCols, Statement)
+    catch Class:Reason:Stacktrace ->
+              ?LOG_ERROR(#{what => prepare_failed,
+                           statement_name => Name, sql_query => Statement,
+                           class => Class, reason => Reason, stacktrace => Stacktrace}),
+              erlang:raise(Class, Reason, Stacktrace)
+    end.
 
--spec execute(Connection :: term(), Statement :: {[binary()], [fun((term()) -> tuple())]},
+prepare2(Connection, TabCols, Statement) ->
+    Tables = tabcols_to_tables(TabCols),
+    TableDesc = describe_tables(Connection, Tables),
+    ServerType = server_type(),
+    ParamMappers = [tabcol_to_mapper(ServerType, TableDesc, TabCol) || TabCol <- TabCols],
+    {ok, {iolist_to_binary(Statement), ParamMappers}}.
+
+-spec execute(Connection :: term(), Statement :: {binary(), [fun((term()) -> tuple())]},
               Params :: [term()], Timeout :: infinity | non_neg_integer()) ->
                      mongoose_rdbms:query_result().
-execute(Connection, {SplitQuery, ParamMapper}, Params, Timeout) ->
-    {Query, ODBCParams} = unsplit_query(SplitQuery, ParamMapper, Params),
+execute(Connection, {Query, ParamMapper}, Params, Timeout)
+    when length(ParamMapper) =:= length(Params) ->
+    ODBCParams = map_params(Params, ParamMapper),
     case eodbc:param_query(Connection, Query, ODBCParams, Timeout) of
         {error, Reason} ->
             Map = #{reason => Reason,
@@ -94,12 +112,20 @@ execute(Connection, {SplitQuery, ParamMapper}, Params, Timeout) ->
             {error, Map};
         Result ->
             parse(Result)
-    end.
-
+    end;
+execute(Connection, {Query, ParamMapper}, Params, Timeout) ->
+    ?LOG_ERROR(#{what => odbc_execute_failed,
+                 params_length => length(Params),
+                 mapped_length => length(ParamMapper),
+                 connection => Connection,
+                 sql_query => Query,
+                 query_params => Params,
+                 param_mapper => ParamMapper}),
+    erlang:error({badarg, [Connection, {Query, ParamMapper}, Params, Timeout]}).
 
 %% Helpers
 
--spec parse(eodbc:result_tuple() | [eodbc:result_tuple()] | {error, string()}) ->
+-spec parse(result_tuple() | [result_tuple()] | {error, string()}) ->
                    mongoose_rdbms:query_result().
 parse(Items) when is_list(Items) ->
     [parse(Item) || Item <- Items];
@@ -139,21 +165,67 @@ parse_row([FieldValue|Row], [generic|FieldsInfo]) ->
 parse_row([], []) ->
     [].
 
--spec field_name_to_mapper(ServerType :: atom(),
-                           TableDesc :: proplists:proplist(),
-                           FieldName :: binary()) -> fun((term()) -> tuple()).
-field_name_to_mapper(ServerType, TableDesc, FieldName) ->
-    {_, ODBCType} = lists:keyfind(unicode:characters_to_list(FieldName), 1, TableDesc),
+-spec tabcol_to_mapper(ServerType :: atom(),
+                       TableDesc :: proplists:proplist(),
+                       TabCol :: tabcol()) -> fun((term()) -> tuple()).
+tabcol_to_mapper(_ServerType, _TableDesc, {_, <<"limit">>}) ->
+    fun(P) -> {sql_integer, [P]} end;
+tabcol_to_mapper(_ServerType, _TableDesc, {_, <<"offset">>}) ->
+    fun(P) -> {sql_integer, [P]} end;
+tabcol_to_mapper(_ServerType, TableDesc, TabCol) ->
+    ODBCType = tabcol_to_odbc_type(TabCol, TableDesc),
     case simple_type(just_type(ODBCType)) of
         binary ->
-            fun(P) -> {[escape_binary(ServerType, P)], []} end;
+            fun(P) -> binary_mapper(P) end;
         unicode ->
-            fun(P) -> {[escape_text_or_integer(ServerType, P)], []} end;
+            fun(P) -> unicode_mapper(P) end;
         bigint ->
-            fun(P) -> {[<<"'">>, integer_to_binary(P), <<"'">>], []} end;
+            fun(P) -> bigint_mapper(P) end;
         _ ->
-            fun(P) -> {<<"?">>, [{ODBCType, [P]}]} end
+            fun(P) -> generic_mapper(ODBCType, P) end
     end.
+
+tabcol_to_odbc_type(TabCol = {Table, Column}, TableDesc) ->
+    case lists:keyfind(TabCol, 1, TableDesc) of
+        false ->
+            ?LOG_ERROR(#{what => field_to_odbc_type_failed, table => Table,
+                         column => Column, table_desc => TableDesc}),
+            error(field_to_odbc_type_failed);
+        {_, ODBCType} ->
+            ODBCType
+    end.
+
+%% Null should be encoded with the correct type. Otherwise when inserting two records,
+%% where one value is null and the other is not, would cause:
+%% > [FreeTDS][SQL Server]Conversion failed when converting the nvarchar value
+%%   'orig_id' to data type int. SQLSTATE IS: 22018
+unicode_mapper(null) ->
+    {{sql_wlongvarchar, 0}, [null]};
+unicode_mapper(P) ->
+    Utf16 = unicode_characters_to_binary(iolist_to_binary(P), utf8, {utf16, little}),
+    Len = byte_size(Utf16) div 2,
+    {{sql_wlongvarchar, Len}, [Utf16]}.
+
+bigint_mapper(null) ->
+    Type = {'sql_varchar', 0},
+    {Type, [null]};
+bigint_mapper(P) when is_integer(P) ->
+    B = integer_to_binary(P),
+    Type = {'sql_varchar', byte_size(B)},
+    {Type, [B]}.
+
+binary_mapper(null) ->
+    Type = {'sql_longvarbinary', 0},
+    {Type, [null]};
+binary_mapper(P) ->
+    Type = {'sql_longvarbinary', byte_size(P)},
+    {Type, [P]}.
+
+generic_mapper(ODBCType, null) ->
+    {ODBCType, [null]};
+generic_mapper(ODBCType, P) ->
+    {ODBCType, [P]}.
+
 
 simple_type('SQL_BINARY')           -> binary;
 simple_type('SQL_VARBINARY')        -> binary;
@@ -170,35 +242,23 @@ just_type({Type, _Len}) ->
 just_type(Type) ->
     Type.
 
--spec unsplit_query(SplitQuery :: [binary()], ParamMappers :: [fun((term()) -> tuple())],
-                    Params :: [term()]) -> {Query :: string(), ODBCParams :: [tuple()]}.
-unsplit_query(SplitQuery, ParamMappers, Params) ->
-    unsplit_query(SplitQuery, queue:from_list(ParamMappers), Params, [], []).
+map_params([Param|Params], [Mapper|Mappers]) ->
+    [map_param(Param, Mapper)|map_params(Params, Mappers)];
+map_params([], []) ->
+    [].
 
--spec unsplit_query(SplitQuery :: [binary()], ParamMappers :: queue:queue(fun((term()) -> tuple())),
-                    Params :: [term()], QueryAcc :: [binary()], ParamsAcc :: [tuple()]) ->
-                           {Query :: string(), ODBCParams :: [tuple()]}.
-unsplit_query([QueryHead], _ParamMappers, [], QueryAcc, ParamsAcc) ->
-    %% Make a list of bytes
-    Query = binary_to_list(iolist_to_binary(lists:reverse([QueryHead | QueryAcc]))),
-    Params = lists:reverse(ParamsAcc),
-    {Query, Params};
-unsplit_query([QueryHead | QueryRest], ParamMappers, [Param | Params], QueryAcc, ParamsAcc) ->
-    {{value, Mapper}, ParamMappersTail} = queue:out(ParamMappers),
-    NextParamMappers = queue:in(Mapper, ParamMappersTail),
-    {InlineQuery, ODBCParam} = maybe_null(Param, Mapper),
-    NewQueryAcc = [InlineQuery, QueryHead | QueryAcc],
-    NewParamsAcc = ODBCParam ++ ParamsAcc,
-    unsplit_query(QueryRest, NextParamMappers, Params, NewQueryAcc, NewParamsAcc).
-
-maybe_null(null, _) ->
-    {"null", []};
-maybe_null(Param, Mapper) ->
+map_param(undefined, Mapper) ->
+    map_param(null, Mapper);
+map_param(true, _Mapper) ->
+    {sql_integer, [1]};
+map_param(false, _Mapper) ->
+    {sql_integer, [0]};
+map_param(Param, Mapper) ->
     Mapper(Param).
 
 -spec server_type() -> atom().
 server_type() ->
-    ejabberd_config:get_local_option(rdbms_server_type).
+    mongoose_config:get_opt(rdbms_server_type).
 
 -spec escape_binary(ServerType :: atom(), binary()) -> iodata().
 escape_binary(pgsql, Bin) ->
@@ -206,24 +266,16 @@ escape_binary(pgsql, Bin) ->
 escape_binary(mysql, Bin) ->
     mongoose_rdbms_mysql:escape_binary(Bin);
 escape_binary(mssql, Bin) ->
-    [<<"0x">>, bin_to_hex:bin_to_hex(Bin)];
+    [<<"0x">>, binary:encode_hex(Bin, lowercase)];
 escape_binary(_ServerType, Bin) ->
-    [$', bin_to_hex:bin_to_hex(Bin), $'].
-
-%% boolean are of type {sql_varchar,5} in pgsql.
-%% So, we need to handle integers.
-%% But converting to integer would cause type check failure.
-escape_text_or_integer(_ServerType, P) when is_integer(P) ->
-    [$', integer_to_list(P), $'];
-escape_text_or_integer(ServerType, P) ->
-    escape_text(ServerType, P).
+    [$', binary:encode_hex(Bin, lowercase), $'].
 
 -spec escape_text(ServerType :: atom(), binary()) -> iodata().
 escape_text(pgsql, Bin) ->
     escape_pgsql_string(Bin);
 escape_text(mssql, Bin) ->
     Utf16 = unicode_characters_to_binary(Bin, utf8, {utf16, little}),
-    [<<"CAST(0x">>, bin_to_hex:bin_to_hex(Utf16), <<" AS NVARCHAR(max))">>];
+    [<<"CAST(0x">>, binary:encode_hex(Utf16, lowercase), <<" AS NVARCHAR(max))">>];
 escape_text(ServerType, Bin) ->
     escape_binary(ServerType, Bin).
 
@@ -232,7 +284,7 @@ unicode_characters_to_binary(Input, FromEncoding, ToEncoding) ->
         Result when is_binary(Result) ->
             Result;
         Other ->
-            erlang:error(#{event => parse_value_failed,
+            erlang:error(#{what => parse_value_failed,
                            from_encoding => FromEncoding,
                            to_encoding => ToEncoding,
                            input_binary => Input,
@@ -245,3 +297,25 @@ escape_pgsql_string(Bin) ->
 %% Duplicate each single quaote
 escape_pgsql_characters(Bin) when is_binary(Bin) ->
     binary:replace(Bin, <<"'">>, <<"''">>, [global]).
+
+fields_to_tabcol(Fields, DefaultTable) ->
+    [field_to_tabcol(Field, DefaultTable) || Field <- Fields].
+
+field_to_tabcol(Field, DefaultTable) ->
+    case binary:split(Field, <<".">>) of
+        [Column] ->
+            {DefaultTable, Column};
+        [Table, Column] ->
+            {Table, Column}
+    end.
+
+tabcols_to_tables(TabCols) ->
+    lists:usort([Table || {Table, _Column} <- TabCols]).
+
+describe_tables(Connection, Tables) ->
+    lists:append([describe_table(Connection, Table) || Table <- Tables]).
+
+describe_table(Connection, Table) ->
+    {ok, TableDesc} = eodbc:describe_table(Connection, unicode:characters_to_list(Table)),
+    [{{Table, unicode:characters_to_binary(Column)}, ODBCType}
+     || {Column, ODBCType} <- TableDesc].

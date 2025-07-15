@@ -29,335 +29,248 @@
 -export([start/0,
          start/1,
          stop/1,
-         set_opts/2,
-         get_opt/3,
-         get_opt/2,
          authorize/1,
-         set_password/3,
-         check_password/3,
-         check_password/5,
-         try_register/3,
-         dirty_get_registered_users/0,
+         set_password/2,
+         check_password/2,
+         check_password/4,
+         try_register/2,
          get_vh_registered_users/1,
          get_vh_registered_users/2,
          get_vh_registered_users_number/1,
          get_vh_registered_users_number/2,
-         get_password/2,
-         get_password_s/2,
+         get_password_s/1,
          get_passterm_with_authmodule/2,
          does_user_exist/1,
-         is_user_exists/2,
-         is_user_exists_in_other_modules/3,
-         remove_user/2,
+         does_user_exist/3,
+         does_stored_user_exist/2,
+         does_method_support/2,
+         remove_user/1,
          supports_sasl_module/2,
-         entropy/1
+         entropy/1,
+         config_spec/1
         ]).
 
 -export([check_digest/4]).
 
--export([auth_modules/1]).
+-export([auth_modules/1,
+         auth_methods/1,
+         auth_modules_for_host_type/1,
+         methods_to_modules/1]).
 
 %% Library functions for reuse in ejabberd_auth_* modules
 -export([authorize_with_check_password/2]).
+
+%% Hook handlers
+-export([remove_domain/3]).
+-export([on_does_user_exist/3]).
+
+%% Exported for tests
+-export([instrumentation/1]).
+
+-ignore_xref([
+    auth_methods/1, auth_modules/1, check_password/4, get_vh_registered_users/2,
+    get_vh_registered_users_number/2, start/1, stop/1, instrumentation/1]).
 
 -include("mongoose.hrl").
 -include("jlib.hrl").
 
 -export_type([authmodule/0,
-              passterm/0]).
+              passterm/0,
+              exist_type/0]).
 
 -type authmodule() :: module().
 -type passterm() :: binary() | mongoose_scram:scram_tuple() | mongoose_scram:scram_map().
+-type exist_type() :: stored | with_anonymous.
 
--define(METRIC(Name), [backends, auth, Name]).
+%% Types defined below are used in call_auth_modules_*
+-type mod_res() :: any().
+-type host_type_mod_fun() :: fun((mongooseim:host_type(), authmodule()) -> mod_res()).
+-type mod_fun() :: fun((authmodule()) -> mod_res()).
+-type mod_fold_fun() :: fun((authmodule(), mod_res()) -> continue |
+                                                         {continue, mod_res()} |
+                                                         {stop, mod_res()}).
+-type event_meta() :: #{user => jid:luser(), server => jid:lserver()}.
+-type event_name() ::
+        auth_authorize
+        | auth_check_password
+        | auth_try_register
+        | auth_does_user_exist.
+
+-type call_opts() :: #{default => mod_res(), op => map,
+                       event_name => event_name(), event_meta => event_meta()}.
 
 %%%----------------------------------------------------------------------
 %%% API
 %%%----------------------------------------------------------------------
 -spec start() -> 'ok'.
 start() ->
-    lists:foreach(fun start/1, ?MYHOSTS).
+    lists:foreach(fun start/1, ?ALL_HOST_TYPES).
 
--spec start(Host :: jid:server()) -> 'ok'.
-start(Host) ->
-    ensure_metrics(Host),
-    lists:foreach(
-      fun(M) ->
-              M:start(Host)
-      end, auth_modules(Host)).
+-spec start(mongooseim:host_type()) -> ok.
+start(HostType) ->
+    mongoose_instrument:set_up(instrumentation(HostType)),
+    F = fun(Mod) -> mongoose_gen_auth:start(Mod, HostType) end,
+    call_auth_modules_for_host_type(HostType, F, #{op => map}),
+    gen_hook:add_handlers(hooks(HostType)).
 
--spec stop(Host :: jid:server()) -> 'ok'.
-stop(Host) ->
-    lists:foreach(
-      fun(M) ->
-              M:stop(Host)
-      end, auth_modules(Host)).
+-spec stop(mongooseim:host_type()) -> ok.
+stop(HostType) ->
+    gen_hook:delete_handlers(hooks(HostType)),
+    F = fun(Mod) -> mongoose_gen_auth:stop(Mod, HostType) end,
+    call_auth_modules_for_host_type(HostType, F, #{op => map}),
+    mongoose_instrument:tear_down(instrumentation(HostType)).
 
--spec set_opts(Host :: jid:server(),
-               KVs :: [tuple()]) ->  {atomic|aborted, _}.
-set_opts(Host, KVs) ->
-    OldOpts = ejabberd_config:get_local_option(auth_opts, Host),
-    AccFunc = fun({K, V}, Acc) ->
-                  lists:keystore(K, 1, Acc, {K, V})
-              end,
-    NewOpts = lists:foldl(AccFunc, OldOpts, KVs),
-    ejabberd_config:add_local_option({auth_opts, Host}, NewOpts).
+-spec hooks(mongooseim:host_type()) -> gen_hook:hook_list().
+hooks(HostType) ->
+    [
+        %% These hooks must run in between those of mod_cache_users
+        {does_user_exist, HostType, fun ?MODULE:on_does_user_exist/3, #{}, 50},
+        %% It is important that this handler happens _before_ all other modules
+        {remove_domain, HostType, fun ?MODULE:remove_domain/3, #{}, 10}
+    ].
 
--spec get_opt(Host :: jid:server(),
-              Opt :: atom(),
-              Default :: ejabberd:value()) -> undefined | ejabberd:value().
-get_opt(Host, Opt, Default) ->
-    case ejabberd_config:get_local_option(auth_opts, Host) of
-        undefined ->
-            Default;
-        Opts ->
-            case lists:keyfind(Opt, 1, Opts) of
-                {Opt, Value} ->
-                    Value;
-                false ->
-                    Default
-            end
-    end.
-
-get_opt(Host, Opt) ->
-    get_opt(Host, Opt, undefined).
-
--spec supports_sasl_module(jid:lserver(), cyrsasl:sasl_module()) -> boolean().
-supports_sasl_module(Server, Module) ->
-    lists:any(fun(M) -> M:supports_sasl_module(Server, Module) end, auth_modules(Server)).
+-spec supports_sasl_module(mongooseim:host_type(), cyrsasl:sasl_module()) -> boolean().
+supports_sasl_module(HostType, SASLModule) ->
+    F = fun(Mod) ->
+                case mongoose_gen_auth:supports_sasl_module(Mod, HostType, SASLModule) of
+                    true -> {stop, true};
+                    false -> continue
+                end
+        end,
+    call_auth_modules_for_host_type(HostType, F, #{default => false}).
 
 -spec authorize(mongoose_credentials:t()) -> {ok, mongoose_credentials:t()}
-                                           | {error, any()}.
+                                           | {error, not_authorized}.
 authorize(Creds) ->
+    F = fun(Mod, {_CurResult, CurCreds}) ->
+                case mongoose_gen_auth:authorize(Mod, CurCreds) of
+                    {ok, NewCreds} ->
+                        {stop, {ok, mongoose_credentials:register(NewCreds, Mod, success)}};
+                    Error ->
+                        NewCreds = mongoose_credentials:register(CurCreds, Mod, {failure, Error}),
+                        {continue, {not_authorized, NewCreds}}
+                end
+        end,
+    HostType = mongoose_credentials:host_type(Creds),
     LServer = mongoose_credentials:lserver(Creds),
-    timed_call(LServer, authorize, fun authorize_loop/2,
-               [auth_modules(LServer), Creds]).
-
--spec authorize_loop([AuthM], Creds) -> {ok, R}
-                                      | {error, any()} when
-      AuthM :: ejabberd_gen_auth:t(),
-      Creds :: mongoose_credentials:t(),
-      R     :: mongoose_credentials:t().
-authorize_loop([], Creds) -> {error, {no_auth_modules, Creds}};
-authorize_loop(Modules, Creds) -> do_authorize_loop(Modules, Creds).
-
-do_authorize_loop([], _Creds) -> {error, not_authorized};
-do_authorize_loop([M | Modules], Creds) ->
-    try
-        {ok, NewCreds} = M:authorize(Creds),
-        {ok, mongoose_credentials:register(NewCreds, M, success)}
-    catch
-        _:R -> do_authorize_loop(Modules,
-                              mongoose_credentials:register(Creds, M, {failure, R}))
+    Modules = mongoose_credentials:auth_modules(Creds),
+    Opts = #{default => {not_authorized, Creds},
+             event_name => auth_authorize,
+             event_meta => #{server => LServer}},
+    case call_auth_modules_for_host_type(Modules, HostType, F, Opts) of
+        Res = {ok, _Creds} -> Res;
+        {not_authorized, _Creds} -> {error, not_authorized}
     end.
 
-
-%% @doc Check if the user and password can login in server.
--spec check_password(User :: jid:user(),
-                     Server :: jid:server(),
-                     Password :: binary() ) -> boolean().
-check_password(User, Server, Password) ->
-    LUser = jid:nodeprep(User),
-    LServer = jid:nameprep(Server),
-    do_check_password(LUser, LServer, Password).
-
--spec do_check_password(jid:luser(), jid:lserver(), binary()) -> boolean().
-do_check_password(LUser, LServer, _) when LUser =:= error; LServer =:= error ->
+%% @doc Check if at least one authentication method accepts the user and the password.
+-spec check_password(JID :: jid:jid() | error, Password :: binary()) -> boolean().
+check_password(error, _Password) ->
     false;
-do_check_password(LUser, LServer, Password) ->
-    case check_password_with_authmodule(LUser, LServer, Password) of
-        {true, _AuthModule} -> true;
-        false -> false
-    end.
+check_password(#jid{luser = LUser, lserver = LServer}, Password) ->
+    F = fun(HostType, Mod) ->
+                case  mongoose_gen_auth:check_password(Mod, HostType, LUser, LServer, Password) of
+                    true -> {stop, true};
+                    false -> continue
+                end
+        end,
+    Opts = #{default => false,
+             event_name => auth_check_password,
+             event_meta => #{user => LUser, server => LServer}},
+    call_auth_modules_for_domain(LServer, F, Opts).
 
-%% @doc Check if the user and password can login in server.
--spec check_password(User :: jid:user(),
-                     Server :: jid:server(),
+%% @doc Check if at least one authentication method accepts the user and the password.
+-spec check_password(JID :: jid:jid() | error,
                      Password :: binary(),
                      Digest :: binary(),
-                     DigestGen :: fun()) -> boolean().
-check_password(User, Server, Password, Digest, DigestGen) ->
-    LUser = jid:nodeprep(User),
-    LServer = jid:nameprep(Server),
-    do_check_password(LUser, LServer, Password, Digest, DigestGen).
-
--spec do_check_password(User :: jid:luser(),
-                     Server :: jid:lserver(),
-                     Password :: binary(),
-                     Digest :: binary(),
-                     DigestGen :: fun()) -> boolean().
-do_check_password(LUser, LServer, _, _, _)
-    when LUser =:= error; LServer =:= error ->
+                     DigestGen :: fun((binary()) -> binary())) -> boolean().
+check_password(error, _, _, _) ->
     false;
-do_check_password(LUser, LServer, Password, Digest, DigestGen) ->
-    case check_password_with_authmodule(LUser, LServer, Password, Digest, DigestGen) of
-        {true, _AuthModule} -> true;
-        false -> false
-    end.
+check_password(#jid{luser = LUser, lserver = LServer}, Password, Digest, DigestGen) ->
+    F = fun(HostType, Mod) ->
+                case mongoose_gen_auth:check_password(Mod, HostType, LUser, LServer,
+                                                      Password, Digest, DigestGen) of
+                    true -> {stop, true};
+                    false -> continue
+                end
+        end,
+    Opts = #{default => false,
+             event_name => auth_check_password,
+             event_meta => #{user => LUser, server => LServer}},
+    call_auth_modules_for_domain(LServer, F, Opts).
 
-%% @doc Check if the user and password can login in server.
-%% The user can login if at least an authentication method accepts the user
-%% and the password.
--spec check_password_with_authmodule(User :: binary(),
-                                     Server :: binary(),
-                                     Password :: binary()
-                                     ) -> 'false' | {'true', authmodule()}.
-check_password_with_authmodule(User, Server, Password) ->
-    LUser = jid:nodeprep(User),
-    LServer = jid:nameprep(Server),
-    do_check_password_with_authmodule(LUser, LServer, Password).
-
--spec do_check_password_with_authmodule(LUser :: jid:luser(),
-                                        LServer :: jid:lserver(),
-                                        Password :: binary()
-                                       ) -> 'false' | {'true', authmodule()}.
-do_check_password_with_authmodule(LUser, LServer, _)
-    when LUser =:= error; LServer =:= error ->
-    false;
-do_check_password_with_authmodule(LUser, LServer, Password) ->
-    check_password_loop(auth_modules(LServer), [LUser, LServer, Password]).
-
--spec check_password_with_authmodule(User :: binary(),
-                                     Server :: binary(),
-                                     Password :: binary(),
-                                     Digest :: binary(),
-                                     DigestGen :: fun()
-                                     ) -> 'false' | {'true', authmodule()}.
-check_password_with_authmodule(User, Server, Password, Digest, DigestGen) ->
-    LUser = jid:nodeprep(User),
-    LServer = jid:nameprep(Server),
-    do_check_password_with_authmodule(LUser, LServer, Password, Digest, DigestGen).
-
--spec do_check_password_with_authmodule(LUser :: jid:luser(),
-                                        LServer :: jid:lserver(),
-                                        Password :: binary(),
-                                        Digest :: binary(),
-                                        DigestGen :: fun()
-                                     ) -> 'false' | {'true', authmodule()}.
-do_check_password_with_authmodule(LUser, LServer, _, _, _)
-    when LUser =:= error; LServer =:= error ->
-    false;
-do_check_password_with_authmodule(LUser, LServer, Password, Digest, DigestGen) ->
-    check_password_loop(auth_modules(LServer), [LUser, LServer, Password,
-                                               Digest, DigestGen]).
-
--spec check_password_loop(AuthModules :: [authmodule()],
-                          Args :: [any(), ...]
-                          ) -> 'false' | {'true', authmodule()}.
-check_password_loop([], _Args) ->
-    false;
-check_password_loop(AuthModules, [_, LServer | _] = Args) ->
-    timed_call(LServer, check_password, fun do_check_password_loop/2, [AuthModules, Args]).
-
-do_check_password_loop([], _) ->
-    false;
-do_check_password_loop([AuthModule | AuthModules], Args) ->
-    case apply(AuthModule, check_password, Args) of
-        true ->
-            {true, AuthModule};
-        false ->
-            do_check_password_loop(AuthModules, Args)
-    end.
-
--spec check_digest(binary(), fun(), binary(), binary()) -> boolean().
+-spec check_digest(binary(), fun((binary()) -> binary()), binary(), binary()) -> boolean().
 check_digest(<<>>, _, <<>>, _) ->
-    false; %%empty digest and password
+    false; %% empty digest and password
 check_digest(Digest, DigestGen, _Password, Passwd) ->
     Digest == DigestGen(Passwd).
 
--spec set_password(User :: jid:user(),
-                   Server :: jid:server(),
-                   Password :: binary()
-                  ) -> ok | {error, empty_password | not_allowed | invalid_jid}.
-set_password(_, _, <<"">>) ->
+-spec set_password(jid:jid() | error, binary()) ->
+    ok | {error, empty_password | not_allowed | invalid_jid}.
+set_password(_, <<"">>) ->
     {error, empty_password};
-set_password(User, Server, Password) ->
-    LUser = jid:nodeprep(User),
-    LServer = jid:nodeprep(Server),
-    do_set_password(LUser, LServer, Password).
-
-do_set_password(LUser, LServer, _) when LUser =:= error; LServer =:= error ->
+set_password(error, _) ->
     {error, invalid_jid};
-do_set_password(LUser, LServer, Password) ->
-    lists:foldl(
-      fun(M, {error, _}) ->
-              M:set_password(LUser, LServer, Password);
-         (_M, Res) ->
-              Res
-      end, {error, not_allowed}, auth_modules(LServer)).
-
-
--spec try_register(User :: jid:user(),
-                   Server :: jid:server(),
-                   Password :: binary()
-                   ) -> ok | {error, exists | not_allowed | invalid_jid | null_password}.
-try_register(_, _, <<"">>) ->
-    {error, null_password};
-try_register(User, Server, Password) ->
-    LUser = jid:nodeprep(User),
-    LServer = jid:nodeprep(Server),
-    do_try_register(LUser, LServer, Password).
-
--spec do_try_register(jid:luser(), jid:lserver(), binary())
-        -> ok | {error, exists | not_allowed | invalid_jid}.
-do_try_register(LUser, LServer, _) when LUser =:= error; LServer =:= error ->
-    {error, invalid_jid};
-do_try_register(LUser, LServer, Password) ->
-    Exists = is_user_exists(LUser, LServer),
-    do_try_register_if_does_not_exist(Exists, LUser, LServer, Password).
-
-do_try_register_if_does_not_exist(true, _, _, _) ->
-    {error, exists};
-do_try_register_if_does_not_exist(_, LUser, LServer, Password) ->
-    case lists:member(LServer, ?MYHOSTS) of
+set_password(#jid{luser = LUser, lserver = LServer}, Password) ->
+    F = fun(HostType, Mod) ->
+                case mongoose_gen_auth:set_password(Mod, HostType, LUser, LServer, Password) of
+                    ok -> {stop, ok};
+                    {error, Error} -> {continue, {error, Error}}
+                end
+        end,
+    Opts = #{default => {error, not_allowed}},
+    case does_user_exist(jid:make_bare(LUser, LServer)) of
         true ->
-            timed_call(LServer, try_register,
-                       fun do_try_register_if_does_not_exist_timed/3, [LUser, LServer, Password]);
+            call_auth_modules_for_domain(LServer, F, Opts);
         false ->
             {error, not_allowed}
     end.
 
-do_try_register_if_does_not_exist_timed(LUser, LServer, Password) ->
-    Backends = auth_modules(LServer),
-    do_try_register_in_backend(Backends, LUser, LServer, Password).
+-spec try_register(jid:jid() | error, binary()) ->
+    ok | {error, exists | not_allowed | invalid_jid | null_password | limit_per_domain_exceeded}.
+try_register(_, <<>>) ->
+    {error, null_password};
+try_register(#jid{luser = <<>>}, _) ->
+    {error, invalid_jid};
+try_register(error, _) ->
+    {error, invalid_jid};
+try_register(JID, Password) ->
+    Exists = does_user_exist(JID),
+    do_try_register_if_does_not_exist(Exists, JID, Password).
 
-do_try_register_in_backend([], _, _, _) ->
-    {error, not_allowed};
-do_try_register_in_backend([M | Backends], LUser, LServer, Password) ->
-    case M:try_register(LUser, LServer, Password) of
-        ok ->
-            mongoose_hooks:register_user(LServer, ok, LUser);
-        _ ->
-            do_try_register_in_backend(Backends, LUser, LServer, Password)
+-spec do_try_register_if_does_not_exist(boolean(), jid:jid(), binary()) ->
+    ok | {error, exists | not_allowed | invalid_jid | null_password | limit_per_domain_exceeded}.
+do_try_register_if_does_not_exist(true, _, _) ->
+    {error, exists};
+do_try_register_if_does_not_exist(_, JID, Password) ->
+    {LUser, LServer} = jid:to_lus(JID),
+    F = fun(HostType, Mod) ->
+                case mongoose_gen_auth:try_register(Mod, HostType, LUser, LServer, Password) of
+                    ok ->
+                        mongoose_instrument:execute(auth_register_user, #{host_type => HostType},
+                                                    #{count => 1, user => LUser, server => LServer}),
+                        mongoose_hooks:register_user(HostType, LServer, LUser),
+                        {stop, ok};
+                    {error, _Error} ->
+                        continue
+                end
+        end,
+    Opts = #{default => {error, not_allowed},
+             event_name => auth_try_register,
+             event_meta => #{user => LUser, server => LServer}},
+    case is_user_number_below_limit(LServer) of
+        true ->
+            call_auth_modules_for_domain(LServer, F, Opts);
+        false ->
+            {error, limit_per_domain_exceeded}
     end.
 
 %% @doc Registered users list do not include anonymous users logged
--spec dirty_get_registered_users() -> [jid:simple_bare_jid()].
-dirty_get_registered_users() ->
-    lists:flatmap(
-      fun(M) ->
-              M:dirty_get_registered_users()
-      end, auth_modules()).
-
-
-%% @doc Registered users list do not include anonymous users logged
--spec get_vh_registered_users(Server :: jid:server()
-                             ) -> [jid:simple_bare_jid()].
+-spec get_vh_registered_users(Server :: jid:server()) -> [jid:simple_bare_jid()].
 get_vh_registered_users(Server) ->
-    LServer = jid:nameprep(Server),
-    do_get_vh_registered_users(LServer).
+    get_vh_registered_users(Server, []).
 
-do_get_vh_registered_users(error) ->
-    [];
-do_get_vh_registered_users(LServer) ->
-    lists:flatmap(
-      fun(M) ->
-              M:get_vh_registered_users(LServer)
-      end, auth_modules(LServer)).
-
-
--spec get_vh_registered_users(Server :: jid:server(),
-                              Opts :: [any()]) -> [jid:simple_bare_jid()].
+-spec get_vh_registered_users(Server :: jid:server(), Opts :: [any()]) ->
+    [jid:simple_bare_jid()].
 get_vh_registered_users(Server, Opts) ->
     LServer = jid:nameprep(Server),
     do_get_vh_registered_users(LServer, Opts).
@@ -365,30 +278,16 @@ get_vh_registered_users(Server, Opts) ->
 do_get_vh_registered_users(error, _) ->
     [];
 do_get_vh_registered_users(LServer, Opts) ->
-    lists:flatmap(
-        fun(M) ->
-            M:get_vh_registered_users(LServer, Opts)
-        end, auth_modules(LServer)).
+    F = fun(HostType, Mod) ->
+                mongoose_gen_auth:get_registered_users(Mod, HostType, LServer, Opts)
+        end,
+    lists:append(call_auth_modules_for_domain(LServer, F, #{default => [], op => map})).
 
-
--spec get_vh_registered_users_number(Server :: jid:server()
-                                    ) -> integer().
+-spec get_vh_registered_users_number(Server :: jid:server()) -> integer().
 get_vh_registered_users_number(Server) ->
-    LServer = jid:nameprep(Server),
-    do_get_vh_registered_users_number(LServer).
+    get_vh_registered_users_number(Server, []).
 
-do_get_vh_registered_users_number(error) ->
-    0;
-do_get_vh_registered_users_number(LServer) ->
-    lists:sum(
-        lists:map(
-            fun(M) ->
-                M:get_vh_registered_users_number(LServer)
-            end, auth_modules(LServer))).
-
-
--spec get_vh_registered_users_number(Server :: jid:server(),
-                                     Opts :: list()) -> integer().
+-spec get_vh_registered_users_number(Server :: jid:server(), Opts :: list()) -> integer().
 get_vh_registered_users_number(Server, Opts) ->
     LServer = jid:nameprep(Server),
     do_get_vh_registered_users_number(LServer, Opts).
@@ -396,167 +295,133 @@ get_vh_registered_users_number(Server, Opts) ->
 do_get_vh_registered_users_number(error, _) ->
     0;
 do_get_vh_registered_users_number(LServer, Opts) ->
-    lists:sum(
-        lists:map(
-            fun(M) ->
-                M:get_vh_registered_users_number(LServer, Opts)
-            end, auth_modules(LServer))).
+    F = fun(HostType, Mod) ->
+                mongoose_gen_auth:get_registered_users_number(Mod, HostType, LServer, Opts)
+        end,
+    lists:sum(call_auth_modules_for_domain(LServer, F, #{default => [], op => map})).
 
-
-%% @doc Get the password of the user.
--spec get_password(User :: jid:user(),
-                   Server :: jid:server()) -> ejabberd_auth:passterm() | false.
-get_password(User, Server) ->
-    LUser = jid:nodeprep(User),
-    LServer = jid:nameprep(Server),
-    do_get_password(LUser, LServer).
-
-do_get_password(LUser, LServer) when LUser =:= error; LServer =:= error ->
-    false;
-do_get_password(LUser, LServer) ->
-    lists:foldl(
-        fun(M, false) ->
-            M:get_password(LUser, LServer);
-            (_M, Password) ->
-                Password
-        end, false, auth_modules(LServer)).
-
-
--spec get_password_s(User :: jid:user(),
-                     Server :: jid:server()) -> binary().
-get_password_s(User, Server) ->
-    LUser = jid:nodeprep(User),
-    LServer = jid:nameprep(Server),
-    do_get_password_s(LUser, LServer).
-
-do_get_password_s(LUser, LServer) when LUser =:= error; LServer =:= error ->
-    <<"">>;
-do_get_password_s(LUser, LServer) ->
-    lists:foldl(
-        fun(M, <<"">>) ->
-            M:get_password_s(LUser, LServer);
-            (_M, Password) ->
-                Password
-        end, <<"">>, auth_modules(LServer)).
+-spec get_password_s(JID :: jid:jid() | error) -> binary().
+get_password_s(#jid{luser = LUser, lserver = LServer}) ->
+    F = fun(HostType, Mod) ->
+                case mongoose_gen_auth:get_password_s(Mod, HostType, LUser, LServer) of
+                    <<>> -> continue;
+                    Password when is_binary(Password) -> {stop, Password}
+                end
+        end,
+    call_auth_modules_for_domain(LServer, F, #{default => <<>>}).
 
 %% @doc Get the password(like thing) of the user and the auth module.
--spec get_passterm_with_authmodule(jid:user(), jid:server()) -> R when
-      R :: {passterm(), authmodule()}
-         | {'false', 'none'}.
-get_passterm_with_authmodule(User, Server) ->
-    LUser = jid:nodeprep(User),
-    LServer = jid:nameprep(Server),
-    do_get_passterm_with_authmodule(LUser, LServer).
+-spec get_passterm_with_authmodule(mongooseim:host_type(), error | jid:jid()) ->
+          {passterm(), authmodule()} | false.
+get_passterm_with_authmodule(HostType, #jid{luser = LUser, lserver = LServer}) ->
+    F = fun(Mod) ->
+                case mongoose_gen_auth:get_password(Mod, HostType, LUser, LServer) of
+                    false -> continue;
+                    PassTerm -> {stop, {PassTerm, Mod}}
+                end
+        end,
+    call_auth_modules_for_host_type(HostType, F, #{default => false}).
 
-do_get_passterm_with_authmodule(LUser, LServer)
-    when LUser =:= error; LServer =:= error ->
-    {false, none};
-do_get_passterm_with_authmodule(LUser, LServer) ->
-    lists:foldl(
-        fun(M, {false, _}) ->
-            {M:get_password(LUser, LServer), M};
-            (_M, {Password, AuthModule}) ->
-                {Password, AuthModule}
-        end, {false, none}, auth_modules(LServer)).
+%% @doc Returns true if the user exists in the DB
+%% or if an anonymous user is logged under the given name
+%% Returns 'false' in case of an error
+-spec does_user_exist(JID :: jid:jid() | error) -> boolean().
+does_user_exist(#jid{luser = LUser, lserver = LServer}) ->
+    F = fun(HostType, Mod) -> does_user_exist_in_module(Mod, HostType, LUser, LServer) end,
+    case call_auth_modules_for_domain(LServer, F, #{default => false, event_name => auth_does_user_exist,
+                                                    event_meta => #{user => LUser, server => LServer}}) of
+        {error, _Error} -> false;
+        Result -> Result
+    end;
+does_user_exist(error) ->
+    false.
 
-%% @doc Returns true if the user exists in the DB or if an anonymous user is
-%% logged under the given name
--spec is_user_exists(User :: jid:user(),
-                     Server :: jid:server()) -> boolean().
-is_user_exists(<<"">>, _) ->
-    false;
-is_user_exists(User, Server) ->
-    LUser = jid:nodeprep(User),
-    LServer = jid:nameprep(Server),
-    do_does_user_exist(LUser, LServer).
+%% Hook interface
+-spec does_user_exist(mongooseim:host_type(), jid:jid(), exist_type()) -> boolean().
+does_user_exist(HostType, Jid, RequestType) ->
+    mongoose_hooks:does_user_exist(HostType, Jid, RequestType).
 
--spec does_user_exist(JID :: jid:jid()) -> boolean().
-does_user_exist(JID) ->
-    #jid{luser = LUser, lserver = LServer} = JID,
-    do_does_user_exist(LUser, LServer).
+%% @doc does_user_exist hook handler
+%% Returns 'false' in case of an error
+-spec on_does_user_exist(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: boolean(),
+    Params :: map(),
+    Extra :: map().
+on_does_user_exist(false, #{jid := Jid, request_type := stored}, #{host_type := HostType}) ->
+    {ok, true =:= does_stored_user_exist(HostType, Jid)};
+on_does_user_exist(false,
+                   #{jid := #jid{luser = LUser, lserver = LServer}, request_type := with_anonymous},
+                   #{host_type := HostType}) ->
+    F = fun(Mod) -> does_user_exist_in_module(Mod, HostType, LUser, LServer) end,
+    {ok, call_auth_modules_for_host_type(HostType, F, #{default => false, event_name => auth_does_user_exist,
+                                                        event_meta => #{user => LUser, server => LServer}})};
+on_does_user_exist(Status, _, _) ->
+    {ok, Status}.
 
-do_does_user_exist(LUser, LServer) when LUser =:= error; LServer =:= error ->
-    false;
-do_does_user_exist(LUser, LServer) ->
-    timed_call(LServer, does_user_exist, fun does_user_exist_timed/2, [LUser, LServer]).
+%% @doc Returns true if the user exists in the DB
+%% In case of a backend error, it is propagated to the caller
+-spec does_stored_user_exist(mongooseim:host_type(), jid:jid() | error) ->
+          boolean() | {error, any()}.
+does_stored_user_exist(HostType, #jid{luser = LUser, lserver = LServer}) ->
+    F = fun(ejabberd_auth_anonymous) -> continue;
+           (Mod) -> does_user_exist_in_module(Mod, HostType, LUser, LServer)
+        end,
+    call_auth_modules_for_host_type(HostType, F, #{default => false, event_name => auth_does_user_exist,
+                                                   event_meta => #{user => LUser, server => LServer}});
+does_stored_user_exist(_HostType, error) ->
+    false.
 
-does_user_exist_timed(LUser, LServer) ->
-    lists:any(
-        fun(M) ->
-            case M:does_user_exist(LUser, LServer) of
-                {error, Error} ->
-                    ?ERROR_MSG("The authentication module ~p returned an "
-                    "error~nwhen checking user ~p in server ~p~n"
-                    "Error message: ~p",
-                        [M, LUser, LServer, Error]),
-                    false;
-                Else ->
-                    Else
-            end
-        end, auth_modules(LServer)).
-
-%% Check if the user exists in all authentications module except the module
-%% passed as parameter
--spec is_user_exists_in_other_modules(Module :: authmodule(),
-                                      User :: jid:user(),
-                                      Server :: jid:server()
-                                      ) -> boolean() | 'maybe'.
-is_user_exists_in_other_modules(Module, User, Server) ->
-    LUser = jid:nodeprep(User),
-    LServer = jid:nameprep(Server),
-    do_does_user_exist_in_other_modules(Module, LUser, LServer).
-
-do_does_user_exist_in_other_modules(_, LUser, LServer)
-    when LUser =:= error; LServer =:= error ->
-    false;
-do_does_user_exist_in_other_modules(Module, LUser, LServer) ->
-    does_user_exist_in_other_modules_loop(
-        auth_modules(LServer)--[Module],
-        LUser, LServer).
-
-
-does_user_exist_in_other_modules_loop([], _User, _Server) ->
-    false;
-does_user_exist_in_other_modules_loop([AuthModule|AuthModules], User, Server) ->
-    case AuthModule:does_user_exist(User, Server) of
-        true ->
-            true;
-        false ->
-            does_user_exist_in_other_modules_loop(AuthModules, User, Server);
-        {error, Error} ->
-            ?DEBUG("The authentication module ~p returned an error~nwhen "
-                   "checking user ~p in server ~p~nError message: ~p",
-                   [AuthModule, User, Server, Error]),
-            maybe
+does_user_exist_in_module(Mod, HostType, LUser, LServer) ->
+    case mongoose_gen_auth:does_user_exist(Mod, HostType, LUser, LServer) of
+        true -> {stop, true};
+        false -> continue;
+        {error, Reason} = Error ->
+            ?LOG_ERROR(#{what => does_user_exist_failed,
+                         text => <<"The authentication module returned an error">>,
+                         auth_module => Mod, reason => Reason,
+                         user => LUser, server => LServer}),
+            {continue, Error}
     end.
 
+-spec does_method_support(AuthMethod :: atom(), Feature :: atom()) -> boolean().
+does_method_support(AuthMethod, Feature) ->
+    Module = auth_method_to_module(AuthMethod),
+    lists:member(Feature, mongoose_gen_auth:supported_features(Module)).
 
 %% @doc Remove user.
 %% Note: it may return ok even if there was some problem removing the user.
--spec remove_user(User :: jid:user(),
-                  Server :: jid:server()) -> ok | error | {error, not_allowed}.
-remove_user(User, Server) ->
-    LUser = jid:nodeprep(User),
-    LServer = jid:nameprep(Server),
-    do_remove_user(LUser, LServer).
-
-do_remove_user(LUser, LServer) when LUser =:= error; LServer =:= error ->
-    error;
-do_remove_user(LUser, LServer) ->
-    AuthModules = auth_modules(LServer),
-    RemoveResult = [M:remove_user(LUser, LServer) || M <- AuthModules ],
-    case lists:any(fun(El) -> El == ok end, RemoveResult) of
+-spec remove_user(JID :: jid:jid()) -> ok | {error, not_allowed | user_does_not_exist};
+                 (error) -> error.
+remove_user(error) -> error;
+remove_user(#jid{luser = LUser, lserver = LServer}) ->
+    JID = jid:make_bare(LUser, LServer),
+    F = fun(HostType, Mod) ->
+                case mongoose_gen_auth:remove_user(Mod, HostType, LUser, LServer) of
+                    ok -> {continue, {ok, HostType}};
+                    {error, _Error} -> continue
+                end
+        end,
+    case does_user_exist(JID) of
         true ->
-            Acc = mongoose_acc:new(#{ location => ?LOCATION,
-                                      lserver => LServer,
-                                      element => undefined }),
-            mongoose_hooks:remove_user(LServer, Acc, LUser),
-            ok;
+            case call_auth_modules_for_domain(LServer, F, #{default => {error, not_allowed}}) of
+                {ok, HostType} ->
+                    mongoose_instrument:execute(auth_unregister_user, #{host_type => HostType},
+                                                #{count => 1, user => LUser, server => LServer}),
+                    Acc = mongoose_acc:new(#{location => ?LOCATION,
+                                                host_type => HostType,
+                                                lserver => LServer,
+                                                element => undefined}),
+                    mongoose_hooks:remove_user(Acc, LServer, LUser),
+                    ok;
+                Error ->
+                    ?LOG_ERROR(#{what => backend_disallows_user_removal,
+                    user => LUser, server => LServer,
+                    reason => Error}),
+                    Error
+                end;
         false ->
-            ?ERROR_MSG("event=backends_disallow_user_removal,user=~s,server=~s,backends=~p",
-                       [LUser, LServer, AuthModules]),
-            {error, not_allowed}
-    end.
+            {error, user_does_not_exist}
+        end.
 
 %% @doc Calculate informational entropy.
 -spec entropy(iolist()) -> float().
@@ -572,41 +437,52 @@ entropy(IOList) ->
             length(InputList) * math:log(lists:sum(Set))/math:log(2)
     end.
 
+-spec config_spec(atom()) -> mongoose_config_spec:config_section().
+config_spec(Method) ->
+    mongoose_gen_auth:config_spec(auth_method_to_module(Method)).
+
 %%%----------------------------------------------------------------------
 %%% Internal functions
 %%%----------------------------------------------------------------------
-%% @doc Return the lists of all the auth modules actually used in the
-%% configuration
--spec auth_modules() -> [authmodule()].
-auth_modules() ->
-    lists:usort(
-      lists:flatmap(
-        fun(Server) ->
-                auth_modules(Server)
-        end, ?MYHOSTS)).
-
-
-%% Return the list of authenticated modules for a given host
+%% Return the list of authenticated modules for a given domain
+%% TODO: rework is_anonymous_user/1 at mongoose_users module,
+%% so there is no need for exporting auth_modules/1 function.
+%% after that completely get rid of this interface, we should
+%% use auth_modules_for_host_type/1 function instead.
 -spec auth_modules(Server :: jid:lserver()) -> [authmodule()].
 auth_modules(LServer) ->
-    Method = ejabberd_config:get_local_option({auth_method, LServer}),
-    Methods = get_auth_method_as_a_list(Method),
-    [list_to_atom("ejabberd_auth_" ++ atom_to_list(M)) || M <- Methods].
+    case mongoose_domain_api:get_domain_host_type(LServer) of
+        {ok, HostType} -> auth_modules_for_host_type(HostType);
+        {error, not_found} -> []
+    end.
 
-get_auth_method_as_a_list(undefined) -> [];
-get_auth_method_as_a_list(AuthMethod) when is_list(AuthMethod) -> AuthMethod;
-get_auth_method_as_a_list(AuthMethod) when is_atom(AuthMethod) -> [AuthMethod].
+%% Return the list of authenticated modules for a given host type
+-spec auth_modules_for_host_type(HostType :: mongooseim:host_type()) -> [authmodule()].
+auth_modules_for_host_type(HostType) ->
+    Methods = auth_methods(HostType),
+    methods_to_modules(Methods).
 
-ensure_metrics(Host) ->
-    Metrics = [authorize, check_password, try_register, does_user_exist],
-    [mongoose_metrics:ensure_metric(Host, ?METRIC(Metric), histogram)
-     || Metric <- Metrics].
+-spec methods_to_modules([atom()]) -> [authmodule()].
+methods_to_modules(Methods) ->
+    [auth_method_to_module(M) || M <- Methods].
 
--spec timed_call(jid:lserver(), term(), fun(), list()) -> term().
-timed_call(LServer, Metric, Fun, Args) ->
-    {Time, Result} = timer:tc(Fun, Args),
-    mongoose_metrics:update(LServer, ?METRIC(Metric), Time),
-    Result.
+-spec auth_methods(mongooseim:host_type()) -> [atom()].
+auth_methods(HostType) ->
+    mongoose_config:get_opt([{auth, HostType}, methods]).
+
+-spec auth_method_to_module(atom()) -> authmodule().
+auth_method_to_module(Method) ->
+    list_to_atom("ejabberd_auth_" ++ atom_to_list(Method)).
+
+-spec remove_domain(mongoose_domain_api:remove_domain_acc(), map(), map()) ->
+    {ok | stop, mongoose_domain_api:remove_domain_acc()}.
+remove_domain(Acc, #{domain := Domain}, #{host_type := HostType}) ->
+    F = fun() ->
+            FAuth = fun(Mod) -> mongoose_gen_auth:remove_domain(Mod, HostType, Domain) end,
+            call_auth_modules_for_host_type(HostType, FAuth, #{op => map}),
+            Acc
+        end,
+    mongoose_domain_api:remove_domain_wrapper(Acc, F, ?MODULE).
 
 %% Library functions for reuse in ejabberd_auth_* modules
 -spec authorize_with_check_password(Module, Creds) -> {ok, Creds}
@@ -618,16 +494,18 @@ authorize_with_check_password(Module, Creds) ->
     LUser     = jid:nodeprep(User),
     LUser == error andalso error({nodeprep_error, User}),
     LServer   = mongoose_credentials:lserver(Creds),
+    HostType  = mongoose_credentials:host_type(Creds),
     Password  = mongoose_credentials:get(Creds, password),
     Digest    = mongoose_credentials:get(Creds, digest, undefined),
     DigestGen = mongoose_credentials:get(Creds, digest_gen, undefined),
-    Args = case {Digest, DigestGen} of
-               _ when Digest /= undefined andalso DigestGen /= undefined ->
-                   [LUser, LServer, Password, Digest, DigestGen];
-               _  ->
-                   [LUser, LServer, Password]
-           end,
-    case erlang:apply(Module, check_password, Args) of
+    Result = case {Digest, DigestGen} of
+                 _ when Digest /= undefined andalso DigestGen /= undefined ->
+                     mongoose_gen_auth:check_password(Module, HostType, LUser, LServer,
+                                                      Password, Digest, DigestGen);
+                 _  ->
+                     mongoose_gen_auth:check_password(Module, HostType, LUser, LServer, Password)
+             end,
+    case Result of
         true -> {ok, mongoose_credentials:set(Creds, auth_module, Module)};
         false -> {error, not_authorized}
     end.
@@ -647,3 +525,89 @@ get_type_information(IOContent, [Digit, _, LowLetter, HiLetter, Other])
     [Digit, 33, LowLetter, HiLetter, Other];
 get_type_information(_IOContent, [Digit, Printable, LowLetter, HiLetter, _Other]) ->
     [Digit, Printable, LowLetter, HiLetter, 128].
+
+%% @doc If the domain corresponds to a valid host type, call auth modules for that host type
+-spec call_auth_modules_for_domain(jid:lserver(), host_type_mod_fun(), call_opts()) ->
+          mod_res() | [mod_res()].
+call_auth_modules_for_domain(Domain, F, Opts = #{default := Default}) ->
+    case mongoose_domain_api:get_domain_host_type(Domain) of
+        {ok, HostType} ->
+            StepF = bind_host_type(HostType, F),
+            call_auth_modules_for_host_type(HostType, StepF, Opts);
+        {error, not_found} ->
+            Default
+    end.
+
+-spec bind_host_type(mongooseim:host_type(), host_type_mod_fun()) -> mod_fun().
+bind_host_type(HostType, F) when is_function(F, 2) ->
+    fun(Mod) -> F(HostType, Mod) end.
+
+-spec call_auth_modules_for_host_type(mongooseim:host_type(),
+                                      mod_fun() | mod_fold_fun(), call_opts()) ->
+          mod_res() | [mod_res()].
+call_auth_modules_for_host_type(HostType, F, Opts) ->
+    Modules = auth_modules_for_host_type(HostType),
+    call_auth_modules_for_host_type(Modules, HostType, F, Opts).
+
+-spec call_auth_modules_for_host_type([authmodule()], mongooseim:host_type(),
+                                      mod_fun() | mod_fold_fun(), call_opts()) ->
+          mod_res() | [mod_res()].
+call_auth_modules_for_host_type(Modules, HostType, F, Opts) ->
+    case maps:find(event_name, Opts) of
+        {ok, EventName} ->
+            EventMeta = maps:get(event_meta, Opts, #{}),
+            mongoose_instrument:span(EventName, #{host_type => HostType},
+                fun call_auth_modules/3, [Modules, F, Opts],
+                fun(Time, _Result) -> EventMeta#{time => Time, count => 1} end);
+        error ->
+            call_auth_modules(Modules, F, Opts)
+    end.
+
+%% @doc Perform a map or a fold operation with function F over the provided Modules
+-spec call_auth_modules([authmodule()], mod_fun() | mod_fold_fun(), call_opts()) ->
+          mod_res() | [mod_res()].
+call_auth_modules(Modules, F, #{op := map}) when is_function(F, 1) ->
+    lists:map(F, Modules);
+call_auth_modules(Modules, F, Opts) when is_function(F, 1) ->
+    call_auth_modules(Modules, fun(Mod, _) -> F(Mod) end, Opts);
+call_auth_modules(Modules, F, #{default := Default}) when is_function(F, 2) ->
+    fold_auth_modules(Modules, F, Default).
+
+%% @doc Apply function F to all consecutive auth modules with an accumulator and a stop condition
+-spec fold_auth_modules([authmodule()], mod_fold_fun(), mod_res()) -> mod_res().
+fold_auth_modules([], _F, FinalAcc) ->
+    FinalAcc;
+fold_auth_modules([AuthModule | AuthModules], F, CurAcc) ->
+    case F(AuthModule, CurAcc) of
+        continue ->
+            fold_auth_modules(AuthModules, F, CurAcc);
+        {continue, NewAcc} ->
+            fold_auth_modules(AuthModules, F, NewAcc);
+        {stop, Value} ->
+            Value
+    end.
+
+is_user_number_below_limit(Domain) ->
+    case mongoose_domain_api:get_domain_host_type(Domain) of
+        {ok, HostType} ->
+            Limit = mongoose_config:get_opt([{auth, HostType}, max_users_per_domain]),
+            Current = get_vh_registered_users_number(Domain),
+            Current < Limit;
+        {error, not_found} ->
+            true
+    end.
+
+-spec instrumentation(mongooseim:host_type()) -> [mongoose_instrument:spec()].
+instrumentation(HostType) ->
+    [{auth_register_user, #{host_type => HostType},
+      #{metrics => #{count => spiral}}},
+     {auth_unregister_user, #{host_type => HostType},
+      #{metrics => #{count => spiral}}},
+     {auth_authorize, #{host_type => HostType},
+      #{metrics => #{count => spiral, time => histogram}}},
+     {auth_check_password, #{host_type => HostType},
+      #{metrics => #{count => spiral, time => histogram}}},
+     {auth_try_register, #{host_type => HostType},
+      #{metrics => #{count => spiral, time => histogram}}},
+     {auth_does_user_exist, #{host_type => HostType},
+      #{metrics => #{count => spiral, time => histogram}}}].

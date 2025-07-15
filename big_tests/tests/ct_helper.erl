@@ -1,8 +1,13 @@
 -module(ct_helper).
 -export([is_ct_running/0,
-        repeat_all_until_all_ok/1,
-        repeat_all_until_all_ok/2
-        ]).
+         repeat_all_until_all_ok/1,
+         repeat_all_until_all_ok/2,
+         repeat_all_until_any_fail/1,
+         repeat_all_until_any_fail/2,
+         groups_to_all/1,
+         get_preset_var/3,
+         get_internal_database/0,
+         add_params_to_list/3]).
 
 -type group_name() :: atom().
 
@@ -27,6 +32,11 @@ is_ct_running() ->
 repeat_all_until_all_ok(GroupDefs) ->
     repeat_all_until_all_ok(GroupDefs, 3).
 
+-spec repeat_all_until_any_fail([group_def() | group_def_dirty() | group_def_incomplete()]) ->
+    [group_def()].
+repeat_all_until_any_fail(GroupDefs) ->
+    repeat_all_until_any_fail(GroupDefs, 100).
+
 %% @doc repeat_all_until_all_ok/2 will rewrite your group definitions so that
 %% the `{repeat_until_all_ok, Retries}` property is added to all of them.
 %% For example, for the following definitions:
@@ -49,6 +59,13 @@ repeat_all_until_all_ok(GroupDefs) ->
     [group_def()].
 repeat_all_until_all_ok(GroupDefs, Retries) ->
     [ {Name, maybe_add_repeat_type(repeat_until_all_ok, Retries, Properties), Tests}
+      || {Name, Properties, Tests} <- prepare_group_defs(GroupDefs) ].
+
+-spec repeat_all_until_any_fail([group_def() | group_def_dirty() | group_def_incomplete()],
+                                 repeat_num()) ->
+    [group_def()].
+repeat_all_until_any_fail(GroupDefs, Retries) ->
+    [ {Name, maybe_add_repeat_type(repeat_until_any_fail, Retries, Properties), Tests}
       || {Name, Properties, Tests} <- prepare_group_defs(GroupDefs) ].
 
 -spec maybe_add_repeat_type(repeat_type(), repeat_num(), group_props()) -> group_props().
@@ -88,4 +105,43 @@ all_repeat_modes() ->
      repeat_until_any_fail].
 
 sensible_maximum_repeats() ->
-    ct:get_config(sensible_maximum_repeats, 100).
+    case is_ct_started() of
+        true ->
+            ct:get_config(sensible_maximum_repeats, 100);
+        false -> %% In case it's called from test-runner-complete script
+            100
+    end.
+
+is_ct_started() ->
+    lists:keymember(common_test, 1, application:which_applications()).
+
+groups_to_all(Groups) ->
+    [{group, Name} || {Name, _Opts, _Cases} <- Groups].
+
+get_preset_var(Config, Opt, Def) ->
+    case proplists:get_value(preset, Config, undefined) of
+        undefined ->
+            Def;
+        Preset ->
+            PresetAtom = list_to_existing_atom(Preset),
+            ct:get_config({presets, toml, PresetAtom, Opt}, Def)
+    end.
+
+get_internal_database() ->
+    case distributed_helper:lookup_config_opt([internal_databases, cets]) of
+        {ok, _} -> cets;
+        {error, not_found} -> mnesia
+    end.
+
+add_params_to_list(Groups, [], _IgnoreNames) ->
+    Groups;
+add_params_to_list(Groups, NewParams, IgnoreNames) ->
+    [add_params(Group, NewParams, IgnoreNames) || Group <- Groups].
+
+add_params({Name, Params, Tests} = Group, NewParams, IgnoreNames) ->
+    case lists:member(Name, IgnoreNames) of
+        true ->
+            Group;
+        false ->
+            {Name, NewParams ++ Params, Tests}
+    end.

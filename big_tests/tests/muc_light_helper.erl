@@ -1,6 +1,6 @@
 -module(muc_light_helper).
 
--compile([export_all]).
+-compile([export_all, nowarn_export_all]).
 
 -include("mam_helper.hrl").
 -include("muc_light.hrl").
@@ -13,26 +13,60 @@
 
 -type ct_aff_user() :: {EscalusClient :: escalus:client(), Aff :: atom()}.
 -type ct_aff_users() :: [ct_aff_user()].
+-type ct_block_item() :: {What :: atom(), Action :: atom(), Who :: binary()}.
+
+%% The tests use only binary config fields
+-type schema_item() :: {binary(), binary(), atom(), binary}.
+-type config_item() :: {binary(), binary()}.
+-type internal_config_item() :: {atom(), binary()}.
+
+-export_type([ct_block_item/0, schema_item/0, config_item/0, internal_config_item/0]).
 
 -spec room_bin_jid(Room :: binary()) -> binary().
 room_bin_jid(Room) ->
     <<Room/binary, $@, (muc_host())/binary>>.
 
 muc_host() ->
-    Host = ct:get_config({hosts, mim, domain}),
-    <<"muclight.", Host/binary>>.
+    ct:get_config({hosts, mim, muc_light_service}).
+
+muc_host_pattern() ->
+    ct:get_config({hosts, mim, muc_light_service_pattern}).
+
+cache_name() ->
+    case domain_helper:host_type() of
+        <<"localhost">> ->
+            mod_muc_light_cache_localhost;
+        <<"test type">> ->
+            'mod_muc_light_cache_test type'
+    end.
 
 create_room(RoomU, MUCHost, Owner, Members, Config, Version) ->
-    DefaultConfig = default_config(),
+    DefaultConfig = default_internal_config(MUCHost),
     RoomUS = {RoomU, MUCHost},
     AffUsers = [{to_lus(Owner, Config), owner}
                 | [ {to_lus(Member, Config), member} || Member <- Members ]],
+    assert_no_aff_duplicates(AffUsers),
     AffUsersSort = lists:sort(AffUsers),
     {ok, _RoomUS} = rpc(mim(), mod_muc_light_db_backend, create_room,
-                        [RoomUS, DefaultConfig, AffUsersSort, Version]).
+                        [domain_helper:host_type(), RoomUS, DefaultConfig, AffUsersSort, Version]).
 
--spec default_config() -> list().
-default_config() -> rpc(mim(), mod_muc_light, default_config, [muc_host()]).
+-spec default_internal_config(jid:lserver()) -> [internal_config_item()].
+default_internal_config(MUCHost) ->
+    Schema = rpc(mim(), mod_muc_light, config_schema, [MUCHost]),
+    {ok, Config} = rpc(mim(), mod_muc_light_room_config, from_binary_kv, [[], Schema]),
+    Config.
+
+-spec default_schema() -> [schema_item()].
+default_schema() ->
+    rpc(mim(), mod_muc_light, default_schema, []).
+
+-spec default_config([schema_item()]) -> [config_item()].
+default_config(Schema) ->
+    [config_item(SchemaItem) || SchemaItem <- Schema].
+
+-spec config_item(schema_item()) -> config_item().
+config_item({BinKey, BinValue, _Key, binary}) when is_binary(BinKey), is_binary(BinValue) ->
+    {BinKey, BinValue}.
 
 -spec ns_muc_light_affiliations() -> binary().
 ns_muc_light_affiliations() ->
@@ -88,7 +122,7 @@ user_leave(Room, User, RemainingOccupants) ->
   verify_aff_bcast(RemainingOccupants, AffUsersChanges),
   escalus:assert(is_iq_result, escalus:wait_for_stanza(User)).
 
-then_archive_response_is(Receiver, Expected, Config) ->
+then_archive_response_is(Receiver, Expected, _Config) ->
     Response = mam_helper:wait_archive_respond(Receiver),
     Stanzas = mam_helper:respond_messages(mam_helper:assert_respond_size(length(Expected), Response)),
     ParsedStanzas = [ mam_helper:parse_forwarded_message(Stanza) || Stanza <- Stanzas ],
@@ -111,7 +145,7 @@ assert_archive_element({{message, Sender, Body}, Stanza}) ->
 assert_archive_element({{chat_marker, Type}, Stanza}) ->
     #forwarded_message{chat_marker = Type} = Stanza.
 
-assert_valid_muc_roles_in_user_x([#xmlel{ attrs = [{<<"xmlns">>, ?NS_MUC_USER}] } = XUser | _]) ->
+assert_valid_muc_roles_in_user_x([#xmlel{ attrs = #{<<"xmlns">> := ?NS_MUC_USER} } = XUser | _]) ->
     Item = exml_query:subelement(XUser, <<"item">>),
     muc_helper:assert_valid_affiliation(exml_query:attr(Item, <<"affiliation">>)),
     muc_helper:assert_valid_role(exml_query:attr(Item, <<"role">>));
@@ -177,12 +211,12 @@ aff_msg_verify_fun(AffUsersChanges) ->
     end.
 
 -spec lbin(Bin :: binary()) -> binary().
-lbin(Bin) -> list_to_binary(string:to_lower(binary_to_list(Bin))).
-
+lbin(Bin) ->
+    string:lowercase(Bin).
 
 -spec bin_aff_users(AffUsers :: ct_aff_users()) -> [{LBinJID :: binary(), AffBin :: binary()}].
 bin_aff_users(AffUsers) ->
-    [ {lbin(escalus_client:short_jid(User)), list_to_binary(atom_to_list(Aff))}
+    [ {lbin(escalus_client:short_jid(User)), atom_to_binary(Aff)}
       || {User, Aff} <- AffUsers ].
 
 -spec verify_aff_users(Items :: [exml:element()], BinAffUsers :: [{binary(), binary()}]) -> [].
@@ -199,7 +233,7 @@ verify_aff_users(Items, BinAffUsers) ->
                      Aff :: binary(), AffAcc :: list()) -> list().
 verify_keytake({value, {_, Aff}, NewAffAcc}, _JID, Aff, _AffAcc) -> NewAffAcc.
 
--spec stanza_create_room(RoomNode :: binary() | undefined, InitConfig :: [{binary(), binary()}],
+-spec stanza_create_room(RoomNode :: binary() | undefined, InitConfig :: [config_item()],
                          InitOccupants :: ct_aff_users()) -> exml:element().
 stanza_create_room(RoomNode, InitConfig, InitOccupants) ->
     Host = muc_host(),
@@ -210,7 +244,7 @@ stanza_create_room(RoomNode, InitConfig, InitOccupants) ->
     ConfigItem = #xmlel{ name = <<"configuration">>,
                          children = [ kv_el(K, V) || {K, V} <- InitConfig ] },
     OccupantsItems = [ #xmlel{ name = <<"user">>,
-                               attrs = [{<<"affiliation">>, BinAff}],
+                               attrs = #{<<"affiliation">> => BinAff},
                                children = [#xmlcdata{ content = BinJID }] }
                        || {BinJID, BinAff} <- bin_aff_users(InitOccupants) ],
     OccupantsItem = #xmlel{ name = <<"occupants">>, children = OccupantsItems },
@@ -222,9 +256,12 @@ kv_el(K, V) ->
     #xmlel{ name = K, children = [ #xmlcdata{ content = V } ] }.
 
 -spec to_lus(Config :: list(), UserAtom :: atom()) -> {binary(), binary()}.
-to_lus(UserAtom, Config) ->
+to_lus(UserAtom, Config) when is_atom(UserAtom) ->
     {lbin(escalus_users:get_username(Config, UserAtom)),
-     lbin(escalus_users:get_server(Config, UserAtom))}.
+     lbin(escalus_users:get_server(Config, UserAtom))};
+to_lus(Client, _Config) ->
+    {lbin(escalus_client:username(Client)),
+     lbin(escalus_client:server(Client))}.
 
 -spec gc_message_verify_fun(Room :: binary(), MsgText :: binary(), Id :: binary()) -> muc_helper:verify_fun().
 gc_message_verify_fun(Room, MsgText, Id) ->
@@ -240,20 +277,37 @@ gc_message_verify_fun(Room, MsgText, Id) ->
 
 -spec stanza_aff_set(Room :: binary(), AffUsers :: ct_aff_users()) -> exml:element().
 stanza_aff_set(Room, AffUsers) ->
-    Items = [#xmlel{ name = <<"user">>, attrs = [{<<"affiliation">>, AffBin}],
+    Items = [#xmlel{ name = <<"user">>, attrs = #{<<"affiliation">> => AffBin},
                      children = [#xmlcdata{ content = UserBin }] }
              || {UserBin, AffBin} <- bin_aff_users(AffUsers)],
     escalus_stanza:to(escalus_stanza:iq_set(?NS_MUC_LIGHT_AFFILIATIONS, Items), room_bin_jid(Room)).
 
-clear_db() ->
+clear_db(HostType) ->
     Node = mim(),
-    rpc(Node#{timeout => timer:seconds(15)}, mod_muc_light_db_backend, force_clear, []).
+    rpc(Node#{timeout => timer:seconds(15)}, mod_muc_light, force_clear_from_ct, [HostType]).
 
 -spec ver(Int :: integer()) -> binary().
 ver(Int) ->
-  <<"ver-", (list_to_binary(integer_to_list(Int)))/binary>>.
+  <<"ver-", (integer_to_binary(Int))/binary>>.
 
--spec set_mod_config(K :: atom(), V :: any(), Host :: binary()) -> ok.
-set_mod_config(K, V, Host) ->
-        true = rpc(mim(), gen_mod, set_module_opt_by_subhost, [Host, mod_muc_light, K, V]).
+assert_no_aff_duplicates(AffUsers) ->
+    Users = [US || {US, _} <- AffUsers],
+    case lists:sort(Users) =:= lists:usort(Users) of
+        true ->
+            ok;
+        false ->
+            ct:fail(#{what => assert_no_aff_duplicates,
+                      aff_users => AffUsers})
+    end.
 
+-spec stanza_blocking_set(BlocklistChanges :: [ct_block_item()]) -> exml:element().
+stanza_blocking_set(BlocklistChanges) ->
+    Items = [#xmlel{ name = atom_to_binary(What),
+                     attrs = #{<<"action">> => atom_to_binary(Action)},
+                     children = [#xmlcdata{ content = Who }] }
+             || {What, Action, Who} <- BlocklistChanges],
+    escalus_stanza:to(escalus_stanza:iq_set(?NS_MUC_LIGHT_BLOCKING, Items), muc_host()).
+
+eq_bjid(Jid, BinJid) -> Jid =:= jid:from_binary(BinJid).
+
+pos_int(T) -> is_integer(T) andalso T > 0.

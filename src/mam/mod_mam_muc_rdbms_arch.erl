@@ -1,7 +1,7 @@
 %%%-------------------------------------------------------------------
 %%% @author Uvarov Michael <arcusfelis@gmail.com>
 %%% @copyright (C) 2013, Uvarov Michael
-%%% @doc A backend for storing messages from MUC rooms using RDBMS.
+%%% @doc RDBMS backend for MUC Message Archive Management.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(mod_mam_muc_rdbms_arch).
@@ -10,631 +10,385 @@
 %% Exports
 
 %% gen_mod handlers
--export([start/2, stop/1]).
+-export([start/2, stop/1, hooks/1, supported_features/0]).
 
 %% MAM hook handlers
 -behaviour(ejabberd_gen_mam_archive).
+-behaviour(gen_mod).
+-behaviour(mongoose_module_metrics).
 
 -callback encode(term()) -> binary().
 -callback decode(binary()) -> term().
 
--export([archive_size/4,
-         archive_message/10,
+-export([archive_size/3,
+         archive_message/3,
          lookup_messages/3,
-         remove_archive/4]).
+         remove_archive/3,
+         remove_domain/3,
+         get_mam_muc_gdpr_data/3]).
 
-%% Called from mod_mam_rdbms_async_writer
--export([prepare_message/7, retract_message/7, prepare_insert/2]).
-
-%gdpr
--export([get_mam_muc_gdpr_data/2]).
+%% Called from mod_mam_muc_rdbms_async_pool_writer
+-export([prepare_message/2, retract_message/2, prepare_insert/2]).
+-export([extend_params_with_sender_id/2]).
 
 %% ----------------------------------------------------------------------
 %% Imports
 
-%% UMessID
--import(mod_mam_utils,
-        [encode_compact_uuid/2]).
-
-%% Other
--import(mod_mam_utils,
-        [apply_start_border/2,
-         apply_end_border/2]).
-
--import(mongoose_rdbms,
-        [escape_integer/1,
-         use_escaped_string/1,
-         use_escaped_integer/1]).
-
 -include("mongoose.hrl").
 -include("jlib.hrl").
--include_lib("exml/include/exml.hrl").
--include("mongoose_rsm.hrl").
-
+-include("mongoose_mam.hrl").
 
 %% ----------------------------------------------------------------------
 %% Types
 
--type filter() :: iolist().
--type escaped_message_id() :: mongoose_rdbms:escaped_integer().
--type escaped_room_id() :: mongoose_rdbms:escaped_integer().
--type escaped_jid() :: mongoose_rdbms:escaped_string().
--type unix_timestamp() :: mod_mam:unix_timestamp().
--type packet() :: any().
--type raw_row() :: {binary(), binary(), binary()}.
+-type env_vars() :: mod_mam_rdbms_arch:env_vars().
+-type host_type() :: mongooseim:host_type().
 
 %% ----------------------------------------------------------------------
 %% gen_mod callbacks
 %% Starting and stopping functions for users' archives
 
--spec start(jid:server(), _) -> 'ok'.
-start(Host, Opts) ->
-    prepare_insert(insert_mam_muc_message, 1),
+-spec start(host_type(), gen_mod:module_opts()) -> ok.
+start(_HostType, Opts) ->
+    register_prepared_queries(Opts),
+    ok.
 
-    start_muc(Host, Opts).
+-spec stop(host_type()) -> ok.
+stop(_HostType) ->
+    ok.
 
--spec stop(jid:server()) -> 'ok'.
-stop(Host) ->
-    stop_muc(Host).
+-spec supported_features() -> [atom()].
+supported_features() ->
+    [dynamic_domains].
+
+-spec get_mam_muc_gdpr_data(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: ejabberd_gen_mam_archive:mam_muc_gdpr_data(),
+    Params :: #{jid := jid:jid()},
+    Extra :: gen_hook:extra().
+get_mam_muc_gdpr_data(Acc, #{jid := #jid{luser = LUser, lserver = LServer}}, #{host_type := HostType}) ->
+    case mod_mam_pm:archive_id(LServer, LUser) of
+        undefined ->
+            {ok, Acc};
+        SenderID ->
+            %% We don't know the real room JID here, use FakeEnv
+            FakeEnv = env_vars(HostType, jid:make(<<>>, <<>>, <<>>)),
+            {selected, Rows} = extract_gdpr_messages(HostType, SenderID),
+            {ok, [mam_decoder:decode_muc_gdpr_row(Row, FakeEnv) || Row <- Rows] ++ Acc}
+    end.
 
 %% ----------------------------------------------------------------------
-%% Add hooks for mod_mam_muc
+%% Add hooks for mod_mam_pm
 
--spec start_muc(jid:server(), _) -> 'ok'.
-start_muc(Host, _Opts) ->
-    case gen_mod:get_module_opt(Host, ?MODULE, no_writer, false) of
+-spec hooks(mongooseim:host_type()) -> gen_hook:hook_list().
+hooks(HostType) ->
+    case gen_mod:get_module_opt(HostType, ?MODULE, no_writer) of
         true ->
-            ok;
+            [];
         false ->
-            ejabberd_hooks:add(mam_muc_archive_message, Host, ?MODULE, archive_message, 50)
-    end,
-    ejabberd_hooks:add(mam_muc_archive_size, Host, ?MODULE, archive_size, 50),
-    ejabberd_hooks:add(mam_muc_lookup_messages, Host, ?MODULE, lookup_messages, 50),
-    ejabberd_hooks:add(mam_muc_remove_archive, Host, ?MODULE, remove_archive, 50),
-    ejabberd_hooks:add(get_mam_muc_gdpr_data, Host, ?MODULE, get_mam_muc_gdpr_data, 50),
-    ok.
+            [{mam_muc_archive_message, HostType, fun ?MODULE:archive_message/3, #{}, 50}]
+    end ++
+    [
+        {remove_domain, HostType, fun ?MODULE:remove_domain/3, #{}, 50},
+        {mam_muc_archive_size, HostType, fun ?MODULE:archive_size/3, #{}, 50},
+        {mam_muc_lookup_messages, HostType, fun ?MODULE:lookup_messages/3, #{}, 50},
+        {mam_muc_remove_archive, HostType, fun ?MODULE:remove_archive/3, #{}, 50},
+        {get_mam_muc_gdpr_data, HostType, fun ?MODULE:get_mam_muc_gdpr_data/3, #{}, 50}
+    ].
 
+%% ----------------------------------------------------------------------
+%% SQL queries
 
--spec stop_muc(jid:server()) -> 'ok'.
-stop_muc(Host) ->
-    case gen_mod:get_module_opt(Host, ?MODULE, no_writer, false) of
-        true ->
-            ok;
-        false ->
-            ejabberd_hooks:delete(mam_muc_archive_message, Host, ?MODULE, archive_message, 50)
-    end,
-    ejabberd_hooks:delete(mam_muc_archive_size, Host, ?MODULE, archive_size, 50),
-    ejabberd_hooks:delete(mam_muc_lookup_messages, Host, ?MODULE, lookup_messages, 50),
-    ejabberd_hooks:delete(mam_muc_remove_archive, Host, ?MODULE, remove_archive, 50),
-    ejabberd_hooks:delete(get_mam_muc_gdpr_data, Host, ?MODULE, get_mam_muc_gdpr_data, 50),
-    ok.
+register_prepared_queries(Opts) ->
+    prepare_insert(insert_mam_muc_message, 1),
+    mongoose_rdbms:prepare(mam_muc_archive_remove, mam_muc_message, [room_id],
+                           <<"DELETE FROM mam_muc_message "
+                             "WHERE room_id = ?">>),
 
+    %% Domain Removal
+    prepare_remove_domain(Opts),
+
+    mongoose_rdbms:prepare(mam_muc_make_tombstone, mam_muc_message, [message, room_id, id],
+                           <<"UPDATE mam_muc_message SET message = ?, search_body = '' "
+                             "WHERE room_id = ? AND id = ?">>),
+    {LimitSQL, LimitMSSQL} = rdbms_queries:get_db_specific_limits_binaries(1),
+    mongoose_rdbms:prepare(mam_muc_select_messages_to_retract_on_origin_id, mam_muc_message,
+                           [room_id, sender_id, origin_id],
+                           <<"SELECT ", LimitMSSQL/binary,
+                             " id, message FROM mam_muc_message"
+                             " WHERE room_id = ? AND sender_id = ? "
+                             " AND origin_id = ?"
+                             " ORDER BY id DESC ", LimitSQL/binary>>),
+    mongoose_rdbms:prepare(mam_muc_select_messages_to_retract_on_stanza_id, mam_muc_message,
+                           [room_id, sender_id, id],
+                           <<"SELECT ", LimitMSSQL/binary,
+                             " origin_id, message FROM mam_muc_message"
+                             " WHERE room_id = ? AND sender_id = ? "
+                             " AND id = ?"
+                             " ORDER BY id DESC ", LimitSQL/binary>>),
+    mongoose_rdbms:prepare(mam_muc_extract_gdpr_messages, mam_muc_message, [sender_id],
+                           <<"SELECT id, message FROM mam_muc_message "
+                             " WHERE sender_id = ? ORDER BY id">>).
+
+prepare_remove_domain(#{delete_domain_limit := infinity}) ->
+    mongoose_rdbms:prepare(mam_muc_remove_domain, mam_muc_message, ['mam_server_user.server'],
+                           <<"DELETE FROM mam_muc_message "
+                             "WHERE room_id IN (SELECT id FROM mam_server_user where server = ?)">>),
+    mongoose_rdbms:prepare(mam_muc_remove_domain_users, mam_server_user, [server],
+                           <<"DELETE FROM mam_server_user WHERE server = ? ">>);
+prepare_remove_domain(#{delete_domain_limit := Limit}) ->
+    LimitSQL = case mongoose_rdbms:db_type() of
+                        mssql -> throw(delete_domain_limit_not_supported_for_mssql);
+                        _ -> {MaybeLimitSQL, _} = rdbms_queries:get_db_specific_limits_binaries(Limit),
+                             MaybeLimitSQL
+                    end,
+    IdTable = <<"(SELECT * FROM ",
+                    "(SELECT msg.room_id, msg.id FROM mam_muc_message msg",
+                    " INNER JOIN mam_server_user msu ON msu.id=msg.room_id",
+                    " WHERE msu.server = ? ", LimitSQL/binary, ") AS T)">>,
+    mongoose_rdbms:prepare(mam_muc_incr_remove_domain, mam_muc_message, ['mam_server_user.server'],
+                           <<"DELETE FROM mam_muc_message WHERE (room_id, id) IN ", IdTable/binary>>),
+    ServerTable = <<"(SELECT * FROM",
+                        "(SELECT id FROM mam_server_user WHERE server = ? ", LimitSQL/binary, ") as t)">>,
+    mongoose_rdbms:prepare(mam_muc_incr_remove_domain_users, mam_server_user, [server],
+                           <<"DELETE FROM mam_server_user WHERE id IN ", ServerTable/binary>>).
+
+%% ----------------------------------------------------------------------
+%% Declarative logic
+
+db_mappings() ->
+    [#db_mapping{column = id, param = message_id, format = int},
+     #db_mapping{column = room_id, param = archive_id, format = int},
+     #db_mapping{column = sender_id, param = sender_id, format = int},
+     #db_mapping{column = nick_name, param = source_jid, format = jid_resource},
+     #db_mapping{column = origin_id, param = origin_id, format = maybe_string},
+     #db_mapping{column = message, param = packet, format = xml},
+     #db_mapping{column = search_body, param = packet, format = search}].
+
+lookup_fields() ->
+    [#lookup_field{op = equal, column = room_id, param = archive_id, required = true},
+     #lookup_field{op = ge, column = id, param = start_id},
+     #lookup_field{op = le, column = id, param = end_id},
+     #lookup_field{op = equal, column = nick_name, param = remote_resource},
+     #lookup_field{op = like, column = search_body, param = norm_search_text, value_maker = search_words},
+     #lookup_field{op = equal, column = id, param = message_id}].
+
+-spec env_vars(host_type(), jid:jid()) -> env_vars().
+env_vars(HostType, ArcJID) ->
+    %% Please, minimize the usage of the host field.
+    %% It's only for passing into RDBMS.
+    #{host_type => HostType,
+      archive_jid => ArcJID,
+      table => mam_muc_message,
+      index_hint_fn => fun index_hint_sql/1,
+      columns_sql_fn => fun columns_sql/1,
+      column_to_id_fn => fun column_to_id/1,
+      lookup_fn => fun lookup_query/5,
+      decode_row_fn => fun row_to_uniform_format/2,
+      has_message_retraction => mod_mam_utils:has_message_retraction(mod_mam_muc, HostType),
+      has_full_text_search => mod_mam_utils:has_full_text_search(mod_mam_muc, HostType),
+      db_jid_codec => mod_mam_utils:db_jid_codec(HostType, ?MODULE),
+      db_message_codec => mod_mam_utils:db_message_codec(HostType, ?MODULE)}.
+
+row_to_uniform_format(Row, Env) ->
+    mam_decoder:decode_muc_row(Row, Env).
+
+-spec index_hint_sql(env_vars()) -> string().
+index_hint_sql(_) -> "".
+
+columns_sql(lookup) -> "id, nick_name, message";
+columns_sql(count) -> "COUNT(*)".
+
+column_to_id(id) -> "i";
+column_to_id(room_id) -> "u";
+column_to_id(nick_name) -> "n";
+column_to_id(search_body) -> "s".
+
+column_names(Mappings) ->
+     [Column || #db_mapping{column = Column} <- Mappings].
+
+%% ----------------------------------------------------------------------
+%% Options
+
+-spec get_retract_id(exml:element(), env_vars()) -> none | mod_mam_utils:retraction_id().
+get_retract_id(Packet, #{has_message_retraction := Enabled}) ->
+    mod_mam_utils:get_retract_id(Enabled, Packet).
 
 %% ----------------------------------------------------------------------
 %% Internal functions and callbacks
 
--spec archive_size(integer(), jid:server(), integer(), jid:jid())
-                  -> integer().
-archive_size(Size, Host, RoomID, _RoomJID) when is_integer(Size) ->
-    {selected, [{BSize}]} =
-    mod_mam_utils:success_sql_query(
-      Host,
-      ["SELECT COUNT(*) "
-       "FROM mam_muc_message ",
-       "WHERE room_id = ", use_escaped_integer(escape_room_id(RoomID))]),
-    mongoose_rdbms:result_to_integer(BSize).
+-spec archive_size(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: integer(),
+    Params :: #{archive_id := mod_mam:archive_id() | undefined, room := jid:jid()},
+    Extra :: gen_hook:extra().
+archive_size(Size, #{archive_id := ArcID, room := ArcJID}, #{host_type := HostType}) when is_integer(Size) ->
+    Filter = [{equal, room_id, ArcID}],
+    Env = env_vars(HostType, ArcJID),
+    Result = lookup_query(count, Env, Filter, unordered, all),
+    {ok, mongoose_rdbms:selected_to_integer(Result)}.
 
--spec archive_message(_Result, jid:server(), MessID :: mod_mam:message_id(),
-                      RoomID :: mod_mam:archive_id(), _LocJID :: jid:jid(),
-                      SenderJID :: jid:jid(), UserRoomJID :: jid:jid(),
-                      OriginID :: binary() | none, incoming, Packet :: packet()) -> ok.
-archive_message(_Result, Host, MessID, RoomID, _LocJID = #jid{},
-                SenderJID = #jid{}, UserRoomJID = #jid{}, OriginID, incoming, Packet) ->
-    try
-        Row = prepare_message(Host, MessID, RoomID, SenderJID, UserRoomJID, OriginID, Packet),
-        {updated, 1} = mod_mam_utils:success_sql_execute(Host, insert_mam_muc_message, Row),
-        retract_message(Host, MessID, RoomID, SenderJID, UserRoomJID, OriginID, Packet),
-        ok
-    catch _Type:Reason:StackTrace ->
-            ?ERROR_MSG("event=archive_message_failed mess_id=~p room_id=~p "
-                       "from_nick=~p reason='~p' stacktrace=~p",
-                       [MessID, RoomID, UserRoomJID#jid.lresource, Reason, StackTrace]),
-            {error, Reason}
-    end.
-
-retract_message(Host, _MessID, RoomID, SenderJID, _UserRoomJID, _OriginID, Packet) ->
-    case mod_mam_utils:get_retract_id(mod_mam_muc, Host, Packet) of
-        none -> ok;
-        OriginIDToRetract -> retract_message(Host, RoomID, SenderJID, OriginIDToRetract)
-    end.
-
-retract_message(Host, RoomID, SenderJID, OriginID) ->
-    SRoomID = use_escaped_integer(escape_room_id(RoomID)),
-    SenderID = mod_mam:archive_id_int(Host, jid:to_bare(SenderJID)),
-    SSenderID = use_escaped_integer(mongoose_rdbms:escape_integer(SenderID)),
-    SOriginID = use_escaped_string(mongoose_rdbms:escape_string(OriginID)),
-    Query = query_for_messages_to_retract(SRoomID, SSenderID, SOriginID),
-    {selected, Rows} = mod_mam_utils:success_sql_query(Host, Query),
-    make_tombstone(Host, SRoomID, OriginID, Rows),
-    ok.
-
-make_tombstone(_Host, _SRoomID, OriginID, []) ->
-    ?INFO_MSG("Message to retract with origin id '~s' not found", [OriginID]);
-make_tombstone(Host, SRoomID, OriginID, [{ResMessID, ResData}]) ->
-    Data = mongoose_rdbms:unescape_binary(Host, ResData),
-    Packet = stored_binary_to_packet(Host, Data),
-    MessID = mongoose_rdbms:result_to_integer(ResMessID),
-    Tombstone = mod_mam_utils:tombstone(Packet, OriginID),
-    TombstoneData = packet_to_stored_binary(Host, Tombstone),
-    STombstoneData = mongoose_rdbms:use_escaped_binary(
-                       mongoose_rdbms:escape_binary(Host, TombstoneData)),
-    BMessID = use_escaped_integer(escape_message_id(MessID)),
-    UpdateQuery = query_to_make_tombstone(STombstoneData, SRoomID, BMessID),
-    {updated, 1} = mod_mam_utils:success_sql_query(Host, UpdateQuery).
-
-query_for_messages_to_retract(SRoomID, SSenderID, SOriginID) ->
-    {LimitSQL, LimitMSSQL} = rdbms_queries:get_db_specific_limits(1),
-    ["SELECT ", LimitMSSQL, " id, message FROM mam_muc_message"
-     " WHERE room_id = ", SRoomID, " AND sender_id = ", SSenderID, " AND origin_id = ", SOriginID,
-     " ORDER BY id DESC ", LimitSQL].
-
-query_to_make_tombstone(STombstoneData, SRoomID, BMessID) ->
-    ["UPDATE mam_muc_message SET message = ", STombstoneData, ", search_body = ''"
-     " WHERE room_id = ", SRoomID, " AND id = '", BMessID, "'"].
-
--spec prepare_message(Host :: jid:server(), MessID :: mod_mam:message_id(),
-                      RoomID :: mod_mam:archive_id(), SenderJID :: jid:jid(),
-                      UserRoomJID :: jid:jid(), OriginID :: binary() | none,
-                      Packet :: packet()) -> [binary() | integer()].
-prepare_message(Host, MessID, RoomID, SenderJID, #jid{ lresource = FromNick }, OriginID, Packet) ->
+extend_params_with_sender_id(HostType, Params = #{remote_jid := SenderJID}) ->
     BareSenderJID = jid:to_bare(SenderJID),
-    Data = packet_to_stored_binary(Host, Packet),
-    TextBody = mod_mam_utils:packet_to_search_body(mod_mam_muc, Host, Packet),
-    SenderID = mod_mam:archive_id_int(Host, BareSenderJID),
-    SOriginID = case OriginID of
-                    none -> null;
-                    _ -> OriginID
-                end,
-    [MessID, RoomID, SenderID, FromNick, SOriginID, Data, TextBody].
+    SenderID = mod_mam_pm:archive_id_int(HostType, BareSenderJID),
+    Params#{sender_id => SenderID}.
+
+-spec archive_message(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: ok,
+    Params :: mod_mam:archive_message_params(),
+    Extra :: gen_hook:extra().
+archive_message(_Result, #{local_jid := ArcJID} = Params0, #{host_type := HostType}) ->
+    try
+        Params = extend_params_with_sender_id(HostType, Params0),
+        Env = env_vars(HostType, ArcJID),
+        do_archive_message(HostType, Params, Env),
+        retract_message(HostType, Params, Env),
+        {ok, ok}
+    catch error:Reason:StackTrace ->
+        mongoose_instrument:execute(mod_mam_muc_dropped, #{host_type => HostType}, #{count => 1}),
+        ?LOG_ERROR(#{what => archive_message_failed,
+                     host_type => HostType, mam_params => Params0,
+                     reason => Reason, stacktrace => StackTrace}),
+        erlang:raise(error, Reason, StackTrace)
+    end.
+
+do_archive_message(HostType, Params, Env) ->
+    Row = mam_encoder:encode_message(Params, Env, db_mappings()),
+    {updated, 1} = mongoose_rdbms:execute_successfully(HostType, insert_mam_muc_message, Row).
+
+%% Retraction logic
+%% Called after inserting a new message
+-spec retract_message(mongooseim:host_type(), mod_mam:archive_message_params()) -> ok.
+retract_message(HostType, #{local_jid := ArcJID} = Params)  ->
+    Env = env_vars(HostType, ArcJID),
+    retract_message(HostType, Params, Env).
+
+-spec retract_message(mongooseim:host_type(), mod_mam:archive_message_params(), env_vars()) -> ok.
+retract_message(HostType, #{archive_id := ArcID, sender_id := SenderID,
+                            packet := Packet} = Params, Env) ->
+    case get_retract_id(Packet, Env) of
+        none -> ok;
+        RetractionId ->
+            Info = get_retraction_info(HostType, ArcID, SenderID, RetractionId, Env),
+            make_tombstone(HostType, ArcID, RetractionId, Info, Params, Env)
+    end.
+
+get_retraction_info(HostType, ArcID, SenderID, RetractionId, Env) ->
+    {selected, Rows} =
+        execute_select_messages_to_retract(HostType, ArcID, SenderID, RetractionId),
+    mam_decoder:decode_retraction_info(Env, Rows, RetractionId).
+
+make_tombstone(_HostType, ArcID, RetractionId, skip, _Params, _Env) ->
+    ?LOG_INFO(#{what => make_tombstone_failed,
+                text => <<"Message to retract was not found">>,
+                user_id => ArcID, retraction_context => RetractionId});
+make_tombstone(HostType, ArcID, _RetractionId,
+               RetractionInfo = #{message_id := MessID}, Params,
+               #{archive_jid := ArcJID} = Env) ->
+    RetractionInfo1 = mongoose_hooks:mam_muc_retraction(HostType, RetractionInfo, Params),
+    Tombstone = mod_mam_utils:tombstone(RetractionInfo1, ArcJID),
+    TombstoneData = mam_encoder:encode_packet(Tombstone, Env),
+    execute_make_tombstone(HostType, TombstoneData, ArcID, MessID).
+
+execute_select_messages_to_retract(HostType, ArcID, SenderID, {origin_id, OriginID}) ->
+    mongoose_rdbms:execute_successfully(HostType, mam_muc_select_messages_to_retract_on_origin_id,
+                                      [ArcID, SenderID, OriginID]);
+execute_select_messages_to_retract(HostType, ArcID, SenderID, {stanza_id, BinStanzaId}) ->
+    StanzaId = mod_mam_utils:external_binary_to_mess_id(BinStanzaId),
+    mongoose_rdbms:execute_successfully(HostType, mam_muc_select_messages_to_retract_on_stanza_id,
+                                      [ArcID, SenderID, StanzaId]).
+
+execute_make_tombstone(HostType, TombstoneData, ArcID, MessID) ->
+    mongoose_rdbms:execute_successfully(HostType, mam_muc_make_tombstone,
+                                      [TombstoneData, ArcID, MessID]).
+
+%% Insert logic
+-spec prepare_message(mongooseim:host_type(), mod_mam:archive_message_params()) -> list().
+prepare_message(HostType, Params = #{local_jid := ArcJID}) ->
+    Env = env_vars(HostType, ArcJID),
+    mam_encoder:encode_message(Params, Env, db_mappings()).
 
 -spec prepare_insert(Name :: atom(), NumRows :: pos_integer()) -> ok.
 prepare_insert(Name, NumRows) ->
     Table = mam_muc_message,
-    Fields = [id, room_id, sender_id, nick_name, origin_id, message, search_body],
-    Query = rdbms_queries:create_bulk_insert_query(Table, Fields, NumRows),
-    mongoose_rdbms:prepare(Name, Table, Fields, Query),
+    Fields = column_names(db_mappings()),
+    {Query, Fields2} = rdbms_queries:create_bulk_insert_query(Table, Fields, NumRows),
+    mongoose_rdbms:prepare(Name, Table, Fields2, Query),
     ok.
 
+%% Removal logic
+-spec remove_archive(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: mongoose_acc:t(),
+    Params :: #{archive_id := mod_mam:archive_id() | undefined, room := jid:jid()},
+    Extra :: gen_hook:extra().
+remove_archive(Acc, #{archive_id := ArcID}, #{host_type := HostType}) ->
+    mongoose_rdbms:execute_successfully(HostType, mam_muc_archive_remove, [ArcID]),
+    {ok, Acc}.
 
-lookup_messages({error, _Reason}=Result, _Host, _Params) ->
-    Result;
-lookup_messages(_Result, Host,
-                #{archive_id := UserID, owner_jid := UserJID, rsm := RSM,
-                  borders := Borders, start_ts := Start, end_ts := End, now := Now,
-                  with_jid := WithJID, search_text := SearchText, page_size := PageSize,
-                  is_simple := IsSimple}) ->
+-spec remove_domain(Acc, Params, Extra) -> {ok | stop, Acc} when
+    Acc :: mongoose_domain_api:remove_domain_acc(),
+    Params :: map(),
+    Extra :: gen_hook:extra().
+remove_domain(Acc, #{domain := Domain}, #{host_type := HostType}) ->
+    F = fun() ->
+            case gen_mod:get_module_opt(HostType, ?MODULE, delete_domain_limit) of
+                infinity -> remove_domain_all(HostType, Domain);
+                Limit -> remove_domain_batch(HostType, Domain, Limit)
+            end,
+            Acc
+        end,
+    mongoose_domain_api:remove_domain_wrapper(Acc, F, ?MODULE).
+
+-spec remove_domain_all(host_type(), jid:lserver()) -> any().
+remove_domain_all(HostType, Domain) ->
+    SubHosts = get_subhosts(HostType, Domain),
+    {atomic, _} = mongoose_rdbms:sql_transaction(HostType, fun() ->
+            [remove_domain_trans(HostType, SubHost) || SubHost <- SubHosts]
+     end).
+
+-spec remove_domain_batch(host_type(), jid:lserver(), non_neg_integer()) -> any().
+remove_domain_batch(HostType, Domain, Limit) ->
+    SubHosts = get_subhosts(HostType, Domain),
+    DeleteQueries = [mam_muc_incr_remove_domain, mam_muc_incr_remove_domain_users],
+    DelSubHost = [ mod_mam_utils:incremental_delete_domain(HostType, SubHost, Limit, DeleteQueries, 0)
+                   || SubHost <- SubHosts],
+    TotalDeleted = lists:sum(DelSubHost),
+    ?LOG_INFO(#{what => mam_muc_domain_removal_completed, total_records_deleted => TotalDeleted,
+                domain => Domain, host_type => HostType}).
+
+remove_domain_trans(HostType, MucHost) ->
+    mongoose_rdbms:execute_successfully(HostType, mam_muc_remove_domain, [MucHost]),
+    mongoose_rdbms:execute_successfully(HostType, mam_muc_remove_domain_users, [MucHost]).
+
+get_subhosts(HostType, Domain) ->
+    lists:usort(
+      lists:flatmap(fun(Module) -> get_subhosts_for_module(HostType, Domain, Module) end,
+                    [mod_muc, mod_muc_light])).
+
+get_subhosts_for_module(HostType, Domain, Module) ->
+    case gen_mod:get_module_opts(HostType, Module) of
+        #{host := HostPattern} ->
+            [mongoose_subdomain_utils:get_fqdn(HostPattern, Domain)];
+        #{} ->
+            []
+    end.
+
+%% GDPR logic
+extract_gdpr_messages(HostType, SenderID) ->
+    mongoose_rdbms:execute_successfully(HostType, mam_muc_extract_gdpr_messages, [SenderID]).
+
+%% Lookup logic
+-spec lookup_messages(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: {ok, mod_mam:lookup_result()},
+    Params :: mam_iq:lookup_params(),
+    Extra :: gen_hook:extra().
+lookup_messages(_Result, #{owner_jid := ArcJID} = Params, #{host_type := HostType}) ->
+    Env = env_vars(HostType, ArcJID),
+    ExdParams = mam_encoder:extend_lookup_params(Params, Env),
+    Filter = mam_filter:produce_filter(ExdParams, lookup_fields()),
     try
-        lookup_messages(Host,
-                        UserID, UserJID, RSM, Borders,
-                        Start, End, Now, WithJID,
-                        mod_mam_utils:normalize_search_text(SearchText),
-                        PageSize, IsSimple)
-    catch _Type:Reason:S ->
-        {error, {Reason, {stacktrace, S}}}
+        {ok, mam_lookup:lookup(Env, Filter, ExdParams)}
+    catch _Type:Reason ->
+        {ok, {error, Reason}}
     end.
 
--spec lookup_messages(Host :: jid:server(),
-                      ArchiveID :: mod_mam:archive_id(),
-                      ArchiveJID :: jid:jid(),
-                      RSM :: jlib:rsm_in()  | undefined,
-                      Borders :: mod_mam:borders()  | undefined,
-                      Start :: mod_mam:unix_timestamp()  | undefined,
-                      End :: mod_mam:unix_timestamp()  | undefined,
-                      Now :: mod_mam:unix_timestamp(),
-                      WithJID :: jid:jid()  | undefined,
-                      SearchText :: binary() | undefined,
-                      PageSize :: integer(),
-                      IsSimple :: boolean()  | opt_count) ->
-                             {ok, mod_mam:lookup_result()}.
-lookup_messages(Host, RoomID, RoomJID = #jid{},
-                #rsm_in{direction = aft, id = ID}, Borders,
-                Start, End, _Now, WithJID, SearchText,
-                PageSize, true) ->
-    Filter = prepare_filter(RoomID, Borders, Start, End, WithJID, SearchText),
-    MessageRows = extract_messages(Host, after_id(ID, Filter), 0, PageSize, false),
-    {ok, {undefined, undefined,
-          rows_to_uniform_format(MessageRows, Host, RoomJID)}};
-lookup_messages(Host, RoomID, RoomJID = #jid{},
-                #rsm_in{direction = before, id = ID},
-                Borders, Start, End, _Now, WithJID, SearchText,
-                PageSize, true) ->
-    Filter = prepare_filter(RoomID, Borders, Start, End, WithJID, SearchText),
-    MessageRows = extract_messages(Host, before_id(ID, Filter), 0, PageSize, true),
-    {ok, {undefined, undefined,
-          rows_to_uniform_format(MessageRows, Host, RoomJID)}};
-lookup_messages(Host, RoomID, RoomJID = #jid{},
-                #rsm_in{direction = undefined, index = Offset}, Borders,
-                Start, End, _Now, WithJID, SearchText,
-                PageSize, true) ->
-    Filter = prepare_filter(RoomID, Borders, Start, End, WithJID, SearchText),
-    MessageRows = extract_messages(Host, Filter, Offset, PageSize, false),
-    {ok, {undefined, undefined,
-          rows_to_uniform_format(MessageRows, Host, RoomJID)}};
-lookup_messages(Host, RoomID, RoomJID = #jid{},
-                undefined, Borders,
-                Start, End, _Now, WithJID, SearchText,
-                PageSize, true) ->
-    Filter = prepare_filter(RoomID, Borders, Start, End, WithJID, SearchText),
-    MessageRows = extract_messages(Host, Filter, 0, PageSize, false),
-    {ok, {undefined, undefined,
-          rows_to_uniform_format(MessageRows, Host, RoomJID)}};
-%% Cannot be optimized:
-%% - #rsm_in{direction = aft, id = ID}
-%% - #rsm_in{direction = before, id = ID}
-lookup_messages(Host, RoomID, RoomJID = #jid{},
-                #rsm_in{direction = before, id = undefined}, Borders,
-                Start, End, _Now, WithJID, SearchText,
-                PageSize, opt_count) ->
-    %% Last page
-    Filter = prepare_filter(RoomID, Borders, Start, End, WithJID, SearchText),
-    MessageRows = extract_messages(Host, Filter, 0, PageSize, true),
-    MessageRowsCount = length(MessageRows),
-    case MessageRowsCount < PageSize of
-        true ->
-            {ok, {MessageRowsCount, 0,
-                  rows_to_uniform_format(MessageRows, Host, RoomJID)}};
-        false ->
-            FirstID = row_to_message_id(hd(MessageRows)),
-            Offset = calc_count(Host, before_id(FirstID, Filter)),
-            {ok, {Offset + MessageRowsCount, Offset,
-                  rows_to_uniform_format(MessageRows, Host, RoomJID)}}
-    end;
-lookup_messages(Host, RoomID, RoomJID = #jid{},
-                #rsm_in{direction = undefined, index = Offset}, Borders,
-                Start, End, _Now, WithJID, SearchText,
-                PageSize, opt_count) ->
-    %% By offset
-    Filter = prepare_filter(RoomID, Borders, Start, End, WithJID, SearchText),
-    MessageRows = extract_messages(Host, Filter, Offset, PageSize, false),
-    MessageRowsCount = length(MessageRows),
-    case MessageRowsCount < PageSize of
-        true ->
-            {ok, {Offset + MessageRowsCount, Offset,
-                  rows_to_uniform_format(MessageRows, Host, RoomJID)}};
-        false ->
-            LastID = row_to_message_id(lists:last(MessageRows)),
-            CountAfterLastID = calc_count(Host, after_id(LastID, Filter)),
-            {ok, {Offset + MessageRowsCount + CountAfterLastID, Offset,
-                  rows_to_uniform_format(MessageRows, Host, RoomJID)}}
-    end;
-lookup_messages(Host, RoomID, RoomJID = #jid{},
-                undefined, Borders,
-                Start, End, _Now, WithJID, SearchText,
-                PageSize, opt_count) ->
-    %% First page
-    Filter = prepare_filter(RoomID, Borders, Start, End, WithJID, SearchText),
-    MessageRows = extract_messages(Host, Filter, 0, PageSize, false),
-    MessageRowsCount = length(MessageRows),
-    case MessageRowsCount < PageSize of
-        true ->
-            {ok, {MessageRowsCount, 0,
-                  rows_to_uniform_format(MessageRows, Host, RoomJID)}};
-        false ->
-            LastID = row_to_message_id(lists:last(MessageRows)),
-            CountAfterLastID = calc_count(Host, after_id(LastID, Filter)),
-            {ok, {MessageRowsCount + CountAfterLastID, 0,
-                  rows_to_uniform_format(MessageRows, Host, RoomJID)}}
-    end;
-lookup_messages(Host, RoomID, RoomJID = #jid{},
-                RSM = #rsm_in{direction = aft, id = ID}, Borders,
-                Start, End, _Now, WithJID, SearchText,
-                PageSize, _) when ID =/= undefined ->
-    Filter = prepare_filter(RoomID, Borders, Start, End, WithJID, SearchText),
-    TotalCount = calc_count(Host, Filter),
-    Offset = calc_offset(Host, Filter, PageSize, TotalCount, RSM),
-    MessageRows = extract_messages(Host, from_id(ID, Filter), 0, PageSize + 1, false),
-    Result = {TotalCount, Offset, rows_to_uniform_format(MessageRows, Host, RoomJID)},
-    mod_mam_utils:check_for_item_not_found(RSM, PageSize, Result);
-lookup_messages(Host, RoomID, RoomJID = #jid{},
-                RSM = #rsm_in{direction = before, id = ID},
-                Borders, Start, End, _Now, WithJID, SearchText,
-                PageSize, _) when ID =/= undefined ->
-    Filter = prepare_filter(RoomID, Borders, Start, End, WithJID, SearchText),
-    TotalCount = calc_count(Host, Filter),
-    Offset = calc_offset(Host, Filter, PageSize, TotalCount, RSM),
-    MessageRows = extract_messages(Host, to_id(ID, Filter), 0, PageSize + 1, true),
-    Result = {TotalCount, Offset, rows_to_uniform_format(MessageRows, Host, RoomJID)},
-    mod_mam_utils:check_for_item_not_found(RSM, PageSize, Result);
-lookup_messages(Host, RoomID, RoomJID = #jid{},
-                RSM, Borders,
-                Start, End, _Now, WithJID, SearchText,
-                PageSize, _) ->
-    Filter = prepare_filter(RoomID, Borders, Start, End, WithJID, SearchText),
-    TotalCount = calc_count(Host, Filter),
-    Offset = calc_offset(Host, Filter, PageSize, TotalCount, RSM),
-    MessageRows = extract_messages(Host, Filter, Offset, PageSize, false),
-    {ok, {TotalCount, Offset,
-          rows_to_uniform_format(MessageRows, Host, RoomJID)}}.
-
--spec get_mam_muc_gdpr_data(ejabberd_gen_mam_archive:mam_muc_gdpr_data(), jid:jid()) ->
-    ejabberd_gen_mam_archive:mam_muc_gdpr_data().
-get_mam_muc_gdpr_data(Acc, #jid{ user = User, server = Host }) ->
-    case mod_mam:archive_id(Host, User) of
-        undefined -> Acc;
-        ArchiveID ->
-            {selected, Rows} = extract_gdpr_messages(Host, ArchiveID),
-            [{BMessID, gdpr_decode_packet(Host, SDataRaw)} || {BMessID,  SDataRaw} <- Rows] ++ Acc
-    end.
-
--spec after_id(ID :: escaped_message_id(), Filter :: filter()) -> filter().
-after_id(ID, Filter) ->
-    SID = escape_message_id(ID),
-    [Filter, " AND id > ", use_escaped_integer(SID)].
-
--spec before_id(ID :: escaped_message_id() | undefined,
-               Filter :: filter()) -> filter().
-before_id(undefined, Filter) ->
-    Filter;
-before_id(ID, Filter) ->
-    SID = escape_message_id(ID),
-    [Filter, " AND id < ", use_escaped_integer(SID)].
-
--spec from_id(ID :: escaped_message_id(), Filter :: filter()) -> filter().
-from_id(ID, Filter) ->
-    SID = escape_message_id(ID),
-    [Filter, " AND id >= ", use_escaped_integer(SID)].
-
--spec to_id(ID :: escaped_message_id(), Filter :: filter()) -> filter().
-to_id(ID, Filter) ->
-    SID = escape_message_id(ID),
-    [Filter, " AND id <= ", use_escaped_integer(SID)].
-
-
--spec rows_to_uniform_format([raw_row()], jid:server(), jid:jid()) ->
-                                    [mod_mam_muc:row()].
-rows_to_uniform_format(MessageRows, Host, RoomJID) ->
-    [do_row_to_uniform_format(Host, Row, RoomJID) || Row <- MessageRows].
-
-
--spec do_row_to_uniform_format(jid:server(), raw_row(), jid:jid()) ->
-                                   mod_mam_muc:row().
-do_row_to_uniform_format(Host, {BMessID, BNick, SDataRaw}, RoomJID) ->
-    MessID = mongoose_rdbms:result_to_integer(BMessID),
-    SrcJID = jid:replace_resource(RoomJID, BNick),
-    Data = mongoose_rdbms:unescape_binary(Host, SDataRaw),
-    Packet = stored_binary_to_packet(Host, Data),
-    {MessID, SrcJID, Packet}.
-
-
--spec row_to_message_id({binary(), _, _}) -> integer().
-row_to_message_id({BMessID, _, _}) ->
-    mongoose_rdbms:result_to_integer(BMessID).
-
-
--spec remove_archive(map(), jid:server(), mod_mam:archive_id(), jid:jid()) -> map().
-remove_archive(Acc, Host, RoomID, _RoomJID) ->
-    {updated, _} =
-    mod_mam_utils:success_sql_query(
-      Host,
-      ["DELETE FROM mam_muc_message "
-       "WHERE room_id = ", use_escaped_integer(escape_room_id(RoomID))]),
-    Acc.
-
-%% @doc Columns are `["id", "nick_name", "message"]'.
--spec extract_messages(Host :: jid:server(),
-                       Filter :: filter(), IOffset :: non_neg_integer(), IMax :: pos_integer(),
-                       ReverseLimit :: boolean()) -> [raw_row()].
-extract_messages(_Host, _Filter, _IOffset, 0, _) ->
-    [];
-extract_messages(Host, Filter, IOffset, IMax, false) ->
-    {selected, MessageRows} =
-        do_extract_messages(Host, Filter, IOffset, IMax, " ORDER BY id "),
-    ?DEBUG("extract_messages query returns ~p", [MessageRows]),
-    MessageRows;
-extract_messages(Host, Filter, IOffset, IMax, true) ->
-    {selected, MessageRows} =
-        do_extract_messages(Host, Filter, IOffset, IMax, " ORDER BY id DESC "),
-    ?DEBUG("extract_messages query returns ~p", [MessageRows]),
-    lists:reverse(MessageRows).
-
-do_extract_messages(Host, Filter, 0, IMax, Order) ->
-    {LimitSQL, LimitMSSQL} = rdbms_queries:get_db_specific_limits(IMax),
-    mod_mam_utils:success_sql_query(
-      Host,
-      ["SELECT ", LimitMSSQL, " id, nick_name, message "
-       "FROM mam_muc_message ",
-       Filter,
-       Order,
-       " ", LimitSQL]);
-do_extract_messages(Host, Filter, IOffset, IMax, Order) ->
-    {LimitSQL, _LimitMSSQL} = rdbms_queries:get_db_specific_limits(IMax),
-    Offset = rdbms_queries:get_db_specific_offset(IOffset, IMax),
-    mod_mam_utils:success_sql_query(
-      Host,
-      ["SELECT id, nick_name, message "
-       "FROM mam_muc_message ",
-       Filter, Order, LimitSQL, Offset]).
-
-extract_gdpr_messages(Host, ArchiveID) ->
-    Filter = ["WHERE sender_id = ", use_escaped_integer(escape_integer(ArchiveID))],
-    mod_mam_utils:success_sql_query(
-        Host,
-        ["SELECT id, message "
-         "FROM mam_muc_message ",
-         Filter, " ORDER BY id"]).
-
-%% @doc Zero-based index of the row with UMessID in the result test.
-%% If the element does not exists, the MessID of the next element will
-%% be returned instead.
-%%
-%% ```
-%% "SELECT COUNT(*) as "index" FROM mam_muc_message WHERE id <= '",  UMessID
-%% '''
--spec calc_index(Host :: jid:server(),
-                 Filter :: iodata(), SUMessID :: escaped_message_id()) -> non_neg_integer().
-calc_index(Host, Filter, SUMessID) ->
-    {selected, [{BIndex}]} =
-    mod_mam_utils:success_sql_query(
-      Host,
-      ["SELECT COUNT(*) "
-       "FROM mam_muc_message ",
-       Filter, " AND id <= ", use_escaped_integer(SUMessID)]),
-    mongoose_rdbms:result_to_integer(BIndex).
-
-
-%% @doc Count of elements in RSet before the passed element.
-%% The element with the passed UMessID can be already deleted.
-%% @end
-%% "SELECT COUNT(*) as "count" FROM mam_muc_message WHERE id < '",  UMessID
--spec calc_before(Host :: jid:server(),
-                  Filter :: iodata(), SUMessID :: escaped_message_id()) -> non_neg_integer().
-calc_before(Host, Filter, SUMessID) ->
-    {selected, [{BIndex}]} =
-    mod_mam_utils:success_sql_query(
-      Host,
-      ["SELECT COUNT(*) "
-       "FROM mam_muc_message ",
-       Filter, " AND id < ", use_escaped_integer(SUMessID)]),
-    mongoose_rdbms:result_to_integer(BIndex).
-
-
-%% @doc Get the total result set size.
-%% "SELECT COUNT(*) as "count" FROM mam_muc_message WHERE "
--spec calc_count(Host :: jid:server(),
-                 Filter :: filter()) -> non_neg_integer().
-calc_count(Host, Filter) ->
-    {selected, [{BCount}]} =
-    mod_mam_utils:success_sql_query(
-      Host,
-      ["SELECT COUNT(*) ",
-       "FROM mam_muc_message ", Filter]),
-    mongoose_rdbms:result_to_integer(BCount).
-
-
-%% @doc prepare_filter/5
--spec prepare_filter(RoomID :: mod_mam:archive_id(), Borders :: mod_mam:borders() | undefined,
-                     Start :: unix_timestamp() | undefined, End :: unix_timestamp() | undefined,
-                     WithJID :: jid:jid() | undefined, SearchText :: binary() | undefined) -> filter().
-prepare_filter(RoomID, Borders, Start, End, WithJID, SearchText) ->
-    SWithNick = maybe_jid_to_escaped_resource(WithJID),
-    StartID = maybe_encode_compact_uuid(Start, 0),
-    EndID   = maybe_encode_compact_uuid(End, 255),
-    StartID2 = apply_start_border(Borders, StartID),
-    EndID2   = apply_end_border(Borders, EndID),
-    make_filter(RoomID, StartID2, EndID2, SWithNick, SearchText).
-
-
--spec make_filter(RoomID  :: non_neg_integer(),
-                  StartID :: mod_mam:message_id() | undefined,
-                  EndID :: mod_mam:message_id() | undefined,
-                  SWithNick :: escaped_jid() | undefined,
-                  SearchText :: binary() | undefined) -> filter().
-make_filter(RoomID, StartID, EndID, SWithNick, SearchText) ->
-   ["WHERE room_id=", use_escaped_integer(escape_room_id(RoomID)),
-     case StartID of
-         undefined -> "";
-         _         -> [" AND id >= ", use_escaped_integer(escape_integer(StartID))]
-     end,
-     case EndID of
-         undefined -> "";
-         _         -> [" AND id <= ", use_escaped_integer(escape_integer(EndID))]
-     end,
-     case SWithNick of
-         undefined -> "";
-         _         -> [" AND nick_name = ", use_escaped_string(SWithNick)]
-     end,
-     case SearchText of
-         undefined -> "";
-         _         -> prepare_search_filters(SearchText)
-     end
-    ].
-
-%% Constructs a separate LIKE filter for each word.
-%% SearchText example is "word1%word2%word3".
-prepare_search_filters(SearchText) ->
-    Words = binary:split(SearchText, <<"%">>, [global]),
-    [prepare_search_filter(Word) || Word <- Words].
-
--spec prepare_search_filter(binary()) -> filter().
-prepare_search_filter(Word) ->
-    [" AND search_body like ",
-     %% Search for "%Word%"
-     mongoose_rdbms:use_escaped_like(mongoose_rdbms:escape_like(Word))].
-
-%% @doc #rsm_in{
-%%    max = non_neg_integer() | undefined,
-%%    direction = before | aft | undefined,
-%%    id = binary() | undefined,
-%%    index = non_neg_integer() | undefined}
--spec calc_offset(Host :: jid:server(),
-                  Filter :: filter(), PageSize :: non_neg_integer(),
-                  TotalCount :: non_neg_integer(), RSM :: jlib:rsm_in() | undefined)
-                 -> non_neg_integer().
-calc_offset(_LS, _F, _PS, _TC, #rsm_in{direction = undefined, index = Index})
-  when is_integer(Index) ->
-    Index;
-%% Requesting the Last Page in a Result Set
-calc_offset(_LS, _F, PS, TC, #rsm_in{direction = before, id = undefined}) ->
-    max(0, TC - PS);
-calc_offset(Host, F, PS, _TC, #rsm_in{direction = before, id = MessID})
-  when is_integer(MessID) ->
-    SMessID = escape_message_id(MessID),
-    max(0, calc_before(Host, F, SMessID) - PS);
-calc_offset(Host, F, _PS, _TC, #rsm_in{direction = aft, id = MessID})
-  when is_integer(MessID) ->
-    SMessID = escape_message_id(MessID),
-    calc_index(Host, F, SMessID);
-calc_offset(_LS, _F, _PS, _TC, _RSM) ->
-    0.
-
-
--spec escape_message_id(mod_mam:message_id()) -> escaped_message_id().
-escape_message_id(MessID) when is_integer(MessID) ->
-    escape_integer(MessID).
-
-
--spec escape_room_id(mod_mam:archive_id()) -> escaped_room_id().
-escape_room_id(RoomID) when is_integer(RoomID) ->
-    escape_integer(RoomID).
-
-
--spec maybe_jid_to_escaped_resource('undefined' | jid:jid())
-                                   -> 'undefined' | mongoose_rdbms:escaped_string().
-maybe_jid_to_escaped_resource(undefined) ->
-    undefined;
-maybe_jid_to_escaped_resource(#jid{lresource = <<>>}) ->
-    undefined;
-maybe_jid_to_escaped_resource(#jid{lresource = WithLResource}) ->
-    mongoose_rdbms:escape_string(WithLResource).
-
-
--spec maybe_encode_compact_uuid('undefined' | integer(), 0 | 255)
-                               -> 'undefined' | integer().
-maybe_encode_compact_uuid(undefined, _) ->
-    undefined;
-maybe_encode_compact_uuid(Microseconds, NodeID) ->
-    encode_compact_uuid(Microseconds, NodeID).
-
-
-%% ----------------------------------------------------------------------
-%% Optimizations
-
-packet_to_stored_binary(Host, Packet) ->
-    Module = db_message_codec(Host),
-    mam_message:encode(Module, Packet).
-
-stored_binary_to_packet(Host, Bin) ->
-    Module = db_message_codec(Host),
-    mam_message:decode(Module, Bin).
-
--spec db_message_codec(Host :: jid:server()) -> module().
-db_message_codec(Host) ->
-    gen_mod:get_module_opt(Host, ?MODULE, db_message_format, mam_message_compressed_eterm).
-
-
-gdpr_decode_packet(Host, SDataRaw) ->
-    Codec = mod_mam_meta:get_mam_module_opt(Host, ?MODULE, db_message_format,
-                                            mam_message_compressed_eterm),
-    Data = mongoose_rdbms:unescape_binary(Host, SDataRaw),
-    Message = mam_message:decode(Codec, Data),
-    exml:to_binary(Message).
+lookup_query(QueryType, Env, Filters, Order, OffsetLimit) ->
+    mam_lookup_sql:lookup_query(QueryType, Env, Filters, Order, OffsetLimit).

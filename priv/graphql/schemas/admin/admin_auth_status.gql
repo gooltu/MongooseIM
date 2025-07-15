@@ -1,0 +1,18 @@
+"Information about user request authorization"
+type AdminAuthInfo{
+  "Authorized for a domain"
+  domain: DomainName
+  "Authorization status"
+  authStatus: AuthStatus!
+  "Authorization as a "
+  authType: AuthType
+}
+
+enum AuthType{
+  "Administrator of the specific domain"
+  DOMAIN_ADMIN
+  "Global administrator"
+  ADMIN
+  "Unauthorized user"
+  UNAUTHORIZED
+}

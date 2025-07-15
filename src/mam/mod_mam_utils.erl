@@ -9,7 +9,8 @@
 -export([maybe_microseconds/1]).
 
 %% UID
--export([generate_message_id/0,
+-export([get_or_generate_mam_id/1,
+         generate_message_id/1,
          encode_compact_uuid/2,
          decode_compact_uuid/1,
          mess_id_to_external_binary/1,
@@ -29,27 +30,28 @@
          get_one_of_path/2,
          get_one_of_path/3,
          is_archivable_message/4,
-         get_retract_id/3,
+         has_message_retraction/2,
+         get_retract_id/2,
          get_origin_id/1,
+         is_groupchat/1,
+         should_page_be_flipped/1,
          tombstone/2,
          wrap_message/6,
          wrap_message/7,
          result_set/4,
          result_query/2,
          result_prefs/4,
-         make_fin_element/4,
+         make_fin_element/7,
          parse_prefs/1,
-         borders_decode/1,
-         decode_optimizations/1,
          form_borders_decode/1,
          form_decode_optimizations/1,
          is_mam_result_message/1,
+         make_metadata_element/0,
+         make_metadata_element/4,
          features/2]).
 
 %% Forms
 -export([
-    form_field_value_s/2,
-    form_field_value/2,
     message_form/3,
     form_to_text/1
 ]).
@@ -58,16 +60,13 @@
 -export([
     normalize_search_text/1,
     normalize_search_text/2,
-    packet_to_search_body/3,
+    packet_to_search_body/2,
     has_full_text_search/2
 ]).
 
 %% JID serialization
 -export([jid_to_opt_binary/2,
          expand_minified_jid/2]).
-
-%% SQL
--export([success_sql_query/2, success_sql_execute/3]).
 
 %% Other
 -export([maybe_integer/2,
@@ -81,28 +80,40 @@
          calculate_msg_id_borders/3,
          calculate_msg_id_borders/4,
          maybe_encode_compact_uuid/2,
-         is_complete_result_page/4,
-         wait_shaper/3,
-         check_for_item_not_found/3]).
+         wait_shaper/4,
+         check_for_item_not_found/3,
+         maybe_reverse_messages/2,
+         get_msg_id_and_timestamp/1,
+         lookup_specific_messages/4,
+         is_mam_muc_enabled/2]).
 
 %% Ejabberd
--export([send_message/3,
+-export([send_message/4,
          maybe_set_client_xmlns/2,
-         is_jid_in_user_roster/2]).
+         is_jid_in_user_roster/3]).
 
 %% Shared logic
--export([check_result_for_policy_violation/2]).
+-export([check_result_for_policy_violation/2,
+         lookup/3,
+         lookup_first_and_last_messages/4,
+         lookup_first_and_last_messages/5,
+         incremental_delete_domain/5,
+         db_message_codec/2, db_jid_codec/2]).
+
+-callback extra_fin_element(mongooseim:host_type(),
+                            mam_iq:lookup_params(),
+                            exml:element()) -> exml:element().
+
+-ignore_xref([behaviour_info/1, append_arcid_elem/4, delete_arcid_elem/3,
+              get_one_of_path/3, is_arcid_elem_for/3, maybe_encode_compact_uuid/2,
+              maybe_last/1, result_query/2, send_message/4, wrap_message/7, wrapper_id/0]).
 
 %-define(MAM_INLINE_UTILS, true).
 
 -ifdef(MAM_INLINE_UTILS).
 -compile({inline, [
-                   rsm_ns_binary/0,
-                   mam_ns_binary/0,
-                   is_archived_elem_for/2,
-                   is_valid_message/3,
+                   is_valid_message/4,
                    is_valid_message_type/3,
-                   is_valid_message_children/3,
                    encode_compact_uuid/2,
                    get_one_of_path/3,
                    delay/2,
@@ -111,12 +122,12 @@
                    valid_behavior/1]}).
 -endif.
 
--include("mongoose.hrl").
 -include("jlib.hrl").
 -include_lib("exml/include/exml.hrl").
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
+-export([is_valid_message/4]).
 -endif.
 
 -include("mod_mam.hrl").
@@ -124,10 +135,9 @@
 -include("mongoose_ns.hrl").
 
 -define(MAYBE_BIN(X), (is_binary(X) orelse (X) =:= undefined)).
+-define(BIGINT_MAX, 16#7fffffffffffffff).  % 9223372036854775807, (2^63 - 1)
 
-%% Constants
-rsm_ns_binary() -> <<"http://jabber.org/protocol/rsm">>.
-
+-export_type([direction/0, retraction_id/0, retraction_info/0]).
 
 %% ----------------------------------------------------------------------
 %% Datetime types
@@ -139,6 +149,12 @@ rsm_ns_binary() -> <<"http://jabber.org/protocol/rsm">>.
 -type archive_behaviour() :: mod_mam:archive_behaviour().
 -type archive_behaviour_bin() :: binary(). % `<<"roster">> | <<"always">> | <<"never">>'.
 
+-type direction() :: incoming | outgoing.
+-type retraction_id() :: {origin_id | stanza_id, binary()}.
+-type retraction_info() :: #{retract_on := origin_id | stanza_id,
+                             packet := exml:element(),
+                             message_id := mod_mam:message_id(),
+                             origin_id := null | binary()}.
 
 %% -----------------------------------------------------------------------
 %% Time
@@ -158,13 +174,21 @@ maybe_microseconds(ISODateTime) ->
 %% -----------------------------------------------------------------------
 %% UID
 
--spec generate_message_id() -> integer().
-generate_message_id() ->
-    {ok, NodeId} = ejabberd_node_id:node_id(),
-    CandidateStamp = erlang:system_time(microsecond),
-    UniqueStamp = mongoose_mam_id:next_unique(CandidateStamp),
-    encode_compact_uuid(UniqueStamp, NodeId).
+-spec get_or_generate_mam_id(mongoose_acc:t()) -> integer().
+get_or_generate_mam_id(Acc) ->
+    case mongoose_acc:get(mam, mam_id, undefined, Acc) of
+        undefined ->
+            CandidateStamp = mongoose_acc:timestamp(Acc),
+            generate_message_id(CandidateStamp);
+        ExtMessId ->
+            mod_mam_utils:external_binary_to_mess_id(ExtMessId)
+    end.
 
+-spec generate_message_id(integer()) -> integer().
+generate_message_id(CandidateStamp) ->
+    NodeNum = mongoose_node_num:node_num(),
+    UniqueStamp = mongoose_mam_id:next_unique(CandidateStamp),
+    encode_compact_uuid(UniqueStamp, NodeNum).
 
 %% @doc Create a message ID (UID).
 %%
@@ -172,36 +196,32 @@ generate_message_id() ->
 %% It puts node id as a last byte.
 %% The maximum date, that can be encoded is `{{4253, 5, 31}, {22, 20, 37}}'.
 -spec encode_compact_uuid(integer(), integer()) -> integer().
-encode_compact_uuid(Microseconds, NodeId)
-    when is_integer(Microseconds), is_integer(NodeId) ->
-    (Microseconds bsl 8) + NodeId.
+encode_compact_uuid(Microseconds, NodeNum)
+    when is_integer(Microseconds), is_integer(NodeNum) ->
+    (Microseconds bsl 8) + NodeNum.
 
 
 %% @doc Extract date and node id from a message id.
 -spec decode_compact_uuid(integer()) -> {integer(), byte()}.
 decode_compact_uuid(Id) ->
     Microseconds = Id bsr 8,
-    NodeId = Id band 255,
-    {Microseconds, NodeId}.
+    NodeNum = Id band 255,
+    {Microseconds, NodeNum}.
 
 
 %% @doc Encode a message ID to pass it to the user.
 -spec mess_id_to_external_binary(integer()) -> binary().
 mess_id_to_external_binary(MessID) when is_integer(MessID) ->
-    list_to_binary(integer_to_list(MessID, 32)).
-
-
--spec maybe_external_binary_to_mess_id(binary()) -> undefined | integer().
-maybe_external_binary_to_mess_id(<<>>) ->
-    undefined;
-maybe_external_binary_to_mess_id(BExtMessID) ->
-    external_binary_to_mess_id(BExtMessID).
-
+    integer_to_binary(MessID, 32).
 
 %% @doc Decode a message ID received from the user.
 -spec external_binary_to_mess_id(binary()) -> integer().
 external_binary_to_mess_id(BExtMessID) when is_binary(BExtMessID) ->
-    binary_to_integer(BExtMessID, 32).
+    try binary_to_integer(BExtMessID, 32) of
+        MessId when is_integer(MessId), MessId =< ?BIGINT_MAX -> MessId;
+        _ -> throw(invalid_stanza_id)
+    catch error:badarg -> throw(invalid_stanza_id)
+    end.
 
 %% -----------------------------------------------------------------------
 %% XML
@@ -211,7 +231,7 @@ external_binary_to_mess_id(BExtMessID) when is_binary(BExtMessID) ->
                             AddStanzaid :: boolean()) ->
           AlteredPacket :: exml:element().
 maybe_add_arcid_elems(To, MessID, Packet, AddStanzaid) ->
-    BareTo = jid:to_binary(jid:to_bare(To)),
+    BareTo = jid:to_bare_binary(To),
     case AddStanzaid of
         true ->
             replace_arcid_elem(<<"stanza-id">>, BareTo, MessID, Packet);
@@ -223,11 +243,15 @@ maybe_log_deprecation(_IQ) ->
 
 %% @doc Return true, if the first element points on `By'.
 -spec is_arcid_elem_for(ElemName :: binary(), exml:element(), By :: binary()) -> boolean().
-is_arcid_elem_for(<<"archived">>, #xmlel{name = <<"archived">>, attrs=As}, By) ->
-    lists:member({<<"by">>, By}, As);
-is_arcid_elem_for(<<"stanza-id">>, #xmlel{name = <<"stanza-id">>, attrs=As}, By) ->
-    lists:member({<<"by">>, By}, As) andalso
-    lists:member({<<"xmlns">>, ?NS_STANZAID}, As);
+is_arcid_elem_for(<<"archived">>, #xmlel{name = <<"archived">>,
+                                        attrs = #{<<"by">> := By}}, By) ->
+    true;
+is_arcid_elem_for(<<"stanza-id">>,
+                  #xmlel{name = <<"stanza-id">>,
+                         attrs = #{<<"by">> := By,
+                                   <<"xmlns">> := ?NS_STANZAID}},
+                  By) ->
+    true;
 is_arcid_elem_for(_, _, _) ->
     false.
 
@@ -242,21 +266,24 @@ replace_arcid_elem(ElemName, By, Id, Packet) ->
 append_arcid_elem(<<"stanza-id">>, By, Id, Packet) ->
     Archived = #xmlel{
                   name = <<"stanza-id">>,
-                  attrs=[{<<"by">>, By}, {<<"id">>, Id}, {<<"xmlns">>, ?NS_STANZAID}]},
-    xml:append_subtags(Packet, [Archived]);
+                  attrs=#{<<"by">> => By,
+                          <<"id">> => Id,
+                          <<"xmlns">> => ?NS_STANZAID}},
+    jlib:append_subtags(Packet, [Archived]);
 append_arcid_elem(ElemName, By, Id, Packet) ->
     Archived = #xmlel{
                   name = ElemName,
-                  attrs=[{<<"by">>, By}, {<<"id">>, Id}]},
-    xml:append_subtags(Packet, [Archived]).
+                  attrs=#{<<"by">> => By,
+                          <<"id">> => Id}},
+    jlib:append_subtags(Packet, [Archived]).
 
 -spec delete_arcid_elem(ElemName :: binary(), By :: binary(), exml:element()) -> exml:element().
 delete_arcid_elem(ElemName, By, Packet=#xmlel{children=Cs}) ->
     Packet#xmlel{children=[C || C <- Cs, not is_arcid_elem_for(ElemName, C, By)]}.
 
 
-is_x_user_element(#xmlel{name = <<"x">>, attrs = As}) ->
-    lists:member({<<"xmlns">>, ?NS_MUC_USER}, As);
+is_x_user_element(#xmlel{name = <<"x">>, attrs = #{<<"xmlns">> := ?NS_MUC_USER}}) ->
+    true;
 is_x_user_element(_) ->
     false.
 
@@ -270,16 +297,16 @@ append_x_user_element(FromJID, Role, Affiliation, Packet) ->
     ItemElem = x_user_item(FromJID, Role, Affiliation),
     X = #xmlel{
         name = <<"x">>,
-        attrs = [{<<"xmlns">>, ?NS_MUC_USER}],
+        attrs = #{<<"xmlns">> => ?NS_MUC_USER},
         children = [ItemElem]},
-    xml:append_subtags(Packet, [X]).
+    jlib:append_subtags(Packet, [X]).
 
 x_user_item(FromJID, Role, Affiliation) ->
     #xmlel{
        name = <<"item">>,
-       attrs = [{<<"affiliation">>, atom_to_binary(Affiliation, latin1)},
-                {<<"jid">>, jid:to_binary(FromJID)},
-                {<<"role">>, atom_to_binary(Role, latin1)}]}.
+       attrs = #{<<"affiliation">> => atom_to_binary(Affiliation, latin1),
+                 <<"jid">> => jid:to_binary(FromJID),
+                 <<"role">> => atom_to_binary(Role, latin1)}}.
 
 -spec delete_x_user_element(exml:element()) -> exml:element().
 delete_x_user_element(Packet=#xmlel{children=Cs}) ->
@@ -315,8 +342,7 @@ get_one_of_path(_Elem, [], Def) ->
 %% It also must include a body or chat marker, as long as it doesn't include
 %% "result", "delay" or "no-store" elements.
 %% @end
--spec is_archivable_message(Mod :: module(), Dir :: incoming | outgoing,
-                            Packet :: exml:element(), boolean()) -> boolean().
+-spec is_archivable_message(module(), direction(), exml:element(), boolean()) -> boolean().
 is_archivable_message(Mod, Dir, Packet=#xmlel{name = <<"message">>}, ArchiveChatMarkers) ->
     Type = exml_query:attr(Packet, <<"type">>, <<"normal">>),
     is_valid_message_type(Mod, Dir, Type) andalso
@@ -326,8 +352,8 @@ is_archivable_message(_, _, _, _) ->
 
 is_valid_message_type(_, _, <<"normal">>) -> true;
 is_valid_message_type(_, _, <<"chat">>) -> true;
+is_valid_message_type(mod_inbox, _, <<"groupchat">>) -> true;
 is_valid_message_type(_, incoming, <<"groupchat">>) -> true;
-is_valid_message_type(_, _, <<"error">>) -> false;
 is_valid_message_type(_, _, _) -> false.
 
 is_valid_message(_Mod, _Dir, Packet, ArchiveChatMarkers) ->
@@ -340,91 +366,160 @@ is_valid_message(_Mod, _Dir, Packet, ArchiveChatMarkers) ->
     %% Used in mod_offline
     Delay      = exml_query:subelement(Packet, <<"delay">>, false),
     %% Message Processing Hints (XEP-0334)
-    NoStore    = exml_query:subelement(Packet, <<"no-store">>, false),
+    NoStore    = exml_query:path(Packet, [{element_with_ns, <<"no-store">>, ?NS_HINTS}], false),
+    %% Message Processing Hints (XEP-0334)
+    Store      = exml_query:path(Packet, [{element_with_ns, <<"store">>, ?NS_HINTS}], false),
 
-    has_any([Body, ChatMarker, Retract]) andalso not has_any([Result, Delay, NoStore]).
+    has_any([Store, Body, ChatMarker, Retract]) andalso not has_any([Result, Delay, NoStore]).
 
 has_any(Elements) ->
     lists:any(fun(El) -> El =/= false end, Elements).
 
 has_chat_marker(Packet) ->
-    case exml_query:subelement_with_ns(Packet, ?NS_CHAT_MARKERS) of
-        #xmlel{name = <<"received">>}     -> true;
-        #xmlel{name = <<"displayed">>}    -> true;
-        #xmlel{name = <<"acknowledged">>} -> true;
-        _                                 -> false
-    end.
+    mongoose_chat_markers:has_chat_markers(Packet).
 
-get_retract_id(Module, Host, Packet) ->
-    case has_message_retraction(Module, Host) of
-        true -> get_retract_id(Packet);
-        false -> none
-    end.
+-spec get_retract_id(false, exml:element()) -> none;
+                    (true, exml:element()) -> none | retraction_id().
+get_retract_id(true = _Enabled, Packet) ->
+    get_retract_id(Packet);
+get_retract_id(false, _Packet) ->
+    none.
 
+-spec get_retract_id(exml:element()) -> none | retraction_id().
 get_retract_id(Packet) ->
-    case exml_query:subelement_with_name_and_ns(Packet, <<"apply-to">>, ?NS_FASTEN) of
-        El = #xmlel{} ->
-            case exml_query:subelement_with_name_and_ns(El, <<"retract">>, ?NS_RETRACT) of
-                #xmlel{} -> exml_query:attr(El, <<"id">>, none);
-                undefined -> none
-            end;
-        undefined -> none
+    case exml_query:path(Packet, [{element_with_ns, <<"apply-to">>, ?NS_FASTEN}], none) of
+        none -> none;
+        Fasten ->
+            case {exml_query:path(Fasten, [{element, <<"retract">>}, {attr, <<"xmlns">>}], none),
+                  exml_query:path(Fasten, [{attr, <<"id">>}], none)} of
+                {none, _} -> none;
+                {_, none} -> none;
+                {?NS_RETRACT, OriginId} -> {origin_id, OriginId};
+                {?NS_ESL_RETRACT, StanzaId} -> {stanza_id, StanzaId}
+            end
     end.
 
 get_origin_id(Packet) ->
     exml_query:path(Packet, [{element_with_ns, <<"origin-id">>, ?NS_STANZAID},
                              {attr, <<"id">>}], none).
 
-tombstone(Packet, OriginID) ->
-    Packet#xmlel{children = [retracted_element(OriginID)]}.
+is_groupchat(<<"groupchat">>) ->
+    true;
+is_groupchat(_) ->
+    false.
 
-retracted_element(OriginID) ->
+-spec should_page_be_flipped(exml:element()) -> boolean().
+should_page_be_flipped(Packet) ->
+    case exml_query:path(Packet, [{element, <<"flip-page">>}], none) of
+        none -> false;
+        _ -> true
+    end.
+
+-spec maybe_reverse_messages(mam_iq:lookup_params(), [mod_mam:message_row()]) ->
+    [mod_mam:message_row()].
+maybe_reverse_messages(#{flip_page := true}, Messages) -> lists:reverse(Messages);
+maybe_reverse_messages(#{flip_page := false}, Messages) -> Messages.
+
+-spec get_msg_id_and_timestamp(mod_mam:message_row()) -> {binary(), binary()}.
+get_msg_id_and_timestamp(#{id := MsgID}) ->
+    {Microseconds, _NodeMessID} = decode_compact_uuid(MsgID),
+    TS = calendar:system_time_to_rfc3339(Microseconds, [{offset, "Z"}, {unit, microsecond}]),
+    ExtID = mess_id_to_external_binary(MsgID),
+    {ExtID, list_to_binary(TS)}.
+
+-spec lookup_specific_messages(mongooseim:host_type(),
+                               mam_iq:lookup_params(),
+                               [mod_mam:message_id()],
+                               fun()) -> [mod_mam:message_row()] | {error, item_not_found}.
+lookup_specific_messages(HostType, Params, IDs, FetchFun) ->
+    {FinalOffset, AccumulatedMessages} = lists:foldl(
+        fun(ID, {_AccOffset, AccMsgs}) ->
+            {ok, {_, OffsetForID, MessagesForID}} = FetchFun(HostType, Params#{message_id => ID}),
+            {OffsetForID, AccMsgs ++ MessagesForID}
+        end,
+        {0, []}, IDs),
+
+    Result = determine_result(Params, FinalOffset, AccumulatedMessages),
+    case length(IDs) == length(AccumulatedMessages) of
+        true -> Result;
+        false -> {error, item_not_found}
+    end.
+
+determine_result(#{is_simple := true}, _Offset, Messages) ->
+    {ok, {undefined, undefined, Messages}};
+determine_result(#{}, Offset, Messages) ->
+    {ok, {length(Messages), Offset, Messages}}.
+
+tombstone(RetractionInfo = #{packet := Packet}, LocJid) ->
+    Packet#xmlel{children = [retracted_element(RetractionInfo, LocJid)]}.
+
+-spec retracted_element(retraction_info(), jid:jid()) -> exml:element().
+retracted_element(#{retract_on := origin_id,
+                    origin_id := OriginID}, _LocJid) ->
     Timestamp = calendar:system_time_to_rfc3339(erlang:system_time(second), [{offset, "Z"}]),
     #xmlel{name = <<"retracted">>,
-           attrs = [{<<"xmlns">>, ?NS_RETRACT},
-                    {<<"stamp">>, list_to_binary(Timestamp)}],
+           attrs = #{<<"xmlns">> => ?NS_RETRACT,
+                     <<"stamp">> => list_to_binary(Timestamp)},
            children = [#xmlel{name = <<"origin-id">>,
-                              attrs = [{<<"xmlns">>, ?NS_STANZAID},
-                                       {<<"id">>, OriginID}]}
+                              attrs = #{<<"xmlns">> => ?NS_STANZAID,
+                                        <<"id">> => OriginID}}
+                      ]};
+retracted_element(#{retract_on := stanza_id,
+                    message_id := MessID} = Env, LocJid) ->
+    Timestamp = calendar:system_time_to_rfc3339(erlang:system_time(second), [{offset, "Z"}]),
+    StanzaID = mod_mam_utils:mess_id_to_external_binary(MessID),
+    MaybeOriginId = maybe_append_origin_id(Env),
+    #xmlel{name = <<"retracted">>,
+           attrs = #{<<"xmlns">> => ?NS_ESL_RETRACT,
+                     <<"stamp">> => list_to_binary(Timestamp)},
+           children = [#xmlel{name = <<"stanza-id">>,
+                              attrs = #{<<"xmlns">> => ?NS_STANZAID,
+                                        <<"id">> => StanzaID,
+                                        <<"by">> => jid:to_bare_binary(LocJid)}} |
+                       MaybeOriginId
                       ]}.
+
+-spec maybe_append_origin_id(retraction_info()) -> [exml:element()].
+maybe_append_origin_id(#{origin_id := OriginID}) when is_binary(OriginID), <<>> =/= OriginID ->
+    [#xmlel{name = <<"origin-id">>, attrs = #{<<"xmlns">> => ?NS_STANZAID, <<"id">> => OriginID}}];
+maybe_append_origin_id(_) ->
+    [].
 
 %% @doc Forms `<forwarded/>' element, according to the XEP.
 -spec wrap_message(MamNs :: binary(), Packet :: exml:element(), QueryID :: binary(),
-                   MessageUID :: term(), TS :: calendar:rfc3339_string(),
+                   MessageUID :: term(), TS :: jlib:rfc3339_string(),
                    SrcJID :: jid:jid()) -> Wrapper :: exml:element().
 wrap_message(MamNs, Packet, QueryID, MessageUID, TS, SrcJID) ->
     wrap_message(MamNs, Packet, QueryID, MessageUID, wrapper_id(), TS, SrcJID).
 
 -spec wrap_message(MamNs :: binary(), Packet :: exml:element(), QueryID :: binary(),
                    MessageUID :: term(), WrapperI :: binary(),
-                   TS :: calendar:rfc3339_string(),
+                   TS :: jlib:rfc3339_string(),
                    SrcJID :: jid:jid()) -> Wrapper :: exml:element().
 wrap_message(MamNs, Packet, QueryID, MessageUID, WrapperID, TS, SrcJID) ->
     #xmlel{ name = <<"message">>,
-            attrs = [{<<"id">>, WrapperID}],
+            attrs = #{<<"id">> => WrapperID},
             children = [result(MamNs, QueryID, MessageUID,
                                [forwarded(Packet, TS, SrcJID)])] }.
 
--spec forwarded(exml:element(), calendar:rfc3339_string(), jid:jid())
+-spec forwarded(exml:element(), jlib:rfc3339_string(), jid:jid())
                -> exml:element().
 forwarded(Packet, TS, SrcJID) ->
     #xmlel{
        name = <<"forwarded">>,
-       attrs = [{<<"xmlns">>, ?NS_FORWARD}],
+       attrs = #{<<"xmlns">> => ?NS_FORWARD},
        %% Two places to include SrcJID:
        %% - delay.from - optional XEP-0297 (TODO: depricate adding it?)
        %% - message.from - required XEP-0313
        %% Also, mod_mam_muc will replace it again with SrcJID
        children = [delay(TS, SrcJID), replace_from_attribute(SrcJID, Packet)]}.
 
--spec delay(calendar:rfc3339_string(), jid:jid()) -> exml:element().
+-spec delay(jlib:rfc3339_string(), jid:jid()) -> exml:element().
 delay(TS, SrcJID) ->
     jlib:timestamp_to_xml(TS, SrcJID, <<>>).
 
 replace_from_attribute(From, Packet=#xmlel{attrs = Attrs}) ->
-    Attrs1 = lists:keydelete(<<"from">>, 1, Attrs),
-    Attrs2 = [{<<"from">>, jid:to_binary(From)} | Attrs1],
-    Packet#xmlel{attrs = Attrs2}.
+    Packet#xmlel{attrs = Attrs#{<<"from">> => jid:to_binary(From)}}.
 
 %% @doc Generates tag `<result />'.
 %% This element will be added in each forwarded message.
@@ -432,11 +527,15 @@ replace_from_attribute(From, Packet=#xmlel{attrs = Attrs}) ->
             -> exml:element().
 result(MamNs, QueryID, MessageUID, Children) when is_list(Children) ->
     %% <result xmlns='urn:xmpp:mam:tmp' queryid='f27' id='28482-98726-73623' />
+    Attrs = case QueryID =/= undefined andalso QueryID =/= <<>>  of
+              true->
+                #{<<"queryid">> => QueryID};
+              false ->
+                #{}
+            end,
     #xmlel{
        name = <<"result">>,
-       attrs = [{<<"queryid">>, QueryID} || QueryID =/= undefined, QueryID =/= <<>>] ++
-           [{<<"xmlns">>, MamNs},
-            {<<"id">>, MessageUID}],
+       attrs = Attrs#{<<"xmlns">> => MamNs, <<"id">> => MessageUID},
        children = Children}.
 
 
@@ -461,12 +560,12 @@ result_set(FirstId, LastId, undefined, undefined)
               || LastId =/= undefined],
     #xmlel{
        name = <<"set">>,
-       attrs = [{<<"xmlns">>, rsm_ns_binary()}],
+       attrs = #{<<"xmlns">> => ?NS_RSM},
        children = FirstEl ++ LastEl};
 result_set(FirstId, LastId, FirstIndexI, CountI)
   when ?MAYBE_BIN(FirstId), ?MAYBE_BIN(LastId) ->
     FirstEl = [#xmlel{name = <<"first">>,
-                      attrs = [{<<"index">>, integer_to_binary(FirstIndexI)}],
+                      attrs = #{<<"index">> => integer_to_binary(FirstIndexI)},
                       children = [#xmlcdata{content = FirstId}]
                      }
                || FirstId =/= undefined],
@@ -479,15 +578,15 @@ result_set(FirstId, LastId, FirstIndexI, CountI)
                  children = [#xmlcdata{content = integer_to_binary(CountI)}]},
     #xmlel{
        name = <<"set">>,
-       attrs = [{<<"xmlns">>, rsm_ns_binary()}],
+       attrs = #{<<"xmlns">> => ?NS_RSM},
        children = FirstEl ++ LastEl ++ [CountEl]}.
 
 
--spec result_query(jlib:xmlcdata() | exml:element(), binary()) -> exml:element().
+-spec result_query(exml:child(), binary()) -> exml:element().
 result_query(SetEl, Namespace) ->
     #xmlel{
        name = <<"query">>,
-       attrs = [{<<"xmlns">>, Namespace}],
+       attrs = #{<<"xmlns">> => Namespace},
        children = [SetEl]}.
 
 -spec result_prefs(DefaultMode :: archive_behaviour(),
@@ -501,8 +600,8 @@ result_prefs(DefaultMode, AlwaysJIDs, NeverJIDs, Namespace) ->
                       children = encode_jids(NeverJIDs)},
     #xmlel{
        name = <<"prefs">>,
-       attrs = [{<<"xmlns">>, Namespace},
-                {<<"default">>, atom_to_binary(DefaultMode, utf8)}],
+       attrs = #{<<"xmlns">> => Namespace,
+                 <<"default">> => atom_to_binary(DefaultMode, utf8)},
        children = [AlwaysEl, NeverEl]
       }.
 
@@ -514,15 +613,48 @@ encode_jids(JIDs) ->
 
 
 %% MAM v0.4.1 and above
--spec make_fin_element(binary(), boolean(), boolean(), exml:element()) -> exml:element().
-make_fin_element(MamNs, IsComplete, IsStable, ResultSetEl) ->
-    #xmlel{
-       name = <<"fin">>,
-       attrs = [{<<"xmlns">>, MamNs}]
-        ++ [{<<"complete">>, <<"true">>} || IsComplete]
-        ++ [{<<"stable">>, <<"false">>} || not IsStable],
-       children = [ResultSetEl]}.
+-spec make_fin_element(mongooseim:host_type(),
+                       mam_iq:lookup_params(),
+                       binary(),
+                       boolean(),
+                       boolean(),
+                       exml:element(),
+                       module()) ->
+    exml:element().
+make_fin_element(HostType, Params, MamNs, IsComplete, IsStable, ResultSetEl, ExtFinMod) ->
+    Attrs0 = if IsComplete -> #{<<"complete">> => <<"true">>};
+                true -> #{}
+             end,
+    Attrs1 = if IsStable -> Attrs0;
+                true -> Attrs0#{<<"stable">> => <<"false">>}
+             end,
+    FinEl = #xmlel{
+               name = <<"fin">>,
+               attrs = Attrs1#{<<"xmlns">> => MamNs},
+               children = [ResultSetEl]},
+    maybe_transform_fin_elem(ExtFinMod, HostType, Params, FinEl).
 
+maybe_transform_fin_elem(undefined, _HostType, _Params, FinEl) ->
+    FinEl;
+maybe_transform_fin_elem(Module, HostType, Params, FinEl) ->
+    Module:extra_fin_element(HostType, Params, FinEl).
+
+-spec make_metadata_element() -> exml:element().
+make_metadata_element() ->
+    #xmlel{
+        name = <<"metadata">>,
+        attrs = #{<<"xmlns">> => ?NS_MAM_06}}.
+
+-spec make_metadata_element(binary(), binary(), binary(), binary()) -> exml:element().
+make_metadata_element(FirstMsgID, FirstMsgTS, LastMsgID, LastMsgTS) ->
+    #xmlel{
+        name = <<"metadata">>,
+        attrs = #{<<"xmlns">> => ?NS_MAM_06},
+        children = [#xmlel{name = <<"start">>,
+                          attrs = #{<<"id">> => FirstMsgID, <<"timestamp">> => FirstMsgTS}},
+                    #xmlel{name = <<"end">>,
+                          attrs = #{<<"id">> => LastMsgID, <<"timestamp">> => LastMsgTS}}]
+    }.
 
 -spec parse_prefs(PrefsEl :: exml:element()) -> mod_mam:preference().
 parse_prefs(El = #xmlel{ name = <<"prefs">> }) ->
@@ -567,20 +699,12 @@ binary_jid_to_lower(BinJid) when is_binary(BinJid) ->
 skip_bad_jids(MaybeJids) ->
     [Jid || Jid <- MaybeJids, is_binary(Jid)].
 
--spec borders_decode(exml:element()) -> 'undefined' | mod_mam:borders().
-borders_decode(QueryEl) ->
-    AfterID  = tag_id(QueryEl, <<"after_id">>),
-    BeforeID = tag_id(QueryEl, <<"before_id">>),
-    FromID   = tag_id(QueryEl, <<"from_id">>),
-    ToID     = tag_id(QueryEl, <<"to_id">>),
-    borders(AfterID, BeforeID, FromID, ToID).
-
--spec form_borders_decode(exml:element()) -> 'undefined' | mod_mam:borders().
-form_borders_decode(QueryEl) ->
-    AfterID  = form_field_mess_id(QueryEl, <<"after_id">>),
-    BeforeID = form_field_mess_id(QueryEl, <<"before_id">>),
-    FromID   = form_field_mess_id(QueryEl, <<"from_id">>),
-    ToID     = form_field_mess_id(QueryEl, <<"to_id">>),
+-spec form_borders_decode(mongoose_data_forms:kv_map()) -> 'undefined' | mod_mam:borders().
+form_borders_decode(KVs) ->
+    AfterID  = form_field_mess_id(KVs, <<"after-id">>),
+    BeforeID = form_field_mess_id(KVs, <<"before-id">>),
+    FromID   = form_field_mess_id(KVs, <<"from-id">>),
+    ToID     = form_field_mess_id(KVs, <<"to-id">>),
     borders(AfterID, BeforeID, FromID, ToID).
 
 
@@ -599,35 +723,18 @@ borders(AfterID, BeforeID, FromID, ToID) ->
         to_id     = ToID
     }.
 
-
--spec tag_id(exml:element(), binary()) -> 'undefined' | integer().
-tag_id(QueryEl, Name) ->
-    BExtMessID = exml_query:attr(QueryEl, Name, <<>>),
-    maybe_external_binary_to_mess_id(BExtMessID).
-
--spec form_field_mess_id(exml:element(), binary()) -> 'undefined' | integer().
-form_field_mess_id(QueryEl, Name) ->
-    BExtMessID = form_field_value_s(QueryEl, Name),
-    maybe_external_binary_to_mess_id(BExtMessID).
-
--spec decode_optimizations(exml:element()) -> 'false' | 'opt_count' | 'true'.
-decode_optimizations(QueryEl) ->
-    case {exml_query:subelement(QueryEl, <<"simple">>),
-          exml_query:subelement(QueryEl, <<"opt_count">>)} of
-        {undefined, undefined} -> false;
-        {undefined, _}     -> opt_count;
-        _              -> true
+-spec form_field_mess_id(mongoose_data_forms:kv_map(), binary()) -> 'undefined' | integer().
+form_field_mess_id(KVs, Name) ->
+    case KVs of
+        #{Name := [BExtMessID]} -> external_binary_to_mess_id(BExtMessID);
+        #{} -> undefined
     end.
 
--spec form_decode_optimizations(exml:element()) -> false | opt_count | true.
-form_decode_optimizations(QueryEl) ->
-    case {form_field_value(QueryEl, <<"simple">>),
-          form_field_value(QueryEl, <<"opt_count">>)} of
-        {_, <<"true">>}     -> opt_count;
-        {<<"true">>, _}     -> true;
-        {_, _}              -> false
-    end.
-
+-spec form_decode_optimizations(mongoose_data_forms:kv_map()) -> boolean().
+form_decode_optimizations(#{<<"simple">> := [<<"true">>]}) ->
+    true;
+form_decode_optimizations(#{}) ->
+    false.
 
 is_mam_result_message(Packet = #xmlel{name = <<"message">>}) ->
     Ns = maybe_get_result_namespace(Packet),
@@ -641,92 +748,73 @@ maybe_get_result_namespace(Packet) ->
 is_mam_namespace(NS) ->
     lists:member(NS, mam_features()).
 
-features(Module, Host) ->
-    mam_features() ++ retraction_features(Module, Host).
+features(Module, HostType) ->
+    mam_features() ++ retraction_features(Module, HostType)
+        ++ groupchat_features(Module, HostType).
 
 mam_features() ->
-    [?NS_MAM_04, ?NS_MAM_06].
+    [?NS_MAM_04, ?NS_MAM_06, ?NS_MAM_EXTENDED].
 
-retraction_features(Module, Host) ->
-    case has_message_retraction(Module, Host) of
-        true -> [?NS_RETRACT, ?NS_RETRACT_TOMBSTONE];
+retraction_features(Module, HostType) ->
+    case has_message_retraction(Module, HostType) of
+        true -> [?NS_RETRACT, ?NS_RETRACT_TOMBSTONE, ?NS_ESL_RETRACT];
         false -> [?NS_RETRACT]
     end.
+
+groupchat_features(mod_mam_pm = Module, HostType) ->
+    case gen_mod:get_module_opt(HostType, mod_mam, backend) of
+        cassandra -> [];
+        _ ->
+            case gen_mod:get_module_opt(HostType, Module, archive_groupchats) of
+                true -> [?NS_MAM_GC_FIELD, ?NS_MAM_GC_AVAILABLE];
+                false -> [?NS_MAM_GC_FIELD]
+            end
+    end;
+groupchat_features(_, _) ->
+    [].
 
 %% -----------------------------------------------------------------------
 %% Forms
 
--spec form_field_value(exml:element(), binary()) -> undefined | binary().
-form_field_value(QueryEl, Name) ->
-    case exml_query:subelement(QueryEl, <<"x">>) of
-        undefined ->
-            undefined;
-        #xmlel{children = Fields} -> %% <x xmlns='jabber:x:data'/>
-            case find_field(Fields, Name) of
-                undefined ->
-                    undefined;
-                Field ->
-                    field_to_value(Field)
-            end
-    end.
-
-form_field_value_s(QueryEl, Name) ->
-    undefined_to_empty(form_field_value(QueryEl, Name)).
-
-undefined_to_empty(undefined) -> <<>>;
-undefined_to_empty(X)         -> X.
-
-%% @doc Return first matched field
--spec find_field(list(exml:element()), binary()) -> undefined | exml:element().
-find_field([#xmlel{ name = <<"field">> } = Field | Fields], Name) ->
-    case exml_query:attr(Field, <<"var">>) of
-        Name -> Field;
-        _ -> find_field(Fields, Name)
-    end;
-find_field([_|Fields], Name) -> %% skip whitespaces
-    find_field(Fields, Name);
-find_field([], _Name) ->
-    undefined.
-
--spec field_to_value(exml:element()) -> binary().
-field_to_value(FieldEl) ->
-    exml_query:path(FieldEl, [{element, <<"value">>}, cdata], <<>>).
-
--spec message_form(Mod :: mod_mam | mod_mam_muc, Host :: jid:lserver(), binary()) ->
+-spec message_form(Mod :: mod_mam_pm | mod_mam_muc,
+                   HostType :: mongooseim:host_type(), binary()) ->
     exml:element().
-message_form(Module, Host, MamNs) ->
-    SubEl = #xmlel{name = <<"x">>,
-                   attrs = [{<<"xmlns">>, <<"jabber:x:data">>},
-                            {<<"type">>, <<"form">>}],
-                   children = message_form_fields(Module, Host, MamNs)},
-    result_query(SubEl, MamNs).
+message_form(Module, HostType, MamNs) ->
+    Fields = message_form_fields(Module, HostType, MamNs),
+    Form = mongoose_data_forms:form(#{ns => MamNs, fields => Fields}),
+    result_query(Form, MamNs).
 
-message_form_fields(Mod, Host, MamNs) ->
+message_form_fields(Mod, HostType, <<"urn:xmpp:mam:1">>) ->
     TextSearch =
-        case has_full_text_search(Mod, Host) of
-            true -> [form_field(<<"text-single">>, <<"full-text-search">>)];
+        case has_full_text_search(Mod, HostType) of
+            true -> [#{type => <<"text-single">>,
+                       var => <<"{https://erlang-solutions.com/}full-text-search">>}];
             false -> []
         end,
-    [form_type_field(MamNs),
-     form_field(<<"jid-single">>, <<"with">>),
-     form_field(<<"text-single">>, <<"start">>),
-     form_field(<<"text-single">>, <<"end">>) | TextSearch].
-
-form_type_field(MamNs) when is_binary(MamNs) ->
-    #xmlel{name = <<"field">>,
-           attrs = [{<<"type">>, <<"hidden">>},
-                    {<<"var">>, <<"FORM_TYPE">>}],
-           children = [#xmlel{name = <<"value">>,
-                              children = [#xmlcdata{content = MamNs}]}]}.
-
-form_field(Type, VarName) ->
-    #xmlel{name = <<"field">>,
-           attrs = [{<<"type">>, Type},
-                    {<<"var">>, VarName}]}.
+    [#{type => <<"jid-single">>, var => <<"with">>},
+     #{type => <<"text-single">>, var => <<"start">>},
+     #{type => <<"text-single">>, var => <<"end">>} | TextSearch];
+message_form_fields(Mod, HostType, <<"urn:xmpp:mam:2">>) ->
+    TextSearch =
+        case has_full_text_search(Mod, HostType) of
+            true -> [#{type => <<"text-single">>,
+                       var => <<"{https://erlang-solutions.com/}full-text-search">>}];
+            false -> []
+        end,
+    [#{type => <<"jid-single">>, var => <<"with">>},
+     #{type => <<"text-single">>, var => <<"start">>},
+     #{type => <<"text-single">>, var => <<"end">>},
+     #{type => <<"text-single">>, var => <<"before-id">>},
+     #{type => <<"text-single">>, var => <<"after-id">>},
+     #{type => <<"boolean">>, var => <<"include-groupchat">>},
+     #{type => <<"list-multi">>, var => <<"ids">>,
+       validate => #{method => open, datatype => <<"xs:string">>}} | TextSearch].
 
 -spec form_to_text(_) -> 'undefined' | binary().
-form_to_text(El) ->
-    form_field_value(El, <<"full-text-search">>).
+form_to_text(#{<<"full-text-search">> := [Text]}) ->
+    Text;
+form_to_text(#{}) ->
+    undefined.
 
 %% -----------------------------------------------------------------------
 %% Text search tokenization
@@ -751,33 +839,32 @@ normalize_search_text(undefined, _WordSeparator) ->
     undefined;
 normalize_search_text(Text, WordSeparator) ->
     BodyString = unicode:characters_to_list(Text),
-    LowerBody = string:to_lower(BodyString),
+    LowerBody = string:lowercase(BodyString),
     ReOpts = [{return, list}, global, unicode, ucp],
     Re0 = re:replace(LowerBody, "[, .:;-?!]+", " ", ReOpts),
     Re1 = re:replace(Re0, "([^\\w ]+)|(^\\s+)|(\\s+$)", "", ReOpts),
     Re2 = re:replace(Re1, "\s+", unicode:characters_to_list(WordSeparator), ReOpts),
     unicode:characters_to_binary(Re2).
 
--spec packet_to_search_body(Module :: mod_mam | mod_mam_muc, Host :: jid:server(),
+-spec packet_to_search_body(Enabled :: boolean(),
                             Packet :: exml:element()) -> binary().
-packet_to_search_body(Module, Host, Packet) ->
-    case has_full_text_search(Module, Host) of
-        true ->
-            BodyValue = exml_query:path(Packet, [{element, <<"body">>}, cdata], <<>>),
-            mod_mam_utils:normalize_search_text(BodyValue, <<" ">>);
-        false ->
-            <<>>
-    end.
+packet_to_search_body(true, Packet) ->
+    BodyValue = exml_query:path(Packet, [{element, <<"body">>}, cdata], <<>>),
+    mod_mam_utils:normalize_search_text(BodyValue, <<" ">>);
+packet_to_search_body(false, _Packet) ->
+    <<>>.
 
--spec has_full_text_search(Module :: mod_mam | mod_mam_muc, Host :: jid:server()) -> boolean().
-has_full_text_search(Module, Host) ->
-    gen_mod:get_module_opt(Host, Module, full_text_search, true).
+-spec has_full_text_search(Module :: mod_mam_pm | mod_mam_muc,
+                           HostType :: mongooseim:host_type()) -> boolean().
+has_full_text_search(Module, HostType) ->
+    gen_mod:get_module_opt(HostType, Module, full_text_search).
 
 %% Message retraction
 
--spec has_message_retraction(Module :: mod_mam | mod_mam_muc, Host :: jid:server()) -> boolean().
-has_message_retraction(Module, Host) ->
-    gen_mod:get_module_opt(Host, Module, message_retraction, true).
+-spec has_message_retraction(Module :: mod_mam_pm | mod_mam_muc,
+                             HostType :: mongooseim:host_type()) -> boolean().
+has_message_retraction(Module, HostType) ->
+    gen_mod:get_module_opt(HostType, Module, message_retraction).
 
 %% -----------------------------------------------------------------------
 %% JID serialization
@@ -871,9 +958,9 @@ check_stringprep() ->
     is_loaded_application(jid) orelse start_stringprep().
 
 start_stringprep() ->
-    EJ = code:lib_dir(ejabberd),
+    EJ = code:lib_dir(mongooseim),
     code:add_path(filename:join([EJ, "..", "..", "deps", "jid", "ebin"])),
-    ok = application:start(jid).
+    {ok, _} = application:ensure_all_started(jid).
 
 is_loaded_application(AppName) when is_atom(AppName) ->
     lists:keymember(AppName, 1, application:loaded_applications()).
@@ -885,7 +972,7 @@ is_loaded_application(AppName) when is_atom(AppName) ->
 -spec bare_jid(undefined | jid:jid()) -> undefined | binary().
 bare_jid(undefined) -> undefined;
 bare_jid(JID) ->
-    jid:to_binary(jid:to_bare(jid:to_lower(JID))).
+    jid:to_bare_binary(jid:to_lower(JID)).
 
 -spec full_jid(jid:jid()) -> binary().
 full_jid(JID) ->
@@ -1000,14 +1087,15 @@ maybe_previous_id(X) ->
 %%      It's the most efficient way to query archive, if the client side does
 %%      not care about the total number of messages and if it's stateless
 %%      (i.e. web interface).
--spec is_complete_result_page(TotalCount, Offset, MessageRows, Params) ->
+%% Handles case when we have TotalCount and Offset as integers
+-spec is_complete_result_page_using_offset(Params, Result) ->
     boolean() when
-    TotalCount  :: non_neg_integer()|undefined,
-    Offset      :: non_neg_integer()|undefined,
-    MessageRows :: list(),
-    Params      :: mam_iq:lookup_params().
-is_complete_result_page(TotalCount, Offset, MessageRows,
-                        #{page_size := PageSize} = Params) ->
+    Params      :: mam_iq:lookup_params(),
+    Result      :: mod_mam:lookup_result_map().
+is_complete_result_page_using_offset(#{page_size := PageSize} = Params,
+                                     #{total_count := TotalCount, offset := Offset,
+                                       messages := MessageRows})
+    when is_integer(TotalCount), is_integer(Offset) ->
     case maps:get(ordering_direction, Params, forward) of
         forward ->
             is_most_recent_page(PageSize, TotalCount, Offset, MessageRows);
@@ -1039,72 +1127,42 @@ is_most_recent_page(_PageSize, _TotalCount, _Offset, _MessageRows) ->
 
 -spec maybe_set_client_xmlns(boolean(), exml:element()) -> exml:element().
 maybe_set_client_xmlns(true, Packet) ->
-    xml:replace_tag_attr(<<"xmlns">>, <<"jabber:client">>, Packet);
+    jlib:replace_tag_attr(<<"xmlns">>, <<"jabber:client">>, Packet);
 maybe_set_client_xmlns(false, Packet) ->
     Packet.
-
 
 -spec action_to_shaper_name(mam_iq:action()) -> atom().
 action_to_shaper_name(Action) ->
     list_to_atom(atom_to_list(Action) ++ "_shaper").
 
 -spec action_to_global_shaper_name(mam_iq:action()) -> atom().
-action_to_global_shaper_name(Action) -> list_to_atom(atom_to_list(Action) ++ "_global_shaper").
+action_to_global_shaper_name(Action) ->
+    list_to_atom(atom_to_list(Action) ++ "_global_shaper").
 
-
--spec wait_shaper(jid:server(), mam_iq:action(), jid:jid()) ->
-    'ok' | {'error', 'max_delay_reached'}.
-wait_shaper(Host, Action, From) ->
-    case shaper_srv:wait(Host, action_to_shaper_name(Action), From, 1) of
-        ok ->
-            shaper_srv:wait(Host, action_to_global_shaper_name(Action), global, 1);
-        Err ->
-            Err
+-spec wait_shaper(mongooseim:host_type(), jid:server(), mam_iq:action(), jid:jid()) ->
+    continue | {error, max_delay_reached}.
+wait_shaper(HostType, Host, Action, From) ->
+    case mongoose_shaper:wait(
+           HostType, Host, action_to_shaper_name(Action), From, 1) of
+        continue ->
+            mongoose_shaper:wait(
+              global, Host, action_to_global_shaper_name(Action), From, 1);
+        {error, max_delay_reached} ->
+            {error, max_delay_reached}
     end.
 
 %% -----------------------------------------------------------------------
 %% Ejabberd
 
--spec send_message(jid:jid(), jid:jid(), exml:element()
-                  ) -> mongoose_acc:t().
-
--ifdef(MAM_COMPACT_FORWARDED).
-
-send_message(_From, To, Mess) ->
-    From = jid:from_binary(exml_query:attr(Mess, <<"from">>)),
+-spec send_message(mod_mam:message_row(), jid:jid(), jid:jid(), exml:element()) -> mongoose_acc:t().
+send_message(_Row, From, To, Mess) ->
     ejabberd_sm:route(From, To, Mess).
 
--else.
-
-send_message(From, To, Mess) ->
-    ejabberd_sm:route(From, To, Mess).
-
--endif.
-
-
--spec is_jid_in_user_roster(jid:jid(), jid:jid()) -> boolean().
-is_jid_in_user_roster(#jid{lserver=LServer, luser=LUser},
-                      #jid{} = RemJID) ->
+-spec is_jid_in_user_roster(mongooseim:host_type(), jid:jid(), jid:jid()) -> boolean().
+is_jid_in_user_roster(HostType, #jid{} = ToJID, #jid{} = RemJID) ->
     RemBareJID = jid:to_bare(RemJID),
-    {Subscription, _G} = mongoose_hooks:roster_get_jid_info(LServer, {none, []}, LUser, RemBareJID),
+    {Subscription, _G} = mongoose_hooks:roster_get_jid_info(HostType, ToJID, RemBareJID),
     Subscription == from orelse Subscription == both.
-
-
--spec success_sql_query(atom() | jid:server(), mongoose_rdbms:sql_query()) -> any().
-success_sql_query(HostOrConn, Query) ->
-    Result = mongoose_rdbms:sql_query(HostOrConn, Query),
-    error_on_sql_error(HostOrConn, Query, Result).
-
--spec success_sql_execute(atom() | jid:server(), atom(), [term()]) -> any().
-success_sql_execute(HostOrConn, Name, Params) ->
-    Result = mongoose_rdbms:execute(HostOrConn, Name, Params),
-    error_on_sql_error(HostOrConn, Name, Result).
-
-error_on_sql_error(HostOrConn, Query, {error, Reason}) ->
-    ?ERROR_MSG("SQL-error on ~p.~nQuery ~p~nReason ~p", [HostOrConn, Query, Reason]),
-            error({sql_error, Reason});
-error_on_sql_error(_HostOrConn, _Query, Result) ->
-    Result.
 
 %% @doc Returns a UUIDv4 canonical form binary.
 -spec wrapper_id() -> binary().
@@ -1143,24 +1201,160 @@ is_policy_violation(TotalCount, Offset, MaxResultLimit, LimitPassed) ->
 %% return (up to) PageSize messages.
 %% @end
 -spec check_for_item_not_found(RSM, PageSize, LookupResult) -> R when
-      RSM :: jlib:rsm_in(),
+      RSM :: jlib:rsm_in() | undefined,
       PageSize :: non_neg_integer(),
       LookupResult :: mod_mam:lookup_result(),
       R :: {ok, mod_mam:lookup_result()} | {error, item_not_found}.
 check_for_item_not_found(#rsm_in{direction = before, id = ID},
-                         PageSize, {TotalCount, Offset, MessageRows}) when ID =/= undefined ->
+                         _PageSize, {TotalCount, Offset, MessageRows}) ->
     case maybe_last(MessageRows) of
-        {ok, {ID, _, _}} = _IntervalEndpoint ->
-            Page = lists:sublist(MessageRows, PageSize),
-            {ok, {TotalCount, Offset, Page}};
+        {ok, #{id := ID}} ->
+            {ok, {TotalCount, Offset, lists:droplast(MessageRows)}};
         undefined ->
             {error, item_not_found}
     end;
 check_for_item_not_found(#rsm_in{direction = aft, id = ID},
-                         _PageSize, {TotalCount, Offset, MessageRows0}) when ID =/= undefined ->
+                         _PageSize, {TotalCount, Offset, MessageRows0}) ->
     case MessageRows0 of
-        [{ID, _, _} = _IntervalEndpoint | MessageRows] ->
+        [#{id := ID} | MessageRows] ->
             {ok, {TotalCount, Offset, MessageRows}};
         _ ->
             {error, item_not_found}
     end.
+
+-spec lookup(HostType :: mongooseim:host_type(),
+             Params :: mam_iq:lookup_params(),
+             F :: fun()) ->
+    {ok, mod_mam:lookup_result_map()} | {error, Reason :: term()}.
+lookup(HostType, Params, F) ->
+    F1 = patch_fun_to_make_result_as_map(F),
+    process_lookup_with_complete_check(HostType, Params, F1).
+
+process_lookup_with_complete_check(HostType, Params = #{is_simple := true}, F) ->
+    process_simple_lookup_with_complete_check(HostType, Params, F);
+process_lookup_with_complete_check(HostType, Params, F) ->
+    case F(HostType, Params) of
+        {ok, Result} ->
+            IsComplete = is_complete_result_page_using_offset(Params, Result),
+            {ok, Result#{is_complete => IsComplete}};
+        Other ->
+            Other
+    end.
+
+-spec lookup_first_and_last_messages(mongooseim:host_type(), mod_mam:archive_id(),
+                                     jid:jid(), fun()) ->
+    {mod_mam:message_row(), mod_mam:message_row()} | {error, term()} | empty_archive.
+lookup_first_and_last_messages(HostType, ArcID, ArcJID, F) ->
+    lookup_first_and_last_messages(HostType, ArcID, ArcJID, ArcJID, F).
+
+-spec lookup_first_and_last_messages(mongooseim:host_type(), mod_mam:archive_id(), jid:jid(),
+                                     jid:jid(), fun()) ->
+    {mod_mam:message_row(), mod_mam:message_row()} | {error, term()} | empty_archive.
+lookup_first_and_last_messages(HostType, ArcID, CallerJID, OwnerJID, F) ->
+    FirstMsgParams = create_lookup_params(undefined, forward, ArcID, CallerJID, OwnerJID),
+    LastMsgParams = create_lookup_params(#rsm_in{direction = before},
+                                         backward, ArcID, CallerJID, OwnerJID),
+    case lookup(HostType, FirstMsgParams, F) of
+        {ok, #{messages := [FirstMsg]}} ->
+            case lookup(HostType, LastMsgParams, F) of
+                {ok, #{messages := [LastMsg]}} -> {FirstMsg, LastMsg};
+                ErrorLast -> ErrorLast
+            end;
+        {ok, #{messages := []}} -> empty_archive;
+        ErrorFirst -> ErrorFirst
+    end.
+
+-spec create_lookup_params(jlib:rsm_in() | undefined,
+                    backward | forward,
+                    mod_mam:archive_id(),
+                    jid:jid(),
+                    jid:jid()) -> mam_iq:lookup_params().
+create_lookup_params(RSM, Direction, ArcID, CallerJID, OwnerJID) ->
+    #{now => erlang:system_time(microsecond),
+      is_simple => true,
+      rsm => RSM,
+      max_result_limit => 1,
+      archive_id => ArcID,
+      owner_jid => OwnerJID,
+      search_text => undefined,
+      with_jid => undefined,
+      start_ts => undefined,
+      page_size => 1,
+      end_ts => undefined,
+      borders => undefined,
+      flip_page => false,
+      ordering_direction => Direction,
+      limit_passed => true,
+      caller_jid => CallerJID,
+      message_ids => undefined}.
+
+patch_fun_to_make_result_as_map(F) ->
+    fun(HostType, Params) -> result_to_map(F(HostType, Params)) end.
+
+result_to_map({ok, {TotalCount, Offset, MessageRows}}) ->
+    {ok, #{total_count => TotalCount, offset => Offset, messages => MessageRows}};
+result_to_map(Other) ->
+    Other.
+
+%% We query an extra message by changing page_size.
+%% After that we remove this message from the result set when returning.
+process_simple_lookup_with_complete_check(HostType, Params = #{page_size := PageSize}, F) ->
+    Params2 = Params#{page_size => PageSize + 1},
+    case F(HostType, Params2) of
+        {ok, Result} ->
+            {ok, set_complete_result_page_using_extra_message(PageSize, Params, Result)};
+        Other ->
+            Other
+    end.
+
+set_complete_result_page_using_extra_message(PageSize, Params, Result = #{messages := MessageRows}) ->
+    case length(MessageRows) =:= (PageSize + 1) of
+        true ->
+            Result#{is_complete => false, messages => remove_extra_message(Params, MessageRows)};
+        false ->
+            Result#{is_complete => true}
+    end.
+
+remove_extra_message(Params, Messages) ->
+    case maps:get(ordering_direction, Params, forward) of
+        forward ->
+            lists:droplast(Messages);
+        backward ->
+            tl(Messages)
+    end.
+
+-spec db_jid_codec(mongooseim:host_type(), module()) -> module().
+db_jid_codec(HostType, Module) ->
+    gen_mod:get_module_opt(HostType, Module, db_jid_format).
+
+-spec db_message_codec(mongooseim:host_type(), module()) -> module().
+db_message_codec(HostType, Module) ->
+    gen_mod:get_module_opt(HostType, Module, db_message_format).
+
+-spec incremental_delete_domain(
+        mongooseim:host_type(), jid:lserver(), non_neg_integer(), [atom()], non_neg_integer()) ->
+    non_neg_integer().
+incremental_delete_domain(_HostType, _Domain, _Limit, [], TotalDeleted) ->
+    TotalDeleted;
+incremental_delete_domain(HostType, Domain, Limit, [Query | MoreQueries] = AllQueries, TotalDeleted) ->
+    R1 = mongoose_rdbms:execute_successfully(HostType, Query, [Domain]),
+    case is_removing_done(R1, Limit) of
+        {done, N} ->
+            incremental_delete_domain(HostType, Domain, Limit, MoreQueries, N + TotalDeleted);
+        {remove_more, N} ->
+            incremental_delete_domain(HostType, Domain, Limit, AllQueries, N + TotalDeleted)
+    end.
+
+-spec is_removing_done(LastResult :: {updated, non_neg_integer()}, Limit :: non_neg_integer()) ->
+    {done | remove_more, non_neg_integer()}.
+is_removing_done({updated, N}, Limit) when N < Limit ->
+    {done, N};
+is_removing_done({updated, N}, _)->
+    {remove_more, N}.
+
+-spec is_mam_muc_enabled(jid:lserver(), mongooseim:host_type()) -> boolean().
+is_mam_muc_enabled(MucDomain, HostType) ->
+    HostPattern = mongoose_config:get_opt([{modules, HostType}, mod_mam_muc, host]),
+    {ok, #{subdomain_pattern := SubDomainPattern}} =
+        mongoose_domain_api:get_subdomain_info(MucDomain),
+    HostPattern =:= SubDomainPattern.

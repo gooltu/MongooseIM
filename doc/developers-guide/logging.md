@@ -5,107 +5,88 @@ To use logger in your module, include
 ```erlang
 -include("mongoose_logger.hrl").
 ```
-
 or
-
 ```erlang
 -include("mongoose.hrl").
 ```
 
-# Logging macros
+## Logging macros
 
-There are several macroses:
+There are several macros for the most common logging levels:
 
 ```erlang
-DEBUG("event=debug_event info=~1000p", [Arg]),
-INFO_MSG("event=info_event info=~1000p", [Arg]),
-ERROR_MSG("event=error_event reason=~1000p", [Arg]),
-WARNING_MSG("event=warning_event reason=~1000p", [Arg]),
+?LOG_DEBUG(#{what => debug_event, info => Arg}),
+?LOG_INFO(#{what => info_event, info => Arg}),
+?LOG_NOTICE(#{what => notice_event, info => Arg}),
+?LOG_WARNING(#{what => warning_event, info => Arg}),
+?LOG_ERROR(#{what => error_event, info => Arg}),
+?LOG_CRITICAL(#{what => critical_event, info => Arg}),
 ```
 
-Use them to log on corresponding log level.
+Use them in correspondence with the appropriate log level.
+Please be mindful of what is logged and which log level is used for it.
 
-Don't use `ERROR_MSG` for cases that are not errors.
+## Logging levels
 
-# Logging levels
+A system operator can choose the global log level by setting `loglevel` in `mongooseim.toml`.
 
-A system operator can choose log level by setting loglevel in `mongooseim.cfg`.
+Possible values are the standard syslog severity levels, plus all or none:
+`"all"`, `"debug"`, `"info"`, `"notice"`, `"warning"`, `"error"`, `"critical"`, `"alert"`, `"emergency"`, and `"none"`.
 
-- level 5 - debug
-- level 4 - info
-- level 3 - warning
-- level 2 - error
-- level 1 - critical
-- level 0 - none
+```toml
+[general]
+  loglevel = "notice"
+```
 
-While there is a macro to log on level 1, we rarely use it.
+If a user sets the log level to `all`, then they would see all messages in logs.
 
-If an user sets log level 5, than he would see all messages in logs.
+Levels `warning` and `error` are the most commonly used for production systems.
 
-Levels 3 or 2 are usually used for production systems.
+## Logging format
 
+We use structured logging as inspired by [Ferd's post](https://ferd.ca/erlang-otp-21-s-new-logger.html).
+We also use a modified [logfmt](https://brandur.org/logfmt) format as one of
+the possible default logger formatters.
+This format is [Splunk](https://www.splunk.com/en_us/devops.html) and [ELK](https://www.elastic.co/elk-stack) friendly.
+Check [the list of fields](../operation-and-maintenance/Logging-fields.md) for fields documentation.
 
-# Logging format
-
-We use modified [logfmt](https://brandur.org/logfmt) format.
-
-This format is [Splunk](https://www.splunk.com/en_us/solutions/solution-areas/log-management.html)
-and [ELK](https://www.elastic.co/elk-stack) friendly.
-
-`event=something_interesting` field is required.
-
-`reason=~1000p` field is commonly used.
+`what => something_interesting` field is required.
 
 ```erlang
-    ?ERROR_MSG("event=check_password_failed "
-               "reason=~p user=~ts", [Error, LUser]),
+    ?LOG_ERROR(#{what => check_password_failed,
+                 reason => Error, user => LUser})
 
     try ...
     catch
         Class:Reason:StackTrace ->
-            ?ERROR_MSG("event=check_password_failed "
-                       "reason=~p:~p user=~ts stacktrace=~1000p",
-                       [Class, Reason, LUser, StackTrace]),
+            ?LOG_ERROR(#{what => check_password_failed,
+                         class => Class, reason => Reason, stacktrace => StackTrace}),
             erlang:raise(Class, Reason, StackTrace)
     end
 ```
 
-`user=~ts` is often used too.
+Field `user => <<"alice">>` is often used too.
 
-
-A common way to name an error event is `event=function_name_failed`.
-For example, `event=remove_user_failed`. Use the advice critically, it would
-not work well for any function. Counter example:
+A common way to name an error event is `what => function_name_failed`.
+For example, `what => remove_user_failed`. Use the advice critically, it would
+not work well for any function. Counterexample:
 
 ```erlang
 handle_info(Info, State) ->
-    ?ERROR_MSG("issue=unexpected_info_received info=~1000p", [Info]),
+    ?LOG_WARNING(#{what => unexpected_message, msg => Info}),
     {noreply, State}.
 ```
 
-Log messages should not contain new lines.
 
-We usually use `~1000p` to log long datastructures.
+## Filtering logs by module
 
-Use whitespace as a field separator:
-
-```erlang
-%% Use
-?ERROR_MSG("event=check_password_failed reason=~p", [Reason])
-
-%% Don't use
-?ERROR_MSG("event=check_password_failed, reason=~p", [Reason])
-```
-
-# Filtering logs by module
-
-Setting loglevel to `debug` leads to a flood of messages in logs.
-To set different loglevel for just one module, call:
+Setting loglevel to `debug` can lead to a flood of messages in logs.
+To set a different loglevel for just one module, call:
 
 ```erlang
-ejabberd_loglevel:set(3).
-ejabberd_loglevel:set_custom(mod_mam, 5).
+mongoose_logs:set_global_loglevel(error).
+mongoose_logs:set_module_loglevel(mod_mam, debug).
 ```
 
-This code sets loglevel error for all messages, except generated by `mod_mam`.
+This code sets the loglevel to error for all log messages, except for those generated by `mod_mam`.
 All messages from `mod_mam` would be logged.

@@ -16,15 +16,18 @@
 
 -module(mod_global_distrib_SUITE).
 
--compile(export_all).
+-compile([export_all, nowarn_export_all]).
 
 -include_lib("escalus/include/escalus.hrl").
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
--include_lib("escalus/include/escalus_xmlns.hrl").
 -include_lib("exml/include/exml.hrl").
 
 -define(HOSTS_REFRESH_INTERVAL, 200). %% in ms
+-define(PROBE_INTERVAL, 1). %% seconds
+
+-import(domain_helper, [domain/0]).
+-import(config_parser_helper, [config/2, mod_config/2]).
 
 %%--------------------------------------------------------------------
 %% Suite configuration
@@ -43,7 +46,7 @@ all() ->
     ].
 
 groups() ->
-    G = [{mod_global_distrib, [],
+    [{mod_global_distrib, [],
           [
            test_pm_between_users_at_different_locations,
            test_pm_between_users_before_available_presence,
@@ -62,8 +65,8 @@ groups() ->
 
            %% with node 2 disabled
            test_muc_conversation_on_one_host,
+           test_instrumentation_events_on_one_host,
            test_global_disco
-           %% TODO: Add test case fo global_distrib_addr option
           ]},
          {hosts_refresher, [],
           [test_host_refreshing]},
@@ -101,8 +104,7 @@ groups() ->
            test_advertised_endpoints_override_endpoints,
            test_pm_between_users_at_different_locations
           ]}
-        ],
-    ct_helper:repeat_all_until_all_ok(G).
+    ].
 
 suite() ->
     [{require, europe_node1, {hosts, mim, node}},
@@ -119,32 +121,51 @@ init_per_suite(Config) ->
     case {rpc(europe_node1, mongoose_wpool, get_worker, [redis, global, global_distrib]),
           rpc(asia_node, mongoose_wpool, get_worker, [redis, global, global_distrib])} of
         {{ok, _}, {ok, _}} ->
-            ok = rpc(europe_node2, mongoose_cluster, join, [ct:get_config(europe_node1)]),
-
+            case ct_helper:get_internal_database() of
+                mnesia ->
+                    ok = rpc(europe_node2, mongoose_cluster, join, [ct:get_config(europe_node1)]);
+                _ ->
+                    ok
+            end,
             enable_logging(),
-            % We have to pass [no_opts] because [] is treated as string and converted
-            % automatically to <<>>
-            escalus:init_per_suite([{add_advertised_endpoints, []},
-                                    {extra_config, []}, {redis_extra_config, [no_opts]} | Config]);
+            instrument_helper:start(events()),
+            Config1 = mongoose_helper:backup_and_set_config_option(Config, [instrumentation, probe_interval], ?PROBE_INTERVAL),
+            escalus:init_per_suite([{add_advertised_endpoints, []}, {extra_config, #{}} | Config1]);
         Result ->
             ct:pal("Redis check result: ~p", [Result]),
             {skip, "GD Redis default pool not available"}
     end.
 
+events() ->
+    % because mod_global_distrib starts instrumentation manually, it doesn't export instrumentation/1
+    Specs = rpc(europe_node1, mod_global_distrib, instrumentation, []),
+    GDEvents = [{Event, Labels} || {Event, Labels, _Config} <- Specs],
+    OtherModules = [mod_global_distrib_bounce, mod_global_distrib_hosts_refresher,
+                    mod_global_distrib_mapping, mod_global_distrib_receiver],
+    GDEvents ++ lists:append([instrument_helper:declared_events(M) || M <- OtherModules]).
+
 end_per_suite(Config) ->
     disable_logging(),
     escalus_fresh:clean(),
     rpc(europe_node2, mongoose_cluster, leave, []),
-    escalus:end_per_suite(Config).
+    escalus:end_per_suite(Config),
+    mongoose_helper:restore_config_option(Config, [instrumentation, probe_interval]),
+    instrument_helper:stop().
 
 init_per_group(start_checks, Config) ->
-    Config;
+    NodeName = europe_node1,
+    NodeSpec = node_spec(NodeName),
+    Config1 = dynamic_modules:save_modules(NodeSpec, [domain()], Config),
+    dynamic_modules:ensure_modules(NodeSpec, domain(), [{mod_global_distrib, stopped}]),
+    Config1;
 init_per_group(multi_connection, Config) ->
-    ExtraConfig = [{resend_after_ms, 20000},
-                   %% Disable unused feature to avoid interferance
-                   {disabled_gc_interval, 10000},
-                   {connections_per_endpoint, 100}],
-    init_per_group_generic([{extra_config, ExtraConfig} | Config]);
+    Config1 = mongoose_helper:backup_and_set_config_option(
+                Config, [shaper, normal, max_rate], 100000), % needed to send many messages quickly
+    ExtraConfig = #{bounce => #{resend_after_ms => 20000},
+                    connections => #{%% Disable unused feature to avoid interference
+                                     connections_per_endpoint => 100,
+                                     disabled_gc_interval => 10000}},
+    init_per_group_generic([{extra_config, ExtraConfig} | Config1]);
 init_per_group(invalidation, Config) ->
     Config1 = init_per_group(invalidation_generic, Config),
     NodeBin = <<"fake_node@localhost">>,
@@ -152,12 +173,11 @@ init_per_group(invalidation, Config) ->
 init_per_group(rebalancing, Config) ->
     %% We need to prevent automatic refreshes, because they may interfere with tests
     %% and we need early disabled garbage collection to check its validity
-    ExtraConfig = [{endpoint_refresh_interval, 3600},
-                   {endpoint_refresh_interval_when_empty, 3600},
-                   {disabled_gc_interval, 1}],
-    RedisExtraConfig = [{refresh_after, 3600}],
-    init_per_group_generic([{extra_config, ExtraConfig},
-                            {redis_extra_config, RedisExtraConfig} | Config]);
+    ExtraConfig = #{connections => #{endpoint_refresh_interval => 3600,
+                                     endpoint_refresh_interval_when_empty => 3600,
+                                     disabled_gc_interval => 1},
+                    redis => #{refresh_after => 3600}},
+    init_per_group_generic([{extra_config, ExtraConfig} | Config]);
 init_per_group(advertised_endpoints, Config) ->
     lists:foreach(fun({NodeName, _, _}) ->
                           Node = ct:get_config(NodeName),
@@ -169,57 +189,61 @@ init_per_group(advertised_endpoints, Config) ->
                  [{asia_node, advertised_endpoints()}]} | Config]);
 init_per_group(mod_global_distrib, Config) ->
     %% Disable mod_global_distrib_mapping_redis refresher
-    RedisExtraConfig = [{refresh_after, 3600}],
-    init_per_group_generic([{redis_extra_config, RedisExtraConfig} | Config]);
+    ExtraConfig = #{redis => #{refresh_after => 3600}},
+    init_per_group_generic([{extra_config, ExtraConfig} | Config]);
 init_per_group(_, Config) ->
     init_per_group_generic(Config).
 
 init_per_group_generic(Config0) ->
-    Config2 =
-        lists:foldl(
-          fun({NodeName, LocalHost, ReceiverPort}, Config1) ->
-                  Opts0 = (?config(extra_config, Config1) ++
-                           [{local_host, LocalHost},
-                            {hosts_refresh_interval, ?HOSTS_REFRESH_INTERVAL},
-                            {global_host, "localhost"},
-                            {endpoints, [listen_endpoint(ReceiverPort)]},
-                            {tls_opts, [
-                                        {certfile, "priv/ssl/fake_server.pem"},
-                                        {cafile, "priv/ssl/ca/cacert.pem"}
-                                       ]},
-                            {redis, ?config(redis_extra_config, Config1)},
-                            {resend_after_ms, 500}]),
-                  Opts = maybe_add_advertised_endpoints(NodeName, Opts0, Config1),
-
-                  %% To reduce load when sending many messages
-                  VirtHosts = virtual_hosts(),
-                  ModulesToStop = [mod_offline, mod_privacy, mod_roster, mod_last],
-
-                  OldMods = save_modules(NodeName, VirtHosts),
-
-                  rpc(NodeName, gen_mod_deps, start_modules,
-                      [<<"localhost">>, [{mod_global_distrib, Opts}]]),
-
-                  [rpc(NodeName, gen_mod, stop_module, [VirtHost, Mod])
-                   || Mod <- ModulesToStop, VirtHost <- VirtHosts],
-
-                  ResumeTimeout = rpc(NodeName, mod_stream_management, get_resume_timeout, [1]),
-                  true = rpc(NodeName, mod_stream_management, set_resume_timeout, [1]),
-
-                  OldMods ++
-                  [
-                   {{resume_timeout, NodeName}, ResumeTimeout} |
-                   Config1
-                  ]
-          end,
-          Config0,
-          get_hosts()),
-
+    Config2 = lists:foldl(fun init_modules_per_node/2, Config0, get_hosts()),
     wait_for_listeners_to_appear(),
-
     {SomeNode, _, _} = hd(get_hosts()),
     NodesKey = rpc(SomeNode, mod_global_distrib_mapping_redis, nodes_key, []),
     [{nodes_key, NodesKey}, {escalus_user_db, xmpp} | Config2].
+
+init_modules_per_node({NodeName, LocalHost, ReceiverPort}, Config0) ->
+    Extra0 = module_opts(?config(extra_config, Config0)),
+    EndpointOpts = endpoint_opts(NodeName, ReceiverPort, Config0),
+    ConnExtra = maps:merge(EndpointOpts, maps:get(connections, Extra0, #{})),
+    Extra = Extra0#{local_host => LocalHost, connections => ConnExtra},
+    Opts = module_opts(Extra),
+
+    VirtHosts = virtual_hosts(NodeName),
+    Node = node_spec(NodeName),
+    Config1 = dynamic_modules:save_modules(Node, VirtHosts, Config0),
+
+    %% To reduce load when sending many messages
+    ModulesToStop = [mod_offline, mod_blocking, mod_privacy, mod_roster, mod_last,
+                     mod_stream_management],
+    [dynamic_modules:ensure_stopped(Node, VirtHost, ModulesToStop) || VirtHost <- VirtHosts],
+
+    SMBackend = ct_helper:get_internal_database(),
+    SMOpts = config_parser_helper:mod_config(mod_stream_management,
+                                             #{resume_timeout => 1, backend => SMBackend}),
+    dynamic_modules:ensure_modules(Node, domain(), [{mod_global_distrib, Opts},
+                                                    {mod_stream_management, SMOpts}]),
+    Config1.
+
+module_opts(ExtraOpts) ->
+    lists:foldl(fun set_opts/2, ExtraOpts, [common, defaults, connections, redis, bounce]).
+
+set_opts(common, Opts) ->
+    maps:merge(#{global_host => <<"localhost">>,
+                 hosts_refresh_interval => ?HOSTS_REFRESH_INTERVAL}, Opts);
+set_opts(defaults, Opts) ->
+    mod_config(mod_global_distrib, Opts);
+set_opts(connections, #{connections := ConnExtra} = Opts) ->
+    TLSOpts = config([modules, mod_global_distrib, connections, tls],
+                     #{certfile => "priv/ssl/fake_server.pem",
+                       cacertfile => "priv/ssl/cacert.pem"}),
+    Opts#{connections := config([modules, mod_global_distrib, connections],
+                                maps:merge(#{tls => TLSOpts}, ConnExtra))};
+set_opts(redis, #{redis := RedisExtra} = Opts) ->
+    Opts#{redis := config([modules, mod_global_distrib, redis], RedisExtra)};
+set_opts(bounce, #{bounce := BounceExtra} = Opts) ->
+    Opts#{bounce := config([modules, mod_global_distrib, bounce], BounceExtra)};
+set_opts(_, Opts) ->
+    Opts.
 
 end_per_group(advertised_endpoints, Config) ->
     Pids = ?config(meck_handlers, Config),
@@ -233,36 +257,31 @@ end_per_group(invalidation, Config) ->
     redis_query(europe_node1, [<<"HDEL">>, ?config(nodes_key, Config),
                             ?config(node_to_expire, Config)]),
     end_per_group_generic(Config);
+end_per_group(multi_connection, Config) ->
+    mongoose_helper:restore_config_option(Config, [shaper, normal, max_rate]),
+    end_per_group_generic(Config);
 end_per_group(_, Config) ->
     end_per_group_generic(Config).
 
 end_per_group_generic(Config) ->
-    lists:foreach(
-      fun({NodeName, _, _}) ->
-              VirtHosts = virtual_hosts(),
-              [restore_modules(NodeName, VirtHost, Config) || VirtHost <- VirtHosts],
-
-              rpc(NodeName, mod_stream_management, set_resume_timeout,
-                  [?config({resume_timeout, NodeName}, Config)])
-      end,
-      get_hosts()).
+    dynamic_modules:restore_modules(#{timeout => timer:seconds(30)}, Config).
 
 init_per_testcase(CaseName, Config)
-  when CaseName == test_muc_conversation_on_one_host; CaseName == test_global_disco;
-       CaseName == test_muc_conversation_history ->
-    %% There is no helper to load MUC on node2
+  when CaseName == test_muc_conversation_on_one_host; CaseName == test_instrumentation_events_on_one_host;
+       CaseName == test_global_disco; CaseName == test_muc_conversation_history ->
+    %% There is no helper to load MUC, or count instrumentation events on node2
     %% For now it's easier to hide node2
     %% TODO: Do it right at some point!
     hide_node(europe_node2, Config),
     %% There would be no new connections to europe_node2, but there can be some old ones.
     %% We need to disconnect previous connections.
     {_, EuropeHost, _} = lists:keyfind(europe_node1, 1, get_hosts()),
-    trigger_rebalance(asia_node, list_to_binary(EuropeHost)),
+    trigger_rebalance(asia_node, EuropeHost),
     %% Load muc on mim node
-    muc_helper:load_muc(<<"muc.localhost">>),
+    muc_helper:load_muc(),
     RegNode = ct:get_config({hosts, reg, node}),
     %% Wait for muc.localhost to become visible from reg node
-    wait_for_domain(RegNode, <<"muc.localhost">>),
+    wait_for_domain(RegNode, muc_helper:muc_host()),
     escalus:init_per_testcase(CaseName, Config);
 init_per_testcase(CN, Config) when CN == test_pm_with_graceful_reconnection_to_different_server;
                                    CN == test_pm_with_ungraceful_reconnection_to_different_server;
@@ -296,8 +315,8 @@ end_per_testcase(CN, Config) when CN == test_pm_with_graceful_reconnection_to_di
     catch escalus_users:delete_users(Config, [{mim_eve, MimEveSpec}]),
     generic_end_per_testcase(CN, Config);
 end_per_testcase(CaseName, Config)
-  when CaseName == test_muc_conversation_on_one_host; CaseName == test_global_disco;
-       CaseName == test_muc_conversation_history ->
+  when CaseName == test_muc_conversation_on_one_host; CaseName == test_instrumentation_events_on_one_host;
+       CaseName == test_global_disco; CaseName == test_muc_conversation_history ->
     refresh_mappings(europe_node2, "by_end_per_testcase,testcase=" ++ atom_to_list(CaseName)),
     muc_helper:unload_muc(),
     generic_end_per_testcase(CaseName, Config);
@@ -341,8 +360,13 @@ generic_end_per_testcase(CaseName, Config) ->
       get_hosts()),
     escalus:end_per_testcase(CaseName, Config).
 
-virtual_hosts() ->
-    [ct:get_config({hosts, mim, domain}), ct:get_config({hosts, mim, secondary_domain})].
+virtual_hosts(asia_node) ->
+    [domain()];
+virtual_hosts(_) ->
+    [domain(), secondary_domain()].
+
+secondary_domain() ->
+    ct:get_config({hosts, mim, secondary_domain}).
 
 %% Refresher is not started at all or stopped for some test cases
 -spec pause_refresher(NodeName :: atom(), CaseName :: atom()) -> ok.
@@ -370,27 +394,27 @@ unpause_refresher(NodeName, _) ->
 %% Reads Redis to confirm that endpoints (in Redis) are overwritten
 %% with `advertised_endpoints` option value
 test_advertised_endpoints_override_endpoints(_Config) ->
-    Endps = execute_on_each_node(mod_global_distrib_mapping_redis,
-                                 get_endpoints,
-                                 [<<"reg1">>]),
-    true = lists:all(fun({ok, E}) ->
-                             lists:sort(iptuples_to_string(E)) =:=
-                                 lists:sort(advertised_endpoints()) end, Endps).
+    Endps = execute_on_each_node(mod_global_distrib_mapping_redis, get_endpoints, [<<"reg1">>]),
+    true = lists:all(
+             fun(E) ->
+                     lists:sort(E) =:= lists:sort(advertised_endpoints())
+             end, Endps).
 
 %% @doc Verifies that hosts refresher will restart the outgoing connection pool if
 %% it goes down for some reason (crash or domain unavailability).
 %% Also actually verifies that refresher properly reads host list
 %% from backend and starts appropriate pool.
 test_host_refreshing(_Config) ->
-    mongoose_helper:wait_until(fun() -> trees_for_connections_present() end, true,
-                               #{name => trees_for_connections_present}),
+    wait_helper:wait_until(fun() -> trees_for_connections_present() end, true,
+                           #{name => trees_for_connections_present,
+                             time_left => timer:seconds(10)}),
     ConnectionSups = out_connection_sups(asia_node),
     {europe_node1, EuropeHost, _} = lists:keyfind(europe_node1, 1, get_hosts()),
-    EuropeSup = rpc(asia_node, mod_global_distrib_utils, server_to_sup_name, [list_to_binary(EuropeHost)]),
+    EuropeSup = rpc(asia_node, mod_global_distrib_utils, server_to_sup_name, [EuropeHost]),
     {_, EuropePid, supervisor, _} = lists:keyfind(EuropeSup, 1, ConnectionSups),
     erlang:exit(EuropePid, kill), % it's ok to kill temporary process
-    mongoose_helper:wait_until(fun() -> tree_for_sup_present(asia_node, EuropeSup) end, true,
-                               #{name => tree_for_sup_present}).
+    wait_helper:wait_until(fun() -> tree_for_sup_present(asia_node, EuropeSup) end, true,
+                           #{name => tree_for_sup_present}).
 
 %% When run in mod_global_distrib group - tests simple case of connection
 %% between two users connected to different clusters.
@@ -410,12 +434,6 @@ test_pm_between_users_before_available_presence(Config) ->
     escalus_client:stop(Config1, Eve).
 
 test_two_way_pm(Alice, Eve) ->
-    %% Ensure that users are properly registered
-    %% Otherwise you can get "Unable to route global message... user not found in the routing table"
-    %% error, because "escalus_client:start" can return before SM registration is completed.
-    wait_for_registration(Alice, ct:get_config({hosts, mim, node})),
-    wait_for_registration(Eve, ct:get_config({hosts, reg, node})),
-
     escalus_client:send(Alice, escalus_stanza:chat_to(Eve, <<"Hi to Eve from Europe1!">>)),
     escalus_client:send(Eve, escalus_stanza:chat_to(Alice, <<"Hi to Alice from Asia!">>)),
 
@@ -428,7 +446,25 @@ test_two_way_pm(Alice, Eve) ->
     escalus:assert(is_chat_message_from_to, [AliceJid, EveJid, <<"Hi to Eve from Europe1!">>],
                    FromAlice),
     escalus:assert(is_chat_message_from_to, [EveJid, AliceJid, <<"Hi to Alice from Asia!">>],
-                   FromEve).
+                   FromEve),
+
+    instrument_helper:assert(
+      mod_global_distrib_mapping_cache_misses, #{},
+      fun(#{count := 1, jid := Jid}) -> Jid =:= EveJid end),
+    instrument_helper:assert(
+      mod_global_distrib_mapping_fetches, #{},
+      fun(#{count := 1, time := T, jid := Jid}) ->
+              Jid =:= jid:to_lower(jid:from_binary(EveJid)) andalso T >= 0
+      end),
+    instrument_helper:assert(
+      mod_global_distrib_outgoing_established, #{},
+      fun(#{count := 1, host := <<"reg1">>}) -> true end),
+    instrument_helper:assert(
+      mod_global_distrib_outgoing_queue, #{},
+      fun(#{time := Time, host := <<"reg1">>}) -> Time >= 0 end),
+    instrument_helper:assert(
+      mod_global_distrib_outgoing_messages, #{},
+      fun(#{count := 1, host := <<"reg1">>}) -> true end).
 
 test_muc_conversation_on_one_host(Config0) ->
     AliceSpec = escalus_fresh:create_fresh_user(Config0, alice),
@@ -444,10 +480,14 @@ test_muc_conversation_on_one_host(Config0) ->
               RoomAddr = muc_helper:room_address(RoomJid),
 
               escalus:send(Alice, muc_helper:stanza_muc_enter_room(RoomJid, AliceUsername)),
-              escalus:wait_for_stanza(Alice),
+              wait_for_muc_presence(Alice, RoomJid, AliceUsername),
+              wait_for_subject(Alice),
 
               escalus:send(Eve, muc_helper:stanza_muc_enter_room(RoomJid, EveUsername)),
-              [_, _, _] = escalus:wait_for_stanzas(Eve, 3),
+              wait_for_muc_presence(Eve, RoomJid, AliceUsername),
+              wait_for_muc_presence(Eve, RoomJid, EveUsername),
+              wait_for_muc_presence(Alice, RoomJid, EveUsername),
+              wait_for_subject(Eve),
 
               Msg= <<"Hi, Eve!">>,
               escalus:send(Alice, escalus_stanza:groupchat_to(RoomAddr, Msg)),
@@ -460,6 +500,33 @@ test_muc_conversation_on_one_host(Config0) ->
               escalus:assert(is_groupchat_message, [Msg2], escalus:wait_for_stanza(Alice))
       end),
     muc_helper:destroy_room(Config).
+
+test_instrumentation_events_on_one_host(Config) ->
+    % testing is done with mim1 and reg1, and without mim2, so that we don't miss any events that could have been
+    % emitted there
+    Config1 = escalus_fresh:create_users(Config, [{alice, 1}, {eve, 1}]),
+    {ok, Alice} = escalus_client:start(Config1, alice, <<"res1">>),
+    {ok, Eve} = escalus_client:start(Config1, eve, <<"res1">>),
+
+    test_two_way_pm(Alice, Eve),
+
+    Host = <<"localhost.bis">>,
+    instrument_helper:assert(mod_global_distrib_incoming_established, #{},
+                             fun(#{count := 1, peer := _}) -> true end),
+    instrument_helper:assert(mod_global_distrib_incoming_first_packet, #{},
+                             fun(#{count := 1, host := H}) -> H =:= Host end),
+    instrument_helper:assert(mod_global_distrib_incoming_transfer, #{},
+                             fun(#{time := T, host := H}) when T >= 0 -> H =:= Host end),
+    instrument_helper:assert(mod_global_distrib_incoming_messages, #{},
+                             fun(#{count := 1, host := H}) -> H =:= Host end),
+    instrument_helper:assert(mod_global_distrib_incoming_queue, #{},
+                             fun(#{time := T, host := H}) when T >= 0 -> H =:= Host end),
+
+    escalus_client:stop(Config1, Alice),
+    escalus_client:stop(Config1, Eve),
+
+    CheckF = fun(#{count := C, host := H}) -> C =:= 1 andalso H =:= Host end,
+    instrument_helper:wait_and_assert(mod_global_distrib_incoming_closed, #{}, CheckF).
 
 test_muc_conversation_history(Config0) ->
     AliceSpec = escalus_fresh:create_fresh_user(Config0, alice),
@@ -474,7 +541,7 @@ test_muc_conversation_history(Config0) ->
               RoomAddr = muc_helper:room_address(RoomJid),
 
               escalus:send(Alice, muc_helper:stanza_muc_enter_room(RoomJid, AliceUsername)),
-              %% We don't care about presences from Alice, escalus would filter them out
+              wait_for_muc_presence(Alice, RoomJid, AliceUsername),
               wait_for_subject(Alice),
 
               send_n_muc_messages(Alice, RoomAddr, 3),
@@ -490,12 +557,20 @@ test_muc_conversation_history(Config0) ->
 
               wait_for_muc_presence(Eve, RoomJid, AliceUsername),
               wait_for_muc_presence(Eve, RoomJid, EveUsername),
+              wait_for_muc_presence(Alice, RoomJid, EveUsername),
 
               %% XEP-0045: After sending the presence broadcast (and only after doing so),
               %% the service MAY then send discussion history, the room subject,
               %% live messages, presence updates, and other in-room traffic.
               receive_n_muc_messages(Eve, 3),
-              wait_for_subject(Eve)
+              wait_for_subject(Eve),
+
+              % events are checked only on mim host, the other event was executed on Eve's reg ("asia_node") host
+              EveJid = escalus_client:full_jid(Eve),
+              instrument_helper:assert_one(mod_global_distrib_delivered_with_ttl, #{},
+                                           fun(#{value := TTL, from := From}) ->
+                                                   ?assert(TTL > 0), jid:to_binary(From) =:= EveJid
+                                           end)
       end),
     muc_helper:destroy_room(Config).
 
@@ -526,7 +601,7 @@ receive_n_muc_messages(User, N) ->
 
 test_component_on_one_host(Config) ->
     ComponentConfig = [{server, <<"localhost">>}, {host, <<"localhost">>}, {password, <<"secret">>},
-                       {port, service_port()}, {component, <<"test_service">>}],
+                       {port, component_port()}, {component, <<"test_service">>}],
 
     {Comp, Addr, _Name} = component_helper:connect_component(ComponentConfig),
 
@@ -553,8 +628,8 @@ test_component_on_one_host(Config) ->
 test_components_in_different_regions(_Config) ->
     ComponentCommonConfig = [{host, <<"localhost">>}, {password, <<"secret">>},
                              {server, <<"localhost">>}, {component, <<"test_service">>}],
-    Comp1Port = ct:get_config({hosts, mim, service_port}),
-    Comp2Port = ct:get_config({hosts, reg, service_port}),
+    Comp1Port = ct:get_config({hosts, mim, component_port}),
+    Comp2Port = ct:get_config({hosts, reg, component_port}),
     Component1Config = [{port, Comp1Port}, {component, <<"service1">>} | ComponentCommonConfig],
     Component2Config = [{port, Comp2Port}, {component, <<"service2">>} | ComponentCommonConfig],
 
@@ -574,7 +649,7 @@ test_components_in_different_regions(_Config) ->
 %% Ordinary user is not able to discover the hidden component from GD
 test_hidden_component_disco_in_different_region(Config) ->
     %% Hidden component from component_SUITE connects to mim1/europe_node1
-    HiddenComponentConfig = component_helper:spec(hidden_component, Config),
+    HiddenComponentConfig = component_helper:spec(hidden_component),
     {_HiddenComp, HiddenAddr, _} = component_helper:connect_component(HiddenComponentConfig),
 
     escalus:fresh_story(
@@ -591,7 +666,7 @@ test_hidden_component_disco_in_different_region(Config) ->
 
 test_component_disconnect(Config) ->
     ComponentConfig = [{server, <<"localhost">>}, {host, <<"localhost">>}, {password, <<"secret">>},
-                       {port, service_port()}, {component, <<"test_service">>}],
+                       {port, component_port()}, {component, <<"test_service">>}],
 
     {Comp, Addr, _Name} = component_helper:connect_component(ComponentConfig),
     component_helper:disconnect_component(Comp, Addr),
@@ -599,27 +674,45 @@ test_component_disconnect(Config) ->
     Story = fun(User) ->
                     escalus:send(User, escalus_stanza:chat_to(Addr, <<"Hi!">>)),
                     Error = escalus:wait_for_stanza(User, 5000),
-                    escalus:assert(is_error, [<<"cancel">>, <<"service-unavailable">>], Error)
+                    escalus:assert(is_error, [<<"cancel">>, <<"service-unavailable">>], Error),
+                    instrument_helper:assert(mod_global_distrib_outgoing_closed, #{},
+                                             fun(#{count := 1, host := <<"reg1">>}) -> true end)
             end,
 
-    [escalus:fresh_story(Config, [{User, 1}], Story) || User <- [alice, eve]].
+    AliceStory = fun(User) ->
+        Story(User),
+        % only check Alice, because Eve's event is executed on other node
+        Jid = escalus_client:full_jid(User),
+        CheckF = fun(#{count := 1, from := From}) -> jid:to_binary(From) =:= Jid end,
+        instrument_helper:assert_one(mod_global_distrib_stop_ttl_zero, #{}, CheckF)
+                 end,
+
+    escalus:fresh_story(Config, [{alice, 1}], AliceStory),
+    escalus:fresh_story(Config, [{eve, 1}], Story).
 
 test_location_disconnect(Config) ->
     try
         escalus:fresh_story(
-          Config, [{alice, 1}, {eve, 1}],
-          fun(Alice, Eve) ->
+          Config, [{alice, 1}, {eve, 1}, {adam, 1}],
+          fun(Alice, Eve, Adam) ->
                   escalus_client:send(Alice, escalus_stanza:chat_to(Eve, <<"Hi from Europe1!">>)),
-
                   escalus_client:wait_for_stanza(Eve),
 
+                  escalus_client:send(Alice, escalus_stanza:chat_to(Adam, <<"Hi, Adam, from Europe1!">>)),
+                  escalus_client:wait_for_stanza(Adam),
+
+                  print_sessions_debug_info(asia_node),
                   ok = rpc(asia_node, application, stop, [mongooseim]),
                   %% TODO: Stopping mongooseim alone should probably stop connections too
                   ok = rpc(asia_node, application, stop, [ranch]),
 
                   escalus_client:send(Alice, escalus_stanza:chat_to(Eve, <<"Hi again!">>)),
                   Error = escalus:wait_for_stanza(Alice),
-                  escalus:assert(is_error, [<<"cancel">>, <<"service-unavailable">>], Error)
+                  escalus:assert(is_error, [<<"cancel">>, <<"service-unavailable">>], Error),
+
+                  escalus_client:send(Alice, escalus_stanza:chat_to(Adam, <<"Hi, Adam, again!">>)),
+                  Error2 = escalus:wait_for_stanza(Alice),
+                  escalus:assert(is_error, [<<"cancel">>, <<"service-unavailable">>], Error2)
           end)
     after
         rpc(asia_node, application, start, [ranch]),
@@ -655,15 +748,13 @@ test_pm_with_graceful_reconnection_to_different_server(Config) ->
               %% Pause Alice until Eve is reconnected
               AliceNode = ct:get_config({hosts, mim, node}),
               C2sPid = mongoose_helper:get_session_pid(Alice, #{node => AliceNode}),
-              ok = rpc(asia_node, sys, suspend, [C2sPid]),
+              ok = rpc:call(node(C2sPid), sys, suspend, [C2sPid]),
 
               escalus_client:send(Alice, chat_with_seqnum(Eve, <<"Hi from Europe1!">>)),
 
               NewEve = connect_from_spec(EveSpec2, Config),
-              EveNode2 = ct:get_config({hosts, mim, node}),
-              wait_for_registration(NewEve, EveNode2),
 
-              ok = rpc(asia_node, sys, resume, [C2sPid]),
+              ok = rpc:call(node(C2sPid), sys, resume, [C2sPid]),
 
 
               escalus_client:send(Alice, chat_with_seqnum(Eve, <<"Hi again from Europe1!">>)),
@@ -743,14 +834,11 @@ do_test_pm_with_ungraceful_reconnection_to_different_server(Config0, BeforeResum
 
               %% Connect another one, we hope the message would be rerouted
               NewEve = connect_from_spec(EveSpec2, Config),
-              EveNode2 = ct:get_config({hosts, mim, node}),
-              wait_for_registration(NewEve, EveNode2),
 
               BeforeResume(),
 
               %% Trigger rerouting
               ok = rpc(asia_node, sys, resume, [C2sPid]),
-              C2sPid ! resume_timeout,
 
               %% Let C2sPid to process the message and reroute (and die finally, poor little thing)
               mongoose_helper:wait_for_pid_to_die(C2sPid),
@@ -779,7 +867,7 @@ test_global_disco(Config) ->
 
 test_component_unregister(_Config) ->
     ComponentConfig = [{server, <<"localhost">>}, {host, <<"localhost">>}, {password, <<"secret">>},
-                       {port, service_port()}, {component, <<"test_service">>}],
+                       {port, component_port()}, {component, <<"test_service">>}],
 
     {Comp, Addr, _Name} = component_helper:connect_component(ComponentConfig),
     ?assertMatch({ok, _}, rpc(europe_node1, mod_global_distrib_mapping, for_domain,
@@ -791,10 +879,11 @@ test_component_unregister(_Config) ->
                             [<<"test_service.localhost">>])).
 
 test_error_on_wrong_hosts(_Config) ->
-    Opts = [{cookie, "cookie"}, {local_host, "no_such_host"}, {global_host, "localhost"}],
-    ?assertException(error, {badrpc, {'EXIT', {"no_such_host is not a member of the host list", _}}},
-                     rpc(europe_node1, gen_mod, start_module,
-                         [<<"localhost">>, mod_global_distrib, Opts])).
+    Opts = module_opts(#{local_host => <<"no_such_host">>}),
+    ?assertException(error, {badrpc, {'EXIT', {#{what := check_host_failed,
+                                                 domain := <<"no_such_host">>}, _}}},
+                     dynamic_modules:ensure_modules(node_spec(europe_node1), <<"localhost">>,
+                                                    [{mod_global_distrib, Opts}])).
 
 refresh_nodes(Config) ->
     NodesKey = ?config(nodes_key, Config),
@@ -848,7 +937,9 @@ test_messages_bounced_in_order(Config) ->
               %% Make sure all messages land in bounce storage
               delete_mapping(europe_node1, Eve),
 
-              Seq = lists:seq(1, 100),
+              wait_for_bounce_size(0),
+
+              Seq = lists:seq(1, 99),
               lists:foreach(
                 fun(I) ->
                         Stanza = escalus_stanza:chat_to(Eve, integer_to_binary(I)),
@@ -856,9 +947,17 @@ test_messages_bounced_in_order(Config) ->
                 end,
                 Seq),
 
+              wait_for_bounce_size(99),
+
               %% Restore the mapping so that bounce eventually succeeds
               ?assertEqual(undefined, get_mapping(europe_node1, Eve)),
               set_mapping(europe_node1, Eve, <<"reg1">>),
+
+              %% Test used to work if the mapping is restored while Alice was still sending the 100 stanzas.
+              %% This may actually be a race condition, and it should work like in the
+              %% test_in_order_messages_on_multiple_connections_with_bounce testcase:
+              %% Make sure that the last message is sent when the mapping is known
+              escalus_client:send(Alice, escalus_stanza:chat_to(Eve, <<"100">>)),
 
               lists:foreach(
                 fun(I) ->
@@ -888,17 +987,17 @@ test_update_senders_host(Config) ->
               = rpc(asia_node, mod_global_distrib_mapping, for_jid, [AliceJid])
       end).
 wait_for_node(Node,Jid) ->
-    mongoose_helper:wait_until(fun() -> rpc(Node, mod_global_distrib_mapping, for_jid, [Jid]) end,
-                               error,
-                               #{time_left => timer:seconds(10),
-                                 sleep_time => timer:seconds(1),
-                                 name => rpc}).
+    wait_helper:wait_until(fun() -> rpc(Node, mod_global_distrib_mapping, for_jid, [Jid]) end,
+                           error,
+                           #{time_left => timer:seconds(10),
+                             sleep_time => timer:seconds(1),
+                             name => rpc}).
 
 test_update_senders_host_by_ejd_service(Config) ->
     refresh_hosts([europe_node1, europe_node2, asia_node], "by_test_update_senders_host_by_ejd_service"),
     %% Connects to europe_node1
     ComponentConfig = [{server, <<"localhost">>}, {host, <<"localhost">>}, {password, <<"secret">>},
-                       {port, service_port()}, {component, <<"test_service">>}],
+                       {port, component_port()}, {component, <<"test_service">>}],
 
     {Comp, Addr, _Name} = component_helper:connect_component(ComponentConfig),
 
@@ -924,7 +1023,7 @@ test_update_senders_host_by_ejd_service(Config) ->
 
               hide_node(europe_node1, Config),
               {_, EuropeHost, _} = lists:keyfind(europe_node1, 1, get_hosts()),
-              trigger_rebalance(asia_node, list_to_binary(EuropeHost)),
+              trigger_rebalance(asia_node, EuropeHost),
 
               escalus:send(Eve, escalus_stanza:chat_to(Addr, <<"hi">>)),
               escalus:wait_for_stanza(Comp),
@@ -941,7 +1040,8 @@ enable_new_endpoint_on_refresh(Config) ->
     {Enabled1, _Disabled1, Pools1} = get_outgoing_connections(europe_node1, <<"reg1">>),
 
     ExtraPort = get_port(reg, gd_extra_endpoint_port),
-    NewEndpoint = enable_extra_endpoint(asia_node, europe_node1, ExtraPort, Config),
+    NewEndpoint = resolved_endpoint(ExtraPort),
+    enable_extra_endpoint(asia_node, europe_node1, ExtraPort, Config),
 
     {Enabled2, _Disabled2, Pools2} = get_outgoing_connections(europe_node1, <<"reg1">>),
 
@@ -953,6 +1053,7 @@ enable_new_endpoint_on_refresh(Config) ->
 
 disable_endpoint_on_refresh(Config) ->
     ExtraPort = get_port(reg, gd_extra_endpoint_port),
+    NewEndpoint = resolved_endpoint(ExtraPort),
     enable_extra_endpoint(asia_node, europe_node1, ExtraPort, Config),
 
     get_connection(europe_node1, <<"reg1">>),
@@ -976,17 +1077,17 @@ disable_endpoint_on_refresh(Config) ->
     [] = Disabled1,
     [NewEndpoint] = Disabled2.
 
-wait_for_connection(Config) ->
+wait_for_connection(_Config) ->
     set_endpoints(asia_node, []),
     %% Because of hosts refresher, a pool of connections to asia_node
     %% may already be present here
-    mongoose_helper:wait_until(
-                                fun () ->
-                                    try trigger_rebalance(europe_node1, <<"reg1">>), true
-                                    catch _:_ -> false end
-                                end,
-                                true,
-                                #{name => rebalance, time_left => timer:seconds(5)}),
+    wait_helper:wait_until(
+      fun () ->
+              try trigger_rebalance(europe_node1, <<"reg1">>), true
+              catch _:_ -> false end
+      end,
+      true,
+      #{name => rebalance, time_left => timer:seconds(5)}),
 
     spawn_connection_getter(europe_node1),
 
@@ -1014,11 +1115,11 @@ closed_connection_is_removed_from_disabled(_Config) ->
     {[], [_], [_]} = get_outgoing_connections(europe_node1, <<"reg1">>),
 
     % Will drop connections and prevent them from reconnecting
-    restart_receiver(asia_node, [listen_endpoint(get_port(reg, gd_supplementary_endpoint_port))]),
+    restart_receiver(asia_node, [get_port(reg, gd_supplementary_endpoint_port)]),
 
-    mongoose_helper:wait_until(fun() -> get_outgoing_connections(europe_node1, <<"reg1">>) end,
-                               {[], [], []},
-                              #{name => get_outgoing_connections}).
+    wait_helper:wait_until(fun() -> get_outgoing_connections(europe_node1, <<"reg1">>) end,
+                           {[], [], []},
+                           #{name => get_outgoing_connections}).
 
 
 %%--------------------------------------------------------------------
@@ -1035,16 +1136,27 @@ get_port(Host, Param) ->
 
 get_hosts() ->
     [
-     {europe_node1, "localhost.bis", get_port(mim, gd_endpoint_port)},
-     {europe_node2, "localhost.bis", get_port(mim2, gd_endpoint_port)},
-     {asia_node, "reg1", get_port(reg, gd_endpoint_port)}
+     {europe_node1, <<"localhost.bis">>, get_port(mim, gd_endpoint_port)},
+     {europe_node2, <<"localhost.bis">>, get_port(mim2, gd_endpoint_port)},
+     {asia_node, <<"reg1">>, get_port(reg, gd_endpoint_port)}
     ].
 
-listen_endpoint(NodeName) when is_atom(NodeName) ->
+listen_endpoint(NodeName) ->
+    endpoint(listen_port(NodeName)).
+
+listen_port(NodeName) ->
     {_, _, Port} = lists:keyfind(NodeName, 1, get_hosts()),
-    listen_endpoint(Port);
-listen_endpoint(Port) when is_integer(Port) ->
+    Port.
+
+resolved_endpoint(Port) when is_integer(Port) ->
     {{127, 0, 0, 1}, Port}.
+
+endpoint(Port) when is_integer(Port) ->
+    {"127.0.0.1", Port}.
+
+%% For dynamic_modules
+node_spec(NodeName) ->
+    #{node => ct:get_config(NodeName), timeout => timer:seconds(30)}.
 
 rpc(NodeName, M, F, A) ->
     Node = ct:get_config(NodeName),
@@ -1057,8 +1169,8 @@ hide_node(NodeName, Config) ->
 
 connect_from_spec(UserSpec, Config) ->
     {ok, User} = escalus_client:start(Config, UserSpec, <<"res1">>),
-    escalus_connection:set_filter_predicate(User, fun(S) -> not escalus_pred:is_presence(S) end),
     escalus_story:send_initial_presence(User),
+    escalus:assert(is_presence, escalus_client:wait_for_stanza(User)),
     User.
 
 chat_with_seqnum(To, Text) ->
@@ -1140,19 +1252,13 @@ iptuples_to_string([{Addr, Port} | Endps]) when is_tuple(Addr) ->
 iptuples_to_string([E | Endps]) ->
     [E | iptuples_to_string(Endps)].
 
-maybe_add_advertised_endpoints(NodeName, Opts, Config) ->
-    Endpoints = proplists:get_value(NodeName, ?config(add_advertised_endpoints, Config), []),
-    case Endpoints of
-        [] ->
-            Opts;
-        E ->
-            Connections = case lists:keyfind(connections, 1, Opts) of
-                              false -> [];
-                              C -> C
-                          end,
-            NewConnections = {connections, [{advertised_endpoints, E} | Connections]},
-            [NewConnections | Opts]
-    end.
+endpoint_opts(NodeName, ReceiverPort, Config) ->
+    Endpoints = [endpoint(ReceiverPort)],
+    AdvertisedEndpoints =
+        proplists:get_value(NodeName, ?config(add_advertised_endpoints, Config), Endpoints),
+    #{endpoints => Endpoints,
+      resolved_endpoints => [resolved_endpoint(ReceiverPort)],
+      advertised_endpoints => AdvertisedEndpoints}.
 
 mock_inet_on_each_node() ->
     Nodes = lists:map(fun({NodeName, _, _}) -> ct:get_config(NodeName) end, get_hosts()),
@@ -1163,13 +1269,14 @@ execute_on_each_node(M, F, A) ->
     lists:map(fun({NodeName, _, _}) -> rpc(NodeName, M, F, A) end, get_hosts()).
 
 mock_inet() ->
-    %% We don't want to mock inet module itself to avoid strange networking issues
-    meck:new(mod_global_distrib_utils, [non_strict, passthrough, unstick]),
-    meck:expect(mod_global_distrib_utils, getaddrs, fun(_, inet) -> {ok, [{127, 0, 0, 1}]};
-                                                       (_, inet6) -> {error, "No ipv6 address"} end).
+    %% We can only mock MongooseIM modules on mim1.
+    %% Otherwise meck will freeze calling cover_server process.
+    meck:new(inet, [non_strict, passthrough, unstick]),
+    meck:expect(inet, getaddrs, fun(_, inet) -> {ok, [{127, 0, 0, 1}]};
+                                   (_, inet6) -> {error, "No ipv6 address"} end).
 
 unmock_inet(_Pids) ->
-    execute_on_each_node(meck, unload, [mod_global_distrib_utils]).
+    execute_on_each_node(meck, unload, [inet]).
 
 out_connection_sups(Node) ->
     Children = rpc(Node, supervisor, which_children, [mod_global_distrib_outgoing_conns_sup]),
@@ -1195,23 +1302,19 @@ spawn_connection_getter(SenderNode) ->
                   TestPid ! Conn
           end).
 
-enable_extra_endpoint(ListenNode, SenderNode, Port, Config) ->
-    OriginalEndpoint = listen_endpoint(ListenNode),
-    NewEndpoint = {{127, 0, 0, 1}, Port},
-
-    restart_receiver(ListenNode, [NewEndpoint, OriginalEndpoint]),
-    refresh_mappings(ListenNode, "by_enable_extra_endpoint,port=" ++ integer_to_list(Port)),
-    trigger_rebalance(SenderNode, <<"reg1">>),
-
-    NewEndpoint.
+enable_extra_endpoint(ListenNode, SenderNode, Port, _Config) ->
+    restart_receiver(ListenNode, [Port, listen_port(ListenNode)]),
+    set_endpoints(ListenNode, [Port, listen_port(ListenNode)]),
+    trigger_rebalance(SenderNode, <<"reg1">>).
 
 get_connection(SenderNode, ToDomain) ->
     rpc(SenderNode, mod_global_distrib_outgoing_conns_sup, get_connection, [ToDomain]).
 
 hide_extra_endpoint(ListenNode) ->
-    set_endpoints(ListenNode, [listen_endpoint(ListenNode)]).
+    set_endpoints(ListenNode, [listen_port(ListenNode)]).
 
-set_endpoints(ListenNode, Endpoints) ->
+set_endpoints(ListenNode, Ports) ->
+    Endpoints = [endpoint(Port) || Port <- Ports],
     {ok, _} = rpc(ListenNode, mod_global_distrib_mapping_redis, set_endpoints, [Endpoints]).
 
 get_outgoing_connections(NodeName, DestinationDomain) ->
@@ -1226,14 +1329,16 @@ get_outgoing_connections(NodeName, DestinationDomain) ->
     {Enabled, Disabled, Pools}.
 
 restart_receiver(NodeName) ->
-    restart_receiver(NodeName, [listen_endpoint(NodeName)]).
+    restart_receiver(NodeName, [listen_port(NodeName)]).
 
-restart_receiver(NodeName, NewEndpoints) ->
-    OldOpts = rpc(NodeName, gen_mod, get_module_opts,
-                  [<<"localhost">>, mod_global_distrib_receiver]),
-    NewOpts = lists:keyreplace(endpoints, 1, OldOpts, {endpoints, NewEndpoints}),
-    {ok, _} = rpc(NodeName, gen_mod, reload_module,
-             [<<"localhost">>, mod_global_distrib_receiver, NewOpts]).
+restart_receiver(NodeName, NewPorts) ->
+    OldOpts = #{connections := OldConnOpts} = rpc(NodeName, gen_mod, get_module_opts,
+                                                  [<<"localhost">>, mod_global_distrib_receiver]),
+    NewConnOpts = OldConnOpts#{endpoints := [endpoint(Port) || Port <- NewPorts],
+                               resolved_endpoints := [resolved_endpoint(Port) || Port <- NewPorts]},
+    NewOpts = OldOpts#{connections := NewConnOpts},
+    Node = node_spec(NodeName),
+    dynamic_modules:restart(Node, <<"localhost">>, mod_global_distrib_receiver, NewOpts).
 
 trigger_rebalance(NodeName, DestinationDomain) when is_binary(DestinationDomain) ->
     %% To ensure that the manager exists,
@@ -1248,23 +1353,11 @@ trigger_rebalance(NodeName, DestinationDomain) when is_binary(DestinationDomain)
 %% -----------------------------------------------------------------------
 %% Escalus-related helpers
 
+%% Receive messages with Bodies in any order, skipping presences from stream resumption
 user_receives(User, Bodies) ->
-    ExpectedLength = length(Bodies),
-    Messages = escalus_client:wait_for_stanzas(User, ExpectedLength),
-    SortedMessages = order_by_seqnum(Messages),
-    case length(Messages) of
-        ExpectedLength ->
-            Checks = [escalus_pred:is_chat_message(Body, Stanza) || {Body, Stanza} <- lists:zip(Bodies, SortedMessages)],
-            case lists:all(fun(Check) -> Check end, Checks) of
-                true ->
-                    ok;
-                false ->
-                    ct:fail({user_receives_failed, {wanted, Bodies}, {received, SortedMessages}, {check, Checks}})
-            end;
-        _ ->
-            ct:fail({user_receives_not_enough, {wanted, Bodies}, {received, SortedMessages}})
-    end.
-
+    Opts = #{pred => fun(Stanza) -> not escalus_pred:is_presence(Stanza) end},
+    Checks = [fun(Stanza) -> escalus_pred:is_chat_message(Body, Stanza) end || Body <- Bodies],
+    escalus:assert_many(Checks, [escalus_connection:receive_stanza(User, Opts) || _ <- Bodies]).
 
 %% -----------------------------------------------------------------------
 %% Refreshing helpers
@@ -1288,32 +1381,22 @@ connect_steps_with_sm() ->
 bare_client(Client) ->
     Client#client{jid = escalus_utils:get_short_jid(Client)}.
 
-service_port() ->
-    ct:get_config({hosts, mim, service_port}).
+component_port() ->
+    ct:get_config({hosts, mim, component_port}).
 
+wait_for_bounce_size(ExpectedSize) ->
+    F = fun(#{size := Size}) -> Size =:= ExpectedSize end,
+    instrument_helper:wait_and_assert_new(mod_global_distrib_bounce_queue, #{}, F).
 
 %% -----------------------------------------------------------------------
 %% Waiting helpers
 
 wait_for_domain(Node, Domain) ->
     F = fun() ->
-        {ok, Domains} = rpc:call(Node, mod_global_distrib_mapping, all_domains, []),
-        lists:member(Domain, Domains)
+                Domains = rpc:call(Node, mod_global_distrib_mapping, all_domains, []),
+                lists:member(Domain, Domains)
         end,
-    mongoose_helper:wait_until(F, true, #{name => {wait_for_domain, Node, Domain}}).
-
-%% We receive presence BEFORE session is registered in ejabberd_sm.
-%% So, to ensure that we processed do_open_session completely, let's send a "ping".
-%% by calling the c2s process.
-%% That call would only return, when all messages in erlang message queue
-%% are processed.
-wait_for_registration(Client, Node) ->
-    RPCSpec = #{node => Node},
-    mongoose_helper:wait_until(fun() -> is_pid(mongoose_helper:get_session_pid(Client, RPCSpec)) end, true,
-                               #{name => wait_for_session}),
-    C2sPid = mongoose_helper:get_session_pid(Client, RPCSpec),
-    rpc:call(node(C2sPid), ejabberd_c2s, get_info, [C2sPid]),
-    ok.
+    wait_helper:wait_until(F, true, #{name => {wait_for_domain, Node, Domain}}).
 
 
 %% -----------------------------------------------------------------------
@@ -1327,7 +1410,7 @@ receiver_ports(Hosts) ->
 
 wait_for_can_connect_to_port(Port) ->
     Opts = #{time_left => timer:seconds(30), sleep_time => 1000, name => {can_connect_to_port, Port}},
-    mongoose_helper:wait_until(fun() -> can_connect_to_port(Port) end, true, Opts).
+    wait_helper:wait_until(fun() -> can_connect_to_port(Port) end, true, Opts).
 
 can_connect_to_port(Port) ->
     case gen_tcp:connect("127.0.0.1", Port, []) of
@@ -1339,14 +1422,41 @@ can_connect_to_port(Port) ->
             false
     end.
 
+%% Prints information about the active sessions
+print_sessions_debug_info(NodeName) ->
+    Node = rpc(NodeName, erlang, node, []),
+    Nodes = rpc(NodeName, erlang, nodes, []),
+    ct:log("name=~p, erlang_node=~p, other_nodes=~p", [NodeName, Node, Nodes]),
+
+    Children = rpc(NodeName, supervisor, which_children, [mongoose_c2s_sup]),
+    ct:log("C2S processes under a supervisour ~p", [Children]),
+
+    Sessions = rpc(NodeName, ejabberd_sm, get_full_session_list, []),
+    ct:log("C2S processes in the session manager ~p", [Sessions]),
+
+    Sids = [element(2, Session) || Session <- Sessions],
+    Pids = [Pid || {_, Pid} <- Sids],
+    PidNodes = [{Pid, node(Pid)} || Pid <- Pids],
+    ct:log("Pids on nodes ~p", [PidNodes]),
+
+    Info = [{Pid, rpc:call(N, erlang, process_info, [Pid])} || {Pid, N} <- PidNodes],
+    ct:log("Processes info ~p", [Info]),
+    ok.
+
 %% -----------------------------------------------------------------------
 %% Custom log levels for GD modules during the tests
 
+%% Set it to true, if you need to debug GD on CI
+detailed_logging() ->
+    false.
+
 enable_logging() ->
-    mim_loglevel:enable_logging(test_hosts(), custom_loglevels()).
+    detailed_logging() andalso
+        mim_loglevel:enable_logging(test_hosts(), custom_loglevels()).
 
 disable_logging() ->
-    mim_loglevel:disable_logging(test_hosts(), custom_loglevels()).
+    detailed_logging() andalso
+        mim_loglevel:disable_logging(test_hosts(), custom_loglevels()).
 
 custom_loglevels() ->
     %% for "s2s connection to muc.localhost not found" debugging
@@ -1362,33 +1472,14 @@ custom_loglevels() ->
      {mod_global_distrib_connection, debug},
     %% to check if gc or refresh is triggered
      {mod_global_distrib_server_mgr, info},
-   %% To debug incoming connections
+    %% To debug incoming connections
 %    {mod_global_distrib_receiver, info},
-   %% to debug global session set/delete
-     {mod_global_distrib_mapping, debug}
+    %% to debug global session set/delete
+     {mod_global_distrib_mapping, debug},
+    %% To log make_error_reply calls
+     {jlib, debug},
+    %% to log sm_route
+     {ejabberd_sm, debug}
     ].
 
 test_hosts() -> [mim, mim2, reg].
-
-
-%% -----------------------------------------------------------------------
-%% Module loading/restoration with multi node support
-
-loaded_modules_with_opts(NodeName, VirtHost) ->
-    rpc(NodeName, gen_mod, loaded_modules_with_opts, [VirtHost]).
-
-save_modules(NodeName, VirtHosts) ->
-    [{{old_mods, NodeName, VirtHost}, loaded_modules_with_opts(NodeName, VirtHost)}
-     || VirtHost <- VirtHosts].
-
-restore_modules(NodeName, VirtHost, Config) ->
-    CurrentMods = loaded_modules_with_opts(NodeName, VirtHost),
-    case ?config({old_mods, NodeName, VirtHost}, Config) of
-        OldMods when is_list(OldMods) ->
-            rpc(NodeName, gen_mod_deps, replace_modules,
-                [VirtHost, CurrentMods, OldMods]);
-        Other ->
-            ct:fail({replace_modules_failed, NodeName, VirtHost, Other})
-    end.
-
-%% -----------------------------------------------------------------------

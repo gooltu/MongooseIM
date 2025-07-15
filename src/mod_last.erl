@@ -32,89 +32,100 @@
 -behaviour(gen_mod).
 -behaviour(mongoose_module_metrics).
 
--export([
-         start/2,
+%% Gen_mod callbacks
+-export([start/2,
          stop/1,
-         process_local_iq/4,
-         process_sm_iq/4,
-         on_presence_update/5,
-         store_last_info/4,
-         get_last_info/2,
-         count_active_users/2,
+         hooks/1,
+         config_spec/0,
+         supported_features/0]).
+
+%% IQ and hook handlers
+-export([user_receive_iq/3,
+         process_local_iq/5,
+         process_sm_iq/5,
          remove_user/3,
-         session_cleanup/5
-        ]).
+         unset_presence/3,
+         session_cleanup/3,
+         sessions_cleanup/3,
+         remove_domain/3]).
+
+%% API
+-export([store_last_info/5,
+         get_last_info/3,
+         count_active_users/3]).
 
 -export([config_metrics/1]).
 
 -include("mongoose.hrl").
+-include("mongoose_config_spec.hrl").
 
 -include("jlib.hrl").
-
--include("mod_privacy.hrl").
--include("mod_last.hrl").
 
 %% ------------------------------------------------------------------
 %% Backend callbacks
 
--callback init(Host, Opts) -> ok when
-    Host    :: jid:server(),
-    Opts    :: list().
+-export_type([timestamp/0, status/0]).
 
--callback get_last(LUser, LServer) -> Result when
-    LUser   :: jid:luser(),
-    LServer :: jid:lserver(),
-    Reason  :: term(),
-    Result  :: {ok, non_neg_integer(), binary()} | {error, Reason} | not_found.
+-type timestamp() :: non_neg_integer().
+-type status() :: binary().
 
--callback count_active_users(LServer, Timestamp) -> Result when
-    LServer :: jid:lserver(),
-    Timestamp :: non_neg_integer(),
-    Result :: non_neg_integer().
+-spec start(mongooseim:host_type(), gen_mod:module_opts()) -> ok.
+start(HostType, #{iqdisc := IQDisc} = Opts) ->
+    mod_last_backend:init(HostType, Opts),
+    [gen_iq_handler:add_iq_handler_for_domain(HostType, ?NS_LAST, Component, Fn, #{}, IQDisc) ||
+        {Component, Fn} <- iq_handlers()],
+    ok.
 
--callback set_last_info(LUser, LServer, Timestamp, Status) -> Result when
-    LUser   :: jid:luser(),
-    LServer :: jid:lserver(),
-    Timestamp :: non_neg_integer(),
-    Status  :: binary(),
-    Result  :: ok | {error, term()}.
+-spec stop(mongooseim:host_type()) -> ok.
+stop(HostType) ->
+    [gen_iq_handler:remove_iq_handler_for_domain(HostType, ?NS_LAST, Component) ||
+        {Component, _Fn} <- iq_handlers()],
+    gen_hook:delete_handlers(hooks(HostType)).
 
--callback remove_user(LUser, LServer) -> ok | {error, term()} when
-    LUser   :: jid:luser(),
-    LServer :: jid:lserver().
+iq_handlers() ->
+    [{ejabberd_local, fun ?MODULE:process_local_iq/5},
+     {ejabberd_sm, fun ?MODULE:process_sm_iq/5}].
 
--spec start(jid:server(), list()) -> 'ok'.
-start(Host, Opts) ->
-    IQDisc = gen_mod:get_opt(iqdisc, Opts, one_queue),
+-spec hooks(mongooseim:host_type()) -> gen_hook:hook_list().
+hooks(HostType) ->
+    [{remove_user, HostType, fun ?MODULE:remove_user/3, #{}, 50},
+     {anonymous_purge, HostType, fun ?MODULE:remove_user/3, #{}, 50},
+     {unset_presence, HostType, fun ?MODULE:unset_presence/3, #{}, 50},
+     {session_cleanup, HostType, fun ?MODULE:session_cleanup/3, #{}, 50},
+     {sessions_cleanup, HostType, fun ?MODULE:sessions_cleanup/3, #{}, 50},
+     {remove_domain, HostType, fun ?MODULE:remove_domain/3, #{}, 50}
+    | c2s_hooks(HostType) ].
 
-    gen_mod:start_backend_module(?MODULE, Opts, [get_last, set_last_info]),
-    mod_last_backend:init(Host, Opts),
+-spec c2s_hooks(mongooseim:host_type()) -> gen_hook:hook_list(mongoose_c2s_hooks:fn()).
+c2s_hooks(HostType) ->
+    [
+     {user_receive_iq, HostType, fun ?MODULE:user_receive_iq/3, #{}, 50}
+    ].
 
-    gen_iq_handler:add_iq_handler(ejabberd_local, Host,
-        ?NS_LAST, ?MODULE, process_local_iq, IQDisc),
-    gen_iq_handler:add_iq_handler(ejabberd_sm, Host,
-        ?NS_LAST, ?MODULE, process_sm_iq, IQDisc),
-    ejabberd_hooks:add(remove_user, Host, ?MODULE, remove_user, 50),
-    ejabberd_hooks:add(anonymous_purge_hook, Host, ?MODULE, remove_user, 50),
-    ejabberd_hooks:add(unset_presence_hook, Host, ?MODULE, on_presence_update, 50),
-    ejabberd_hooks:add(session_cleanup, Host, ?MODULE, session_cleanup, 50).
+%%%
+%%% config_spec
+%%%
 
--spec stop(jid:server()) -> ok.
-stop(Host) ->
-    ejabberd_hooks:delete(remove_user, Host, ?MODULE, remove_user, 50),
-    ejabberd_hooks:delete(anonymous_purge_hook, Host, ?MODULE, remove_user, 50),
-    ejabberd_hooks:delete(unset_presence_hook, Host, ?MODULE, on_presence_update, 50),
-    ejabberd_hooks:delete(session_cleanup, Host, ?MODULE, session_cleanup, 50),
-    gen_iq_handler:remove_iq_handler(ejabberd_local, Host, ?NS_LAST),
-    gen_iq_handler:remove_iq_handler(ejabberd_sm, Host, ?NS_LAST).
+-spec config_spec() -> mongoose_config_spec:config_section().
+config_spec() ->
+    #section{
+       items = #{<<"iqdisc">> => mongoose_config_spec:iqdisc(),
+                 <<"backend">> => #option{type = atom,
+                                          validate = {module, mod_last}}
+                },
+       defaults = #{<<"iqdisc">> => one_queue,
+                    <<"backend">> => mnesia
+                   }
+      }.
+
+supported_features() -> [dynamic_domains].
 
 %%%
 %%% Uptime of ejabberd node
 %%%
--spec process_local_iq(jid:jid(), jid:jid(), mongoose_acc:t(), jlib:iq())
+-spec process_local_iq(mongoose_acc:t(), jid:jid(), jid:jid(), jlib:iq(), map())
         -> {mongoose_acc:t(), jlib:iq()}.
-process_local_iq(_From, _To, Acc,
-    #iq{type = Type, sub_el = SubEl} = IQ) ->
+process_local_iq(Acc, _From, _To, #iq{type = Type, sub_el = SubEl} = IQ, _Extra) ->
     case Type of
         set ->
             {Acc, IQ#iq{type = error, sub_el = [SubEl, mongoose_xmpp_errors:not_allowed()]}};
@@ -123,63 +134,54 @@ process_local_iq(_From, _To, Acc,
             {Acc, IQ#iq{type = result,
                 sub_el =
                 [#xmlel{name = <<"query">>,
-                    attrs =
-                    [{<<"xmlns">>, ?NS_LAST},
-                        {<<"seconds">>,
-                            integer_to_binary(Sec)}],
+                    attrs = #{<<"xmlns">> => ?NS_LAST,
+                              <<"seconds">> => integer_to_binary(Sec)},
                     children = []}]}}
     end.
 
 -spec get_node_uptime() -> non_neg_integer().
 get_node_uptime() ->
-    case ejabberd_config:get_local_option(node_start) of
-        {node_start, Seconds} when is_integer(Seconds) ->
+    case mongoose_config:lookup_opt(node_start) of
+        {ok, {node_start, Seconds}} ->
             erlang:system_time(second) - Seconds;
-        _Undefined ->
+        {error, not_found} ->
             trunc(element(1, erlang:statistics(wall_clock))/1000)
     end.
 
 %%%
 %%% Serve queries about user last online
 %%%
--spec process_sm_iq(jid:jid(), jid:jid(), mongoose_acc:t(), jlib:iq()) ->
+-spec process_sm_iq(mongoose_acc:t(), jid:jid(), jid:jid(), jlib:iq(), map()) ->
     {mongoose_acc:t(), jlib:iq()}.
-process_sm_iq(_From, _To, Acc, #iq{type = set, sub_el = SubEl} = IQ) ->
+process_sm_iq(Acc, _From, _To, #iq{type = set, sub_el = SubEl} = IQ, _Extra) ->
     {Acc, IQ#iq{type = error, sub_el = [SubEl, mongoose_xmpp_errors:not_allowed()]}};
-process_sm_iq(From, To, Acc, #iq{type = get, sub_el = SubEl} = IQ) ->
-    User = To#jid.luser,
-    Server = To#jid.lserver,
-    {Subscription, _Groups} =
-    mongoose_hooks:roster_get_jid_info(Server,
-                                       {none, []},
-                                       User, From),
-    MutualSubscription = Subscription == both,
-    RequesterSubscribedToTarget = Subscription == from,
-    QueryingSameUsersLast = (From#jid.luser == To#jid.luser) and
-                            (From#jid.lserver == To#jid.lserver),
-    case MutualSubscription or RequesterSubscribedToTarget or QueryingSameUsersLast of
+process_sm_iq(Acc, From, To, #iq{type = get, sub_el = SubEl} = IQ, _Extra) ->
+    HostType = mongoose_acc:host_type(Acc),
+    case can_respond(HostType, From, To) of
         true ->
-            UserListRecord = mongoose_hooks:privacy_get_user_list(Server,
-                                                                  #userlist{},
-                                                                  User),
-            ok,
-            {Acc1, Res} = mongoose_privacy:privacy_check_packet(Acc, Server, User,
-                                                             UserListRecord, To, From,
-                                                             out),
-            {Acc1, make_response(IQ, SubEl, To, Res)};
+            UserListRecord = mongoose_hooks:privacy_get_user_list(HostType, To),
+            {Res, Acc1} = mongoose_privacy:privacy_check_packet(Acc, To, UserListRecord, To, From, out),
+            {Acc1, make_response(HostType, IQ, SubEl, To, Res)};
         false ->
             {Acc, IQ#iq{type = error, sub_el = [SubEl, mongoose_xmpp_errors:forbidden()]}}
     end.
 
--spec make_response(jlib:iq(), SubEl :: 'undefined' | [exml:element()],
+can_respond(HostType, From, To) ->
+    {Subscription, _Groups} = mongoose_hooks:roster_get_jid_info(HostType, To, From),
+    MutualSubscription = Subscription =:= both,
+    RequesterSubscribedToTarget = Subscription =:= from,
+    QueryingSameUsersLast = jid:are_bare_equal(From, To),
+    MutualSubscription or RequesterSubscribedToTarget or QueryingSameUsersLast.
+
+-spec make_response(mongooseim:host_type(), jlib:iq(), SubEl :: 'undefined' | [exml:element()],
                     jid:jid(), allow | deny) -> jlib:iq().
-make_response(IQ, SubEl, _, deny) ->
+make_response(_HostType, IQ, SubEl, _, deny) ->
     IQ#iq{type = error, sub_el = [SubEl, mongoose_xmpp_errors:forbidden()]};
-make_response(IQ, SubEl, JID, allow) ->
+make_response(HostType, IQ, SubEl, JID, allow) ->
     #jid{luser = LUser, lserver = LServer} = JID,
     case ejabberd_sm:get_user_resources(JID) of
         [] ->
-            case get_last(LUser, LServer) of
+            case get_last(HostType, LUser, LServer) of
                 {error, _Reason} ->
                     IQ#iq{type = error,
                         sub_el = [SubEl, mongoose_xmpp_errors:internal_server_error()]};
@@ -192,66 +194,143 @@ make_response(IQ, SubEl, JID, allow) ->
                     IQ#iq{type = result,
                         sub_el =
                         [#xmlel{name = <<"query">>,
-                            attrs =
-                            [{<<"xmlns">>, ?NS_LAST},
-                                {<<"seconds">>,
-                                    integer_to_binary(Sec)}],
-                            children = [{xmlcdata, Status}]}]}
+                            attrs = #{<<"xmlns">> => ?NS_LAST,
+                                      <<"seconds">> => integer_to_binary(Sec)},
+                            children = [#xmlcdata{content = Status}]}]}
             end;
         _ ->
             IQ#iq{type = result,
                 sub_el =
                 [#xmlel{name = <<"query">>,
-                    attrs =
-                    [{<<"xmlns">>, ?NS_LAST},
-                        {<<"seconds">>, <<"0">>}],
-                    children = []}]}
+                        attrs = #{<<"xmlns">> => ?NS_LAST,
+                                  <<"seconds">> => <<"0">>}}]}
     end.
 
-get_last(LUser, LServer) ->
-    mod_last_backend:get_last(LUser, LServer).
-
--spec count_active_users(jid:lserver(), non_neg_integer()) -> non_neg_integer().
-count_active_users(LServer, Timestamp) ->
-    mod_last_backend:count_active_users(LServer, Timestamp).
-
--spec on_presence_update(map(), jid:luser(), jid:lserver(), jid:lresource(),
-                         Status :: binary()) -> map() | {error, term()}.
-on_presence_update(Acc, LUser, LServer, _Resource, Status) ->
-    TimeStamp = erlang:system_time(second),
-    case store_last_info(LUser, LServer, TimeStamp, Status) of
-        ok -> Acc;
-        E -> E
-    end.
-
--spec store_last_info(jid:luser(), jid:lserver(), non_neg_integer(),
-                      Status :: binary()) -> ok | {error, term()}.
-store_last_info(LUser, LServer, TimeStamp, Status) ->
-    mod_last_backend:set_last_info(LUser, LServer, TimeStamp, Status).
-
--spec get_last_info(jid:luser(), jid:lserver())
-        -> 'not_found' | {'ok', integer(), binary()}.
-get_last_info(LUser, LServer) ->
-    case get_last(LUser, LServer) of
+-spec get_last_info(mongooseim:host_type(), jid:luser(), jid:lserver())
+        -> 'not_found' | {'ok', timestamp(), status()}.
+get_last_info(HostType, LUser, LServer) ->
+    case get_last(HostType, LUser, LServer) of
         {error, _Reason} -> not_found;
         Res -> Res
     end.
 
--spec remove_user(mongoose_acc:t(), jid:user(), jid:server()) -> mongoose_acc:t().
-remove_user(Acc, User, Server) ->
-    LUser = jid:nodeprep(User),
-    LServer = jid:nameprep(Server),
-    R = mod_last_backend:remove_user(LUser, LServer),
-    mongoose_lib:log_if_backend_error(R, ?MODULE, ?LINE, {Acc, User, Server}),
+%%%
+%%% Hook handlers
+%%%
+
+-spec remove_user(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: mongoose_acc:t(),
+    Params :: #{jid := jid:jid()},
+    Extra :: gen_hook:extra().
+remove_user(Acc, #{jid := #jid{luser = LUser, lserver = LServer}}, #{host_type := HostType}) ->
+    R = mod_last_backend:remove_user(HostType, LUser, LServer),
+    mongoose_lib:log_if_backend_error(R, ?MODULE, ?LINE, {Acc, LUser, LServer}),
+    {ok, Acc}.
+
+-spec remove_domain(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: mongoose_hooks:simple_acc(),
+    Params :: #{domain := jid:lserver()},
+    Extra :: gen_hook:extra().
+remove_domain(Acc, #{domain := Domain}, #{host_type := HostType}) ->
+    mod_last_backend:remove_domain(HostType, Domain),
+    {ok, Acc}.
+
+-spec user_receive_iq(mongoose_acc:t(), mongoose_c2s_hooks:params(), gen_hook:extra()) ->
+    mongoose_c2s_hooks:result().
+user_receive_iq(Acc, _Params, _Extra) ->
+    case mongoose_iq:info(Acc) of
+        {#iq{type = get, xmlns = ?NS_LAST}, Acc1} ->
+            maybe_forward_last(Acc1);
+        {_, Acc1} ->
+            {ok, Acc1}
+    end.
+
+-spec maybe_forward_last(mongoose_acc:t()) -> mongoose_c2s_hooks:result().
+maybe_forward_last(Acc) ->
+    HostType = mongoose_acc:host_type(Acc),
+    {From, To, _} = mongoose_acc:packet(Acc),
+    case can_respond(HostType, From, To) of
+        true ->
+            {ok, Acc};
+        false ->
+            {Acc1, Err} = jlib:make_error_reply(Acc, mongoose_xmpp_errors:forbidden()),
+            ejabberd_router:route(To, From, Acc1, Err),
+            {stop, Acc}
+    end.
+
+-spec unset_presence(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: mongoose_acc:t(),
+    Params :: #{jid := jid:jid(), status := status()},
+    Extra :: gen_hook:extra().
+unset_presence(Acc, #{jid := #jid{luser = LUser, lserver = LServer}, status := Status}, _) ->
+    {ok, store_last_info(Acc, LUser, LServer, Status)}.
+
+-spec session_cleanup(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: mongoose_acc:t(),
+    Params :: #{jid := jid:jid()},
+    Extra :: gen_hook:extra().
+session_cleanup(Acc, #{jid := #jid{luser = LUser, lserver = LServer}}, _) ->
+    {ok, session_cleanup(Acc, LUser, LServer, <<>>)}.
+
+-spec sessions_cleanup(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: map(),
+    Params :: #{sessions := [ejabberd_sm:session()]},
+    Extra :: gen_hook:extra().
+sessions_cleanup(Acc = #{host_type := HostType}, #{sessions := Sessions}, _) ->
+    mod_last_backend:sessions_cleanup(HostType, Sessions),
+    {ok, Acc}.
+
+-spec store_last_info(mongoose_acc:t(), jid:luser(), jid:lserver(), status()) -> mongoose_acc:t().
+store_last_info(Acc, LUser, LServer, Status) ->
+    HostType = mongoose_acc:host_type(Acc),
+    TimeStamp = erlang:system_time(second),
+    store_last_info(HostType, LUser, LServer, TimeStamp, Status),
     Acc.
 
-%% TODO fix
--spec session_cleanup(Acc :: map(), LUser :: jid:luser(), LServer :: jid:lserver(),
-                      LResource :: jid:lresource(), SID :: ejabberd_sm:sid()) -> any().
-session_cleanup(Acc, LUser, LServer, LResource, _SID) ->
-    on_presence_update(Acc, LUser, LServer, LResource, <<>>).
+-spec session_cleanup(mongoose_acc:t(), jid:luser(), jid:lserver(), status()) -> mongoose_acc:t().
+session_cleanup(Acc, LUser, LServer, Status) ->
+    HostType = mongoose_acc:host_type(Acc),
+    TimeStamp = erlang:system_time(second),
+    session_cleanup(HostType, LUser, LServer, TimeStamp, Status),
+    Acc.
 
-config_metrics(Host) ->
-    OptsToReport = [{backend, mnesia}], %list of tuples {option, defualt_value}
-    mongoose_module_metrics:opts_for_module(Host, ?MODULE, OptsToReport).
+-spec store_last_info(mongooseim:host_type(), jid:luser(), jid:lserver(),
+                      timestamp(), status()) -> ok.
+store_last_info(HostType, LUser, LServer, TimeStamp, Status) ->
+    case mod_last_backend:set_last_info(HostType, LUser, LServer, TimeStamp, Status) of
+        {error, Reason} ->
+            ?LOG_ERROR(#{what => set_last_info_failed,
+                         text => <<"Unexpected error while storing mod_last information">>,
+                         user => LUser, server => LServer,
+                         timestamp => TimeStamp, status => Status,
+                         reason => Reason});
+        ok ->
+            ok
+    end.
 
+-spec session_cleanup(mongooseim:host_type(), jid:luser(), jid:lserver(),
+                      timestamp(), status()) -> ok.
+session_cleanup(HostType, LUser, LServer, TimeStamp, Status) ->
+    case mod_last_backend:session_cleanup(HostType, LUser, LServer, TimeStamp, Status) of
+        {error, Reason} ->
+            ?LOG_ERROR(#{what => session_cleanup_failed,
+                         text => <<"Unexpected error while storing mod_last information">>,
+                         user => LUser, server => LServer,
+                         timestamp => TimeStamp, status => Status,
+                         reason => Reason});
+        ok ->
+            ok
+    end.
+
+-spec get_last(mongooseim:host_type(), jid:luser(), jid:lserver()) ->
+    {ok, timestamp(), status()} | {error, term()} | not_found.
+get_last(HostType, LUser, LServer) ->
+    mod_last_backend:get_last(HostType, LUser, LServer).
+
+-spec count_active_users(mongooseim:host_type(), jid:lserver(), timestamp()) -> non_neg_integer().
+count_active_users(HostType, LServer, Timestamp) ->
+    mod_last_backend:count_active_users(HostType, LServer, Timestamp).
+
+-spec config_metrics(mongooseim:host_type()) -> [{gen_mod:opt_key(), gen_mod:opt_value()}].
+config_metrics(HostType) ->
+    mongoose_module_metrics:opts_for_module(HostType, ?MODULE, [backend]).

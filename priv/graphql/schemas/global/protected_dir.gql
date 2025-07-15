@@ -1,0 +1,11 @@
+"Marks the resource to be accessed only by authorized requests"
+directive @protected (
+  type: ProtectedType = DEFAULT
+  args: [String!] = []
+) on FIELD_DEFINITION | OBJECT | INTERFACE
+
+enum ProtectedType{
+  DEFAULT
+  DOMAIN
+  GLOBAL
+}

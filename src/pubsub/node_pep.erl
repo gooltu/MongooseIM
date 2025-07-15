@@ -39,8 +39,10 @@
          unsubscribe_node/4, node_to_path/1,
          get_entity_affiliations/2, get_entity_affiliations/3,
          get_entity_subscriptions/2, get_entity_subscriptions/4,
-         should_delete_when_owner_removed/0
-         ]).
+         should_delete_when_owner_removed/0, check_publish_options/2
+        ]).
+
+-ignore_xref([get_entity_affiliations/3, get_entity_subscriptions/4, check_publish_options/2]).
 
 based_on() ->  node_flat.
 
@@ -82,6 +84,7 @@ features() ->
         <<"outcast-affiliation">>,
         <<"persistent-items">>,
         <<"publish">>,
+        <<"publish-options">>,
         <<"purge-nodes">>,
         <<"retract-items">>,
         <<"retrieve-affiliations">>,
@@ -89,12 +92,33 @@ features() ->
         <<"retrieve-subscriptions">>,
         <<"subscribe">>].
 
+-spec check_publish_options(#{binary() => [binary()]} | invalid_form, #{binary() => [binary()]}) ->
+    boolean().
+check_publish_options(invalid_form, _) ->
+    true;
+check_publish_options(PublishOptions, NodeOptions) ->
+    F = fun(Key, Value) ->
+            case string:split(Key, "#") of
+                [<<"pubsub">>, Key2] ->
+                    compare_values(Value, maps:get(Key2, NodeOptions, null));
+                _ -> true
+            end
+        end,
+    maps:size(maps:filter(F, PublishOptions)) =/= 0.
+
+-spec compare_values([binary()], [binary()] | null) -> boolean().
+compare_values(_, null) ->
+    true;
+compare_values(Value1, Value2) ->
+    lists:sort(Value1) =/= lists:sort(Value2).
+
 create_node_permission(Host, _ServerHost, _Node, _ParentNode,
                        #jid{ luser = <<>>, lserver = Host, lresource = <<>> }, _Access) ->
     {result, true}; % pubsub service always allowed
 create_node_permission(Host, ServerHost, _Node, _ParentNode,
                        #jid{ luser = User, lserver = Server } = Owner, Access) ->
-    case acl:match_rule(ServerHost, Access, Owner) of
+    {ok, HostType} = mongoose_domain_api:get_domain_host_type(ServerHost),
+    case acl:match_rule(HostType, ServerHost, Access, Owner) of
         allow ->
             case Host of
                 {User, Server, _} -> {result, true};
@@ -121,7 +145,8 @@ get_entity_affiliations(Host, {_, D, _} = Owner) ->
 
 get_entity_affiliations(Host, D, Owner) ->
     {ok, States} = mod_pubsub_db_backend:get_states_by_bare(Owner),
-    NodeTree = mod_pubsub:tree(Host),
+    HT = mod_pubsub:host_to_host_type(Host),
+    NodeTree = mod_pubsub:tree(HT),
     Reply = lists:foldl(fun (#pubsub_state{stateid = {_, N}, affiliation = A}, Acc) ->
                     case gen_pubsub_nodetree:get_node(NodeTree, N) of
                         #pubsub_node{nodeid = {{_, D, _}, _}} = Node -> [{Node, A} | Acc];
@@ -146,7 +171,8 @@ get_entity_subscriptions(Host, D, R, Owner) ->
                      {ok, States0} = mod_pubsub_db_backend:get_states_by_bare_and_full(LOwner),
                      States0
              end,
-    NodeTree = mod_pubsub:tree(Host),
+    HT = mod_pubsub:host_to_host_type(Host),
+    NodeTree = mod_pubsub:tree(HT),
     Reply = lists:foldl(fun (#pubsub_state{stateid = {J, N}, subscriptions = Ss}, Acc) ->
                     case gen_pubsub_nodetree:get_node(NodeTree, N) of
                         #pubsub_node{nodeid = {{_, D, _}, _}} = Node ->
@@ -180,7 +206,7 @@ should_delete_when_owner_removed() -> true.
 %% @doc Check mod_caps is enabled, otherwise show warning.
 %% The PEP plugin for mod_pubsub requires mod_caps to be enabled in the host.
 %% Check that the mod_caps module is enabled in that Jabber Host
-%% If not, show a warning message in the ejabberd log file.
+%% If not, log a warning message.
 complain_if_modcaps_disabled(ServerHost) ->
     ?WARNING_MSG_IF(
        not gen_mod:is_loaded(ServerHost, mod_caps),

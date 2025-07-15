@@ -22,7 +22,9 @@
 
 -export([start_link/1, init/1]).
 -export([get_connection/1, is_available/1]).
--export([start_pool/3, stop_pool/2]).
+-export([start_pool/4, stop_pool/2]).
+
+-ignore_xref([start_link/1]).
 
 %%--------------------------------------------------------------------
 %% API
@@ -40,9 +42,8 @@ get_connection(Server) ->
         %% - {'EXIT', {noproc, _}}
         %%  - {case_clause,{'EXIT',{no_connections...
     catch Class:Reason:Stacktrace ->
-            ?ERROR_MSG("event=get_gd_connection_failed "
-                       "server=~ts reason=~p:~p stacktrace=~1000p",
-                       [Server, Class, Reason, Stacktrace]),
+            ?LOG_ERROR(#{what => gd_get_connection_failed, server => Server,
+                         class => Class, reason => Reason, stacktrace => Stacktrace}),
             %% May be caused by missing server_sup or missing connection manager
             %% The former occurs when a process tries to send a message to Server
             %% for the first time.
@@ -64,15 +65,15 @@ is_available(Server) ->
 
 -spec start_pool(Supervisor :: pid(),
                  Endpoint :: mod_global_distrib_utils:endpoint(),
-                 Server :: jid:lserver()) ->
+                 Server :: jid:lserver(),
+                 ConnOpts :: map()) ->
     {ok, atom(), pid()} | {error, any()}.
-start_pool(Supervisor, Endpoint, Server) ->
+start_pool(Supervisor, Endpoint, Server, #{connections_per_endpoint := PoolSize}) ->
     PoolRef = endpoint_to_atom(Endpoint),
     PoolParams = [
                   PoolRef,
                   {mod_global_distrib_connection, start_link, [Endpoint, Server]},
-                  [{pool_size, mod_global_distrib_utils:opt(mod_global_distrib_sender,
-                                                            connections_per_endpoint)}]
+                  [{pool_size, PoolSize}]
                  ],
     PoolSpec = #{
       id => Endpoint,

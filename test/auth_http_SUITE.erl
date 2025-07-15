@@ -15,16 +15,15 @@
 %%==============================================================================
 
 -module(auth_http_SUITE).
--compile(export_all).
+-compile([export_all, nowarn_export_all]).
 -author('piotr.nosek@erlang-solutions.com').
 
--include_lib("common_test/include/ct.hrl").
-
--define(DOMAIN1, <<"localhost">>).
--define(DOMAIN2, <<"localhost2">>).
+-define(DOMAIN, <<"localhost">>).
+-define(HOST_TYPE, <<"test host type">>).
 -define(AUTH_HOST, "http://localhost:12000").
 -define(BASIC_AUTH, "softkitty:purrpurrpurr").
--define(CERT_PATH, "../../../../tools/ssl").
+
+-import(config_parser_helper, [config/2]).
 
 %%--------------------------------------------------------------------
 %% Suite configuration
@@ -37,7 +36,7 @@ groups() ->
     [
      {cert_auth, cert_auth()},
      {auth_requests_plain, [sequence], all_tests()},
-     {auth_requests_scram, [sequence], [{group,cert_auth} | all_tests()]}
+     {auth_requests_scram, [sequence], [{group, cert_auth} | all_tests()]}
     ].
 
 all_tests() ->
@@ -46,7 +45,7 @@ all_tests() ->
      set_password,
      try_register,
      get_password,
-     is_user_exists,
+     does_user_exist,
      remove_user,
      supported_sasl_mechanisms
     ].
@@ -67,7 +66,7 @@ suite() ->
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(jid),
-    meck_config(Config),
+    set_opts(Config),
     mim_ct_rest:start(?BASIC_AUTH, Config),
     % Separate process needs to do this, because this one will terminate
     % so will supervisor and children and ETS tables
@@ -76,90 +75,83 @@ init_per_suite(Config) ->
               mim_ct_sup:start_link(ejabberd_sup),
               mongoose_wpool:ensure_started(),
               % This would be started via outgoing_pools in normal case
-              Pool = {http, host, auth,
-                      [{strategy, random_worker}, {call_timeout, 5000}, {workers, 20}],
-                      [{path_prefix, "/auth/"}, {http_opts, []}, {server, ?AUTH_HOST}]},
-              Hosts = [?DOMAIN1, ?DOMAIN2],
-              mongoose_wpool:start_configured_pools([Pool], Hosts),
+              Pool = config([outgoing_pools, http, auth], pool_opts()),
+              HostTypes = [?HOST_TYPE, <<"another host type">>],
+              mongoose_wpool:start_configured_pools([Pool], [], HostTypes),
               mongoose_wpool_http:init(),
-              ejabberd_auth_http:start(?DOMAIN1),
-              ejabberd_auth_http:start(?DOMAIN2)
+              ejabberd_auth_http:start(?HOST_TYPE)
       end),
-    meck_cleanup(),
     Config.
 
+pool_opts() ->
+   #{scope => host_type,
+     opts => #{strategy => random_worker, call_timeout => 5000, workers => 20},
+     conn_opts => #{host => ?AUTH_HOST, path_prefix => <<"/auth/">>}}.
+
 end_per_suite(Config) ->
-    ejabberd_auth_http:stop(?DOMAIN1),
-    ejabberd_auth_http:stop(?DOMAIN2),
+    ejabberd_auth_http:stop(?HOST_TYPE),
     ok = mim_ct_rest:stop(),
+    unset_opts(),
     Config.
 
 init_per_group(cert_auth, Config) ->
+    Root = small_path_helper:repo_dir(Config),
+    SslDir = filename:join(Root, "tools/ssl"),
     try
-        {ok, Cert1} = file:read_file(?CERT_PATH ++ "/mongooseim/cert.pem"),
-        {ok, Cert2} = file:read_file(?CERT_PATH ++ "/ca/cacert.pem"),
+        {ok, Cert1} = file:read_file(filename:join(SslDir, "mongooseim/cert.pem")),
+        {ok, Cert2} = file:read_file(filename:join(SslDir,  "ca/cacert.pem")),
         [{'Certificate', DerBin, not_encrypted} | _] = public_key:pem_decode(Cert2),
         [{der_cert, DerBin}, {pem_cert1, Cert1}, {pem_cert2, Cert2} | Config]
     catch
         _:E ->
-            {skip, {E, ?CERT_PATH, element(2, file:get_cwd())}}
+            {skip, {E, SslDir, element(2, file:get_cwd())}}
     end;
 init_per_group(GroupName, Config) ->
     Config2 = lists:keystore(scram_group, 1, Config,
                              {scram_group, GroupName == auth_requests_scram}),
-    meck_config(Config2),
-    mim_ct_rest:register(<<"alice">>, ?DOMAIN1, do_scram(<<"makota">>, Config2)),
-    mim_ct_rest:register(<<"bob">>, ?DOMAIN1, do_scram(<<"niema5klepki">>, Config2)),
-    meck_cleanup(),
+    set_opts(Config2),
+    mim_ct_rest:register(<<"alice">>, ?DOMAIN, do_scram(<<"makota">>, Config2)),
+    mim_ct_rest:register(<<"bob">>, ?DOMAIN, do_scram(<<"niema5klepki">>, Config2)),
     Config2.
 
 end_per_group(cert_auth, Config) ->
     Config;
 end_per_group(_GroupName, Config) ->
-    mim_ct_rest:remove_user(<<"alice">>, ?DOMAIN1),
-    mim_ct_rest:remove_user(<<"bob">>, ?DOMAIN1),
+    mim_ct_rest:remove_user(<<"alice">>, ?DOMAIN),
+    mim_ct_rest:remove_user(<<"bob">>, ?DOMAIN),
     Config.
 
 init_per_testcase(remove_user, Config) ->
-    meck_config(Config),
-    mim_ct_rest:register(<<"toremove1">>, ?DOMAIN1, do_scram(<<"pass">>, Config)),
-    mim_ct_rest:register(<<"toremove2">>, ?DOMAIN1, do_scram(<<"pass">>, Config)),
+    mim_ct_rest:register(<<"toremove1">>, ?DOMAIN, do_scram(<<"pass">>, Config)),
+    mim_ct_rest:register(<<"toremove2">>, ?DOMAIN, do_scram(<<"pass">>, Config)),
     Config;
 init_per_testcase(cert_auth_fail, Config) ->
-    meck_config(Config),
     Cert = proplists:get_value(pem_cert1, Config),
-    mim_ct_rest:register(<<"cert_user">>, ?DOMAIN1, Cert),
+    mim_ct_rest:register(<<"cert_user">>, ?DOMAIN, Cert),
     Config;
 init_per_testcase(cert_auth_success, Config) ->
-    meck_config(Config),
     Cert1 = proplists:get_value(pem_cert1, Config),
     Cert2 = proplists:get_value(pem_cert2, Config),
     SeveralCerts = <<Cert1/bitstring, Cert2/bitstring>>,
-    mim_ct_rest:register(<<"cert_user">>, ?DOMAIN1, SeveralCerts),
+    mim_ct_rest:register(<<"cert_user">>, ?DOMAIN, SeveralCerts),
     Config;
 init_per_testcase(_CaseName, Config) ->
-    meck_config(Config),
     Config.
 
 end_per_testcase(try_register, Config) ->
-    mim_ct_rest:remove_user(<<"nonexistent">>, ?DOMAIN1),
-    meck_cleanup(),
+    mim_ct_rest:remove_user(<<"nonexistent">>, ?DOMAIN),
     Config;
 end_per_testcase(remove_user, Config) ->
-    mim_ct_rest:remove_user(<<"toremove1">>, ?DOMAIN1),
-    mim_ct_rest:remove_user(<<"toremove2">>, ?DOMAIN1),
-    meck_cleanup(),
+    mim_ct_rest:remove_user(<<"toremove1">>, ?DOMAIN),
+    mim_ct_rest:remove_user(<<"toremove2">>, ?DOMAIN),
     Config;
 end_per_testcase(cert_auth_fail, Config) ->
-    mim_ct_rest:remove_user(<<"cert_user">>, ?DOMAIN1),
-    meck_cleanup(),
+    mim_ct_rest:remove_user(<<"cert_user">>, ?DOMAIN),
     Config;
 end_per_testcase(cert_auth_success, Config) ->
-    mim_ct_rest:remove_user(<<"cert_user">>, ?DOMAIN1),
-    meck_cleanup(),
+    mim_ct_rest:remove_user(<<"cert_user">>, ?DOMAIN),
     Config;
 end_per_testcase(_CaseName, Config) ->
-    meck_cleanup(),
     Config.
 
 %%--------------------------------------------------------------------
@@ -167,43 +159,52 @@ end_per_testcase(_CaseName, Config) ->
 %%--------------------------------------------------------------------
 
 check_password(_Config) ->
-    true = ejabberd_auth_http:check_password(<<"alice">>, ?DOMAIN1, <<"makota">>),
-    false = ejabberd_auth_http:check_password(<<"alice">>, ?DOMAIN1, <<"niemakota">>),
-    false = ejabberd_auth_http:check_password(<<"kate">>, ?DOMAIN1, <<"mapsa">>).
+    true = ejabberd_auth_http:check_password(?HOST_TYPE, <<"alice">>,
+                                             ?DOMAIN, <<"makota">>),
+    false = ejabberd_auth_http:check_password(?HOST_TYPE, <<"alice">>,
+                                              ?DOMAIN, <<"niemakota">>),
+    false = ejabberd_auth_http:check_password(?HOST_TYPE, <<"kate">>,
+                                              ?DOMAIN, <<"mapsa">>).
 
 set_password(_Config) ->
-    ok = ejabberd_auth_http:set_password(<<"alice">>, ?DOMAIN1, <<"mialakota">>),
-    true = ejabberd_auth_http:check_password(<<"alice">>, ?DOMAIN1, <<"mialakota">>),
-    ok = ejabberd_auth_http:set_password(<<"alice">>, ?DOMAIN1, <<"makota">>).
+    ok = ejabberd_auth_http:set_password(?HOST_TYPE, <<"alice">>,
+                                         ?DOMAIN, <<"mialakota">>),
+    true = ejabberd_auth_http:check_password(?HOST_TYPE, <<"alice">>,
+                                             ?DOMAIN, <<"mialakota">>),
+    ok = ejabberd_auth_http:set_password(?HOST_TYPE, <<"alice">>,
+                                         ?DOMAIN, <<"makota">>).
 
 try_register(_Config) ->
-    ok = ejabberd_auth_http:try_register(<<"nonexistent">>, ?DOMAIN1, <<"newpass">>),
-    true = ejabberd_auth_http:check_password(<<"nonexistent">>, ?DOMAIN1, <<"newpass">>),
-    {error, exists} = ejabberd_auth_http:try_register(<<"nonexistent">>, ?DOMAIN1, <<"anypass">>).
+    ok = ejabberd_auth_http:try_register(?HOST_TYPE, <<"nonexistent">>,
+                                         ?DOMAIN, <<"newpass">>),
+    true = ejabberd_auth_http:check_password(?HOST_TYPE, <<"nonexistent">>,
+                                             ?DOMAIN, <<"newpass">>),
+    {error, exists} = ejabberd_auth_http:try_register(?HOST_TYPE, <<"nonexistent">>,
+                                                      ?DOMAIN, <<"anypass">>).
 
 % get_password + get_password_s
 get_password(_Config) ->
-    case mongoose_scram:enabled(?DOMAIN1) of
+    case mongoose_scram:enabled(?HOST_TYPE) of
         false ->
-            <<"makota">> = ejabberd_auth_http:get_password(<<"alice">>, ?DOMAIN1),
-            <<"makota">> = ejabberd_auth_http:get_password_s(<<"alice">>, ?DOMAIN1);
+            <<"makota">> = ejabberd_auth_http:get_password(?HOST_TYPE, <<"alice">>, ?DOMAIN),
+            <<"makota">> = ejabberd_auth_http:get_password_s(?HOST_TYPE, <<"alice">>, ?DOMAIN);
         true ->
             % map with SCRAM data
-            is_map(ejabberd_auth_http:get_password(<<"alice">>, ?DOMAIN1)),
-            <<>> = ejabberd_auth_http:get_password_s(<<"alice">>, ?DOMAIN1)
+            true = is_map(ejabberd_auth_http:get_password(?HOST_TYPE, <<"alice">>, ?DOMAIN)),
+            <<>> = ejabberd_auth_http:get_password_s(?HOST_TYPE, <<"alice">>, ?DOMAIN)
     end,
-    false = ejabberd_auth_http:get_password(<<"anakin">>, ?DOMAIN1),
-    <<>> = ejabberd_auth_http:get_password_s(<<"anakin">>, ?DOMAIN1).
+    false = ejabberd_auth_http:get_password(?HOST_TYPE, <<"anakin">>, ?DOMAIN),
+    <<>> = ejabberd_auth_http:get_password_s(?HOST_TYPE, <<"anakin">>, ?DOMAIN).
 
-is_user_exists(_Config) ->
-    true = ejabberd_auth_http:does_user_exist(<<"alice">>, ?DOMAIN1),
-    false = ejabberd_auth_http:does_user_exist(<<"madhatter">>, ?DOMAIN1).
+does_user_exist(_Config) ->
+    true = ejabberd_auth_http:does_user_exist(?HOST_TYPE, <<"alice">>, ?DOMAIN),
+    false = ejabberd_auth_http:does_user_exist(?HOST_TYPE, <<"madhatter">>, ?DOMAIN).
 
 % remove_user/2
 remove_user(_Config) ->
-    true = ejabberd_auth_http:does_user_exist(<<"toremove1">>, ?DOMAIN1),
-    ok = ejabberd_auth_http:remove_user(<<"toremove1">>, ?DOMAIN1),
-    false = ejabberd_auth_http:does_user_exist(<<"toremove1">>, ?DOMAIN1).
+    true = ejabberd_auth_http:does_user_exist(?HOST_TYPE, <<"toremove1">>, ?DOMAIN),
+    ok = ejabberd_auth_http:remove_user(?HOST_TYPE, <<"toremove1">>, ?DOMAIN),
+    false = ejabberd_auth_http:does_user_exist(?HOST_TYPE, <<"toremove1">>, ?DOMAIN).
 
 supported_sasl_mechanisms(Config) ->
     Modules = [cyrsasl_plain, cyrsasl_digest, cyrsasl_external,
@@ -214,7 +215,7 @@ supported_sasl_mechanisms(Config) ->
                           _ -> true
                       end,
     [true, DigestSupported, false, true, true, true, true, true] =
-        [ejabberd_auth_http:supports_sasl_module(?DOMAIN1, Mod) || Mod <- Modules].
+        [ejabberd_auth_http:supports_sasl_module(?HOST_TYPE, Mod) || Mod <- Modules].
 
 cert_auth_fail(Config) ->
     Creds = creds_with_cert(Config, <<"cert_user">>),
@@ -233,34 +234,30 @@ cert_auth_nonexistent(Config) ->
 %%--------------------------------------------------------------------
 creds_with_cert(Config, Username) ->
     Cert = proplists:get_value(der_cert, Config),
-    NewCreds = mongoose_credentials:new(?DOMAIN1),
+    NewCreds = mongoose_credentials:new(?DOMAIN, ?HOST_TYPE, #{}),
     mongoose_credentials:extend(NewCreds, [{der_cert, Cert},
                                            {username, Username}]).
 
-meck_config(Config) ->
-    meck:unload(),
-    ScramOpts = case lists:keyfind(scram_group, 1, Config) of
-                    {_, false} -> [{password_format, plain}];
-                    _ -> []
-                end,
-    meck:new(ejabberd_config),
-    meck:expect(ejabberd_config, get_local_option,
-                fun(auth_opts, _Host) ->
-                        [
-                         {host, ?AUTH_HOST},
-                         {path_prefix, "/auth/"},
-                         {basic_auth, ?BASIC_AUTH}
-                        ] ++ ScramOpts
-                end).
+set_opts(Config) ->
+    PasswordFormat = case lists:keyfind(scram_group, 1, Config) of
+                         {_, false} -> plain;
+                         _ -> scram
+                     end,
+    HttpOpts = #{basic_auth => ?BASIC_AUTH},
+    mongoose_config:set_opts(#{{auth, ?HOST_TYPE} => #{methods => [http],
+                                                       password => #{format => PasswordFormat,
+                                                                     scram_iterations => 10},
+                                                       http => HttpOpts}}).
 
-meck_cleanup() ->
-    meck:validate(ejabberd_config),
-    meck:unload(ejabberd_config).
+unset_opts() ->
+    mongoose_config:erase_opts().
 
 do_scram(Pass, Config) ->
     case lists:keyfind(scram_group, 1, Config) of
         {_, true} ->
-            mongoose_scram:serialize(mongoose_scram:password_to_scram(?DOMAIN1, Pass, mongoose_scram:iterations(?DOMAIN1)));
+            Iterations =  mongoose_scram:iterations(?HOST_TYPE),
+            Scram = mongoose_scram:password_to_scram(?HOST_TYPE, Pass, Iterations),
+            mongoose_scram:serialize(Scram);
         _ ->
             Pass
     end.

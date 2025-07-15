@@ -1,13 +1,10 @@
 -module(mongoose_rdbms_SUITE).
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
--include("mongoose.hrl").
 
--compile([export_all]).
+-compile([export_all, nowarn_export_all]).
 
--define(_eq(E, I), ?_assertEqual(E, I)).
 -define(eq(E, I), ?assertEqual(E, I)).
--define(ne(E, I), ?assert(E =/= I)).
 
 -define(KEEPALIVE_INTERVAL, 1).
 -define(KEEPALIVE_QUERY, <<"SELECT 1;">>).
@@ -20,10 +17,13 @@ all() ->
 
 init_per_suite(Config) ->
     application:ensure_all_started(exometer_core),
-    Config.
+    set_opts(),
+    async_helper:start(Config, mongoose_instrument, start_link, []).
 
-end_per_suite(_Config) ->
+end_per_suite(Config) ->
     meck:unload(),
+    async_helper:stop_all(Config),
+    unset_opts(),
     application:stop(exometer_core).
 
 groups() ->
@@ -39,31 +39,33 @@ tests() ->
 init_per_group(odbc, Config) ->
     case code:ensure_loaded(eodbc) of
         {module, eodbc} ->
+            mongoose_rdbms_backend:init(odbc),
             [{db_type, odbc} | Config];
         _ ->
             {skip, no_odbc_application}
     end;
 init_per_group(Group, Config) ->
+    mongoose_rdbms_backend:init(Group),
     [{db_type, Group} | Config].
 
 end_per_group(_, Config) ->
+    % clean up after mongoose_backend:init
+    persistent_term:erase({backend_module, global, mongoose_rdbms}),
     Config.
 
 init_per_testcase(does_backoff_increase_to_a_point, Config) ->
     DbType = ?config(db_type, Config),
-    backend_module:create(mongoose_rdbms, DbType, []),
-    meck_config(DbType),
     meck_db(DbType),
     meck_connection_error(DbType),
     meck_rand(),
-    [{db_opts, [{server, server(DbType)}, {keepalive_interval, 2}, {start_interval, 10}]} | Config];
+    ServerOpts = server_opts(DbType),
+    [{db_opts, ServerOpts#{query_timeout => 5000, keepalive_interval => 2, max_start_interval => 10}} | Config];
 init_per_testcase(_, Config) ->
     DbType = ?config(db_type, Config),
-    backend_module:create(mongoose_rdbms, DbType, []),
-    meck_config(DbType),
     meck_db(DbType),
-    [{db_opts, [{server, server(DbType)}, {keepalive_interval, ?KEEPALIVE_INTERVAL},
-                {start_interval, ?MAX_INTERVAL}]} | Config].
+    ServerOpts = server_opts(DbType),
+    [{db_opts, ServerOpts#{query_timeout => 5000, keepalive_interval => ?KEEPALIVE_INTERVAL,
+                           max_start_interval => ?MAX_INTERVAL}} | Config].
 
 end_per_testcase(does_backoff_increase_to_a_point, Config) ->
     meck_unload_rand(),
@@ -95,11 +97,11 @@ keepalive_exit(Config) ->
         ct:fail(no_down_message)
     end.
 
-%% 5 retries. Max retry 10. Iniitial retry 2.
+%% 5 retries. Max retry 10. Initial retry 2.
 %% We should get a sequence: 2 -> 4 -> 10 -> 10 -> 10.
 does_backoff_increase_to_a_point(Config) ->
     {error, _} = gen_server:start(mongoose_rdbms, ?config(db_opts, Config), []),
-    % We expect to have 2 at the begininng, then values up to 10 and 10 three times in total
+    % We expect to have 2 at the beginning, then values up to 10 and 10 three times in total
     receive_backoffs(2, 10, 3).
 
 receive_backoffs(InitialValue, MaxValue, MaxCount) ->
@@ -128,12 +130,14 @@ meck_rand() ->
 meck_unload_rand() ->
     meck:unload(rand).
 
-meck_config(Server) ->
-    meck:new(ejabberd_config, [no_link]),
-    meck:expect(ejabberd_config, get_local_option,
-                fun(max_fsm_queue) -> 1024;
-                   (all_metrics_are_global) -> false
-                end).
+set_opts() ->
+    mongoose_config:set_opts(opts()).
+
+unset_opts() ->
+    mongoose_config:erase_opts().
+
+opts() ->
+    #{instrumentation => config_parser_helper:default_config([instrumentation])}.
 
 meck_db(odbc) ->
     meck:new(eodbc, [no_link]),
@@ -175,7 +179,6 @@ meck_error(pgsql) ->
                 fun(_Ref, _Query) -> {error, {error, 2, 3, 4, <<"connection broken">>, 5}} end).
 
 meck_config_and_db_unload(DbType) ->
-    meck:unload(ejabberd_config),
     do_meck_unload(DbType).
 
 do_meck_unload(odbc) ->
@@ -205,9 +208,11 @@ a(mysql) ->
 a(pgsql) ->
     ['_', [?KEEPALIVE_QUERY]].
 
-server(odbc) ->
-    "fake-connection-string";
-server(mysql) ->
-    {mysql, "fake-host", "fake-db", "fake-user", "fake-pass"};
-server(pgsql) ->
-    {pgsql, "fake-host", "fake-db", "fake-user", "fake-pass"}.
+server_opts(odbc) ->
+    #{driver => odbc, settings => "fake-connection-string"};
+server_opts(mysql) ->
+    #{driver => mysql, host => "fake-host", port => 3306,
+      database => "fake-db", username => "fake-user", password => "fake-pass"};
+server_opts(pgsql) ->
+    #{driver => pgsql, host => "fake-host", port => 5432,
+      database => "fake-db", username => "fake-user", password => "fake-pass"}.

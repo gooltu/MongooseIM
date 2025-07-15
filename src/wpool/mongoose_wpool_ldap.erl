@@ -4,13 +4,19 @@
 -export([init/0]).
 -export([start/4, stop/2]).
 
+%% --------------------------------------------------------------
+%% mongoose_wpool callbacks
+-spec init() -> ok.
 init() ->
     ok.
 
-start(Host, Tag, WpoolOpts, ConnOpts) ->
+-spec start(mongooseim:host_type_or_global(), mongoose_wpool:tag(),
+            mongoose_wpool:pool_opts(), mongoose_wpool:conn_opts()) -> {ok, pid()} | {error, any()}.
+start(HostType, Tag, WpoolOpts, ConnOpts) ->
     WorkerSpec = {mongoose_ldap_worker, ConnOpts},
-    Name = mongoose_wpool:make_pool_name(ldap, Host, Tag),
-    mongoose_wpool:start_sup_pool(ldap, Name, [{worker, WorkerSpec} | WpoolOpts]).
+    ProcName = mongoose_wpool:make_pool_name(ldap, HostType, Tag),
+    mongoose_wpool:start_sup_pool(ldap, ProcName, [{worker, WorkerSpec} | WpoolOpts]).
 
-stop(_Host, _Tag) ->
+-spec stop(mongooseim:host_type_or_global(), mongoose_wpool:tag()) -> ok.
+stop(_HostType, _Tag) ->
     ok.

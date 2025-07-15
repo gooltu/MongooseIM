@@ -19,6 +19,7 @@
 CREATE TYPE test_enum_char AS ENUM('A','B', 'C');
 CREATE TABLE test_types(
     unicode text,
+    unicode250 varchar(250),
     binary_data_8k bytea, -- byte a has 1 GB limit
     binary_data_65k bytea,
     binary_data_16m bytea,
@@ -32,48 +33,51 @@ CREATE TABLE test_types(
 );
 
 CREATE TABLE users (
-    username varchar(250) PRIMARY KEY,
+    username varchar(250),
+    server varchar(250),
     "password" text NOT NULL,
     pass_details text,
-    created_at TIMESTAMP NOT NULL DEFAULT now()
+    created_at TIMESTAMP NOT NULL DEFAULT now(),
+    PRIMARY KEY (server, username)
 );
 
 
 CREATE TABLE last (
-    username varchar(250) PRIMARY KEY,
+    server varchar(250),
+    username varchar(250),
     seconds integer NOT NULL,
-    state text NOT NULL
+    state text NOT NULL,
+    PRIMARY KEY (server, username)
 );
 
-CREATE INDEX i_last_seconds ON last USING btree (seconds);
-
+CREATE INDEX i_last_server_seconds ON last USING btree (server, seconds);
 
 CREATE TABLE rosterusers (
+    server varchar(250) NOT NULL,
     username varchar(250) NOT NULL,
     jid text NOT NULL,
     nick text NOT NULL,
     subscription character(1) NOT NULL,
     ask character(1) NOT NULL,
     askmessage text NOT NULL,
-    server character(1) NOT NULL,
-    subscribe text,
-    "type" text,
-    created_at TIMESTAMP NOT NULL DEFAULT now()
+    created_at TIMESTAMP NOT NULL DEFAULT now(),
+    PRIMARY KEY (server, username, jid)
 );
-
-CREATE UNIQUE INDEX i_rosteru_user_jid ON rosterusers USING btree (username, jid);
-CREATE INDEX i_rosteru_username ON rosterusers USING btree (username);
-CREATE INDEX i_rosteru_jid ON rosterusers USING btree (jid);
-
 
 CREATE TABLE rostergroups (
+    server varchar(250) NOT NULL,
     username varchar(250) NOT NULL,
     jid text NOT NULL,
-    grp text NOT NULL
+    grp text NOT NULL,
+    PRIMARY KEY (server, username, jid, grp)
 );
 
-CREATE INDEX pk_rosterg_user_jid ON rostergroups USING btree (username, jid);
-
+CREATE TABLE roster_version (
+    server varchar(250),
+    username varchar(250),
+    version text NOT NULL,
+    PRIMARY KEY (server, username)
+);
 
 CREATE TABLE vcard (
     username varchar(150),
@@ -125,16 +129,19 @@ CREATE INDEX i_vcard_search_lorgname  ON vcard_search(lorgname);
 CREATE INDEX i_vcard_search_lorgunit  ON vcard_search(lorgunit);
 
 CREATE TABLE privacy_default_list (
-    username varchar(250) PRIMARY KEY,
-    name text NOT NULL
+    server varchar(250),
+    username varchar(250),
+    name text NOT NULL,
+    PRIMARY KEY (server, username)
 );
 
 CREATE TABLE privacy_list (
+    server varchar(250) NOT NULL,
     username varchar(250) NOT NULL,
     name text NOT NULL,
     id SERIAL UNIQUE,
     created_at TIMESTAMP NOT NULL DEFAULT now(),
-    PRIMARY KEY (username,name)
+    PRIMARY KEY (server, username, name)
 );
 
 CREATE TABLE privacy_list_data (
@@ -142,7 +149,7 @@ CREATE TABLE privacy_list_data (
     t character(1) NOT NULL,
     value text NOT NULL,
     action character(1) NOT NULL,
-    ord NUMERIC NOT NULL,
+    ord INT NOT NULL,
     match_all boolean NOT NULL,
     match_iq boolean NOT NULL,
     match_message boolean NOT NULL,
@@ -152,36 +159,13 @@ CREATE TABLE privacy_list_data (
 );
 
 CREATE TABLE private_storage (
+    server varchar(250) NOT NULL,
     username varchar(250) NOT NULL,
-    namespace text NOT NULL,
+    namespace varchar(250) NOT NULL,
     data text NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT now()
+    created_at TIMESTAMP NOT NULL DEFAULT now(),
+    PRIMARY KEY(server, username, namespace)
 );
-
-CREATE INDEX i_private_storage_username ON private_storage USING btree (username);
-CREATE UNIQUE INDEX i_private_storage_username_namespace ON private_storage USING btree (username, namespace);
-
-
-CREATE TABLE roster_version (
-    username varchar(250) PRIMARY KEY,
-    version text NOT NULL
-);
-
--- To update from 0.9.8:
--- CREATE SEQUENCE spool_seq_seq;
--- ALTER TABLE spool ADD COLUMN seq integer;
--- ALTER TABLE spool ALTER COLUMN seq SET DEFAULT nextval('spool_seq_seq');
--- UPDATE spool SET seq = DEFAULT;
--- ALTER TABLE spool ALTER COLUMN seq SET NOT NULL;
-
--- To update from 1.x:
--- ALTER TABLE rosterusers ADD COLUMN askmessage text;
--- UPDATE rosterusers SET askmessage = '';
--- ALTER TABLE rosterusers ALTER COLUMN askmessage SET NOT NULL;
-
--- To update from 2.0.0:
--- ALTER TABLE mam_message ADD COLUMN search_body text;
--- ALTER TABLE mam_muc_message ADD COLUMN search_body text;
 
 CREATE TYPE mam_behaviour AS ENUM('A', 'N', 'R');
 CREATE TYPE mam_direction AS ENUM('I','O');
@@ -206,6 +190,7 @@ CREATE TABLE mam_message(
   message bytea NOT NULL,
   search_body text,
   origin_id varchar,
+  is_groupchat boolean NOT NULL,
   PRIMARY KEY(user_id, id)
 );
 CREATE INDEX i_mam_message_username_jid_id
@@ -336,21 +321,23 @@ CREATE TABLE muc_light_blocking(
     who VARCHAR(500)        NOT NULL
 );
 
-CREATE INDEX i_muc_light_blocking ON muc_light_blocking (luser, lserver);
+CREATE INDEX i_muc_light_blocking_su ON muc_light_blocking (lserver, luser);
 
 CREATE TABLE inbox (
     luser VARCHAR(250)               NOT NULL,
     lserver VARCHAR(250)             NOT NULL,
     remote_bare_jid VARCHAR(250)     NOT NULL,
-    content bytea                    NOT NULL,
-    unread_count int                 NOT NULL,
-    msg_id varchar(250),
+    msg_id VARCHAR(250),
+    box VARCHAR(64)                  NOT NULL DEFAULT 'inbox',
+    content BYTEA                    NOT NULL,
     timestamp BIGINT                 NOT NULL,
-    PRIMARY KEY(luser, lserver, remote_bare_jid));
+    muted_until BIGINT               DEFAULT 0,
+    unread_count INT                 NOT NULL,
+    PRIMARY KEY(lserver, luser, remote_bare_jid));
 
-CREATE INDEX i_inbox
-    ON inbox
-    USING BTREE(luser, lserver, timestamp);
+CREATE INDEX i_inbox_timestamp ON inbox USING BTREE(lserver, luser, timestamp);
+CREATE INDEX i_inbox_us_box ON inbox USING BTREE(lserver, luser, box);
+CREATE INDEX i_inbox_box ON inbox (box) WHERE (box = 'bin');
 
 CREATE TABLE pubsub_nodes (
     nidx               BIGSERIAL PRIMARY KEY,
@@ -401,7 +388,7 @@ CREATE TABLE pubsub_last_item (
     created_lserver     VARCHAR(250) NOT NULL,
     created_at          BIGINT       NOT NULL,
     payload             TEXT         NOT NULL,
-	PRIMARY KEY (nidx)
+    PRIMARY KEY (nidx)
 );
 
 -- we skip luser and lserver in this one as this is little chance (even impossible?)
@@ -446,13 +433,14 @@ CREATE TABLE mongoose_cluster_id (
 CREATE TYPE chat_marker_type AS ENUM('R', 'D', 'A');
 
 CREATE TABLE smart_markers (
-    from_jid VARCHAR(250) NOT NULL,
+    lserver VARCHAR(250) NOT NULL,
+    luser VARCHAR(250) NOT NULL,
     to_jid VARCHAR(250) NOT NULL,
     thread VARCHAR(250) NOT NULL,
     type chat_marker_type NOT NULL,
     msg_id VARCHAR(250) NOT NULL,
     timestamp BIGINT NOT NULL,
-    PRIMARY KEY(from_jid, to_jid, thread, type)
+    PRIMARY KEY(lserver, luser, to_jid, thread, type)
 );
 
 CREATE INDEX i_smart_markers ON smart_markers(to_jid, thread);
@@ -467,3 +455,67 @@ CREATE TABLE offline_markers (
 );
 
 CREATE INDEX i_offline_markers ON offline_markers(jid);
+
+CREATE TABLE domain_admins(
+     domain VARCHAR(250) NOT NULL,
+     pass_details TEXT NOT NULL,
+     PRIMARY KEY(domain)
+);
+
+-- Mapping from domain hostname to host_type.
+-- Column id is used for ordering only.
+CREATE TABLE domain_settings (
+    id BIGSERIAL NOT NULL UNIQUE,
+    domain VARCHAR(250) NOT NULL,
+    host_type VARCHAR(250) NOT NULL,
+    status SMALLINT NOT NULL DEFAULT 1,
+    PRIMARY KEY(domain)
+);
+
+-- A new record is inserted into domain_events, each time
+-- domain_settings table is updated: i.e. when a domain is removed,
+-- inserted, enabled or disabled.
+-- Column id is used for ordering and not related to domain_settings.id.
+CREATE TABLE domain_events (
+    id BIGSERIAL NOT NULL,
+    domain VARCHAR(250) NOT NULL,
+    PRIMARY KEY(id)
+);
+CREATE INDEX i_domain_events_domain ON domain_events(domain);
+
+CREATE TABLE discovery_nodes (
+    cluster_name varchar(250) NOT NULL,
+    node_name varchar(250) NOT NULL,
+    node_num INT NOT NULL,
+    address varchar(250) NOT NULL DEFAULT '', -- empty means we should ask DNS
+    updated_timestamp BIGINT NOT NULL, -- in seconds
+    PRIMARY KEY (node_name)
+);
+CREATE UNIQUE INDEX i_discovery_nodes_node_num ON discovery_nodes USING BTREE(cluster_name, node_num);
+
+CREATE TABLE caps (
+    node varchar(250) NOT NULL,
+    sub_node varchar(250) NOT NULL,
+    features text NOT NULL,
+    PRIMARY KEY (node, sub_node)
+);
+
+-- XEP-0484: Fast Authentication Streamlining Tokens
+-- Module: mod_fast_auth_token
+CREATE TABLE fast_auth_token(
+     server VARCHAR(250) NOT NULL,
+     username VARCHAR(250) NOT NULL,
+     -- Device installation ID (User-Agent ID)
+     -- Unique for each device
+     -- https://xmpp.org/extensions/xep-0388.html#initiation
+     user_agent_id VARCHAR(250) NOT NULL,
+     current_token VARCHAR(250),
+     current_expire BIGINT, -- seconds unix timestamp
+     current_count INT, -- replay counter
+     current_mech_id smallint,
+     new_token VARCHAR(250),
+     new_expire BIGINT, -- seconds unix timestamp
+     new_count INT,
+     new_mech_id smallint,
+     PRIMARY KEY(server, username, user_agent_id)
+);

@@ -1,0 +1,23 @@
+"""
+A dynamic domain representation.
+Some operation could return incomplete object i.e. some fields can be null.
+"""
+type Domain{
+  "Domain name"
+  domain: DomainName
+  "Domain hostType"
+  hostType: String
+  "Is domain enabled?"
+  status: DomainStatus
+}
+
+enum DomainStatus {
+  "Domain is enabled and ready to route traffic"
+  ENABLED
+  "Domain is disabled and won't be loaded into MongooseIM"
+  DISABLED
+  "Domain has been marked for deletion and is disabled until all data is removed"
+  DELETING
+  "Domain is deleted and does not exist anymore"
+  DELETED
+}

@@ -1,0 +1,387 @@
+[general]
+  loglevel = "warning"
+  hosts = [{{{hosts}}}]
+  host_types = [{{{host_types}}}]
+  default_server_domain = {{{default_server_domain}}}
+  registration_timeout = "infinity"
+  language = "en"
+  {{#sm_backend}}
+  sm_backend = {{{sm_backend}}}
+  {{/sm_backend}}
+  {{#component_backend}}
+  component_backend = {{{component_backend}}}
+  {{/component_backend}}
+  {{#s2s_backend}}
+  s2s_backend = {{{s2s_backend}}}
+  {{/s2s_backend}}
+  {{#http_server_name}}
+  http_server_name = {{{http_server_name}}}
+  {{/http_server_name}}
+  {{#rdbms_server_type}}
+  rdbms_server_type = {{{rdbms_server_type}}}
+  {{/rdbms_server_type}}
+
+[[listen.http]]
+  port = {{{http_port}}}
+  transport.num_acceptors = 10
+  transport.max_connections = 1024
+
+  [[listen.http.handlers.mod_bosh]]
+    host = "_"
+    path = "/http-bind"
+
+  [[listen.http.handlers.mod_websockets]]
+    host = "_"
+    path = "/ws-xmpp"
+
+[[listen.http]]
+  port = {{{https_port}}}
+  transport.num_acceptors = 10
+  transport.max_connections = 1024
+  {{#https_config}}
+  {{{https_config}}}
+  {{/https_config}}
+
+  [[listen.http.handlers.mod_bosh]]
+    host = "_"
+    path = "/http-bind"
+
+  [[listen.http.handlers.mod_websockets]]
+    host = "_"
+    path = "/ws-xmpp"
+
+[[listen.http]]
+  {{#http_api_endpoint}}
+  {{{http_api_endpoint}}}
+  {{/http_api_endpoint}}
+  transport.num_acceptors = 10
+  transport.max_connections = 1024
+
+  [[listen.http.handlers.mongoose_admin_api]]
+    host = "localhost"
+    path = "/api"
+
+[[listen.http]]
+  {{#http_api_client_endpoint}}
+  {{{http_api_client_endpoint}}}
+  {{/http_api_client_endpoint}}
+  transport.num_acceptors = 10
+  transport.max_connections = 1024
+  protocol.compress = true
+  {{#https_config}}
+  {{{https_config}}}
+  {{/https_config}}
+
+  [[listen.http.handlers.mongoose_client_api]]
+    host = "_"
+    path = "/api"
+
+[[listen.http]]
+  {{#http_graphql_api_admin_endpoint}}
+  {{{http_graphql_api_admin_endpoint}}}
+  {{/http_graphql_api_admin_endpoint}}
+  transport.num_acceptors = 10
+  transport.max_connections = 1024
+
+  [[listen.http.handlers.mongoose_graphql_handler]]
+    host = "localhost"
+    path = "/api/graphql"
+    schema_endpoint = "admin"
+    username = "admin"
+    password = "secret"
+
+[[listen.http]]
+  {{#http_graphql_api_domain_admin_endpoint}}
+  {{{http_graphql_api_domain_admin_endpoint}}}
+  {{/http_graphql_api_domain_admin_endpoint}}
+  transport.num_acceptors = 10
+  transport.max_connections = 1024
+
+  [[listen.http.handlers.mongoose_graphql_handler]]
+    host = "_"
+    path = "/api/graphql"
+    schema_endpoint = "domain_admin"
+
+[[listen.http]]
+  {{#http_graphql_api_user_endpoint}}
+  {{{http_graphql_api_user_endpoint}}}
+  {{/http_graphql_api_user_endpoint}}
+  transport.num_acceptors = 10
+  transport.max_connections = 1024
+
+  [[listen.http.handlers.mongoose_graphql_handler]]
+    host = "_"
+    path = "/api/graphql"
+    schema_endpoint = "user"
+{{#http_prometheus_endpoint}}
+
+[[listen.http]]
+  {{{http_prometheus_endpoint}}}
+  transport.num_acceptors = 10
+
+  [[listen.http.handlers.mongoose_prometheus_handler]]
+    host = "_"
+    path = "/metrics"
+{{/http_prometheus_endpoint}}
+
+[[listen.c2s]]
+  port = {{{c2s_port}}}
+  access = "c2s"
+  shaper = "normal"
+  max_stanza_size = 65536
+  {{#tls_config}}
+  {{{tls_config}}}
+  {{/tls_config}}
+  {{#c2s_dhfile}}
+  tls.dhfile = {{{c2s_dhfile}}}
+  {{/c2s_dhfile}}
+  {{#allowed_auth_methods}}
+  allowed_auth_methods = [{{{allowed_auth_methods}}}]
+  {{/allowed_auth_methods}}
+{{#secondary_c2s}}
+
+{{{secondary_c2s}}}
+{{/secondary_c2s}}
+
+[[listen.s2s]]
+  port = {{{incoming_s2s_port}}}
+  shaper = "fast"
+  max_stanza_size = 131072
+  {{#tls_config}}
+  {{{tls_config}}}
+  {{/tls_config}}
+  {{#s2s_dhfile}}
+  tls.dhfile = {{{s2s_dhfile}}}
+  {{/s2s_dhfile}}
+{{#listen_component}}
+
+{{{listen_component}}}
+{{/listen_component}}
+
+[auth]
+  {{#cyrsasl_external}}
+  sasl_external = [{{{cyrsasl_external}}}]
+  {{/cyrsasl_external}}
+  {{#sasl_mechanisms}}
+  sasl_mechanisms = [{{{sasl_mechanisms}}}]
+  {{/sasl_mechanisms}}
+  {{#auth_password_opts}}
+
+  [auth.password]
+    {{{auth_password_opts}}}
+  {{/auth_password_opts}}
+  {{#auth_method}}
+
+  # methods
+  [auth.{{{auth_method}}}]{{#auth_method_opts}}
+    {{{auth_method_opts}}}{{/auth_method_opts}}
+  {{/auth_method}}
+
+{{{internal_databases}}}
+
+{{#outgoing_pools}}
+{{{outgoing_pools}}}
+{{/outgoing_pools}}
+{{^outgoing_pools}}
+#[outgoing_pools.rdbms.default]
+#  scope = "global"
+#  workers = 5
+#
+#  [outgoing_pools.rdbms.default.connection]
+#    driver = "pgsql"
+#    host = "localhost"
+#    database = "mongooseim"
+#    username = "mongooseim"
+#    password = "mongooseim_secret"
+#    tls.required = true
+#    tls.cacertfile = "priv/ssl/cacert.pem"
+#    tls.server_name_indication.enabled = false
+{{/outgoing_pools}}
+
+[services.service_mongoose_system_metrics]
+
+{{#service_domain_db}}
+[services.service_domain_db]
+{{{service_domain_db}}}
+{{/service_domain_db}}
+[modules.mod_adhoc]
+
+{{#mod_amp}}
+[modules.mod_amp]
+{{{mod_amp}}}
+{{/mod_amp}}
+[modules.mod_disco]
+  users_can_see_hidden_services = false
+
+{{#mod_cache_users}}
+[modules.mod_cache_users]
+{{{mod_cache_users}}}
+{{/mod_cache_users}}
+{{#mod_last}}
+[modules.mod_last]
+{{{mod_last}}}
+{{/mod_last}}
+[modules.mod_stream_management]
+  {{#stream_management_backend}}
+  backend = "{{{stream_management_backend}}}"
+  {{/stream_management_backend}}
+
+{{#mod_offline}}
+[modules.mod_offline]
+{{{mod_offline}}}
+{{/mod_offline}}
+{{#mod_privacy}}
+[modules.mod_privacy]
+{{{mod_privacy}}}
+{{/mod_privacy}}
+{{#mod_blocking}}
+[modules.mod_blocking]
+{{{mod_blocking}}}
+{{/mod_blocking}}
+{{#mod_private}}
+[modules.mod_private]
+{{{mod_private}}}
+{{/mod_private}}
+[modules.mod_register]
+  ip_access = [
+    {address = "127.0.0.0/8", policy = "allow"},
+    {address = "0.0.0.0/0", policy = "deny"}
+  ]
+  access = "register"
+
+[modules.mod_presence]
+
+{{#mod_roster}}
+[modules.mod_roster]
+{{{mod_roster}}}
+{{/mod_roster}}
+[modules.mod_sic]
+
+{{#mod_vcard}}
+[modules.mod_vcard]
+{{{mod_vcard}}}
+{{/mod_vcard}}
+[modules.mod_bosh]
+  {{#bosh_backend}}
+  backend = {{{bosh_backend}}}
+  {{/bosh_backend}}
+
+[modules.mod_carboncopy]
+
+{{{instrumentation}}}
+
+[shaper.normal]
+  max_rate = 16_384
+
+[shaper.fast]
+  max_rate = 50_000
+
+[shaper.mam_shaper]
+  max_rate = 1
+
+[shaper.mam_global_shaper]
+  max_rate = 1000
+
+[acl]
+  local = [{}]
+
+[access]
+  max_user_sessions = [
+    {acl = "all", value = 10}
+  ]
+
+  max_user_offline_messages = [
+    {acl = "admin", value = 5000},
+    {acl = "all", value = 100}
+  ]
+
+  local = [
+    {acl = "local", value = "allow"}
+  ]
+
+  c2s = [
+    {acl = "blocked", value = "deny"},
+    {acl = "all", value = "allow"}
+  ]
+
+  muc_admin = [
+    {acl = "admin", value = "allow"}
+  ]
+
+  muc_create = [
+    {acl = "local", value = "allow"}
+  ]
+
+  muc = [
+    {acl = "all", value = "allow"}
+  ]
+
+  register = [
+    {acl = "all", value = "allow"}
+  ]
+
+  mam_set_prefs = [
+    {acl = "all", value = "default"}
+  ]
+
+  mam_get_prefs = [
+    {acl = "all", value = "default"}
+  ]
+
+  mam_lookup_messages = [
+    {acl = "all", value = "default"}
+  ]
+
+  mam_set_prefs_shaper = [
+    {acl = "all", value = "mam_shaper"}
+  ]
+
+  mam_get_prefs_shaper = [
+    {acl = "all", value = "mam_shaper"}
+  ]
+
+  mam_lookup_messages_shaper = [
+    {acl = "all", value = "mam_shaper"}
+  ]
+
+  mam_set_prefs_global_shaper = [
+    {acl = "all", value = "mam_global_shaper"}
+  ]
+
+  mam_get_prefs_global_shaper = [
+    {acl = "all", value = "mam_global_shaper"}
+  ]
+
+  mam_lookup_messages_global_shaper = [
+    {acl = "all", value = "mam_global_shaper"}
+  ]
+
+[s2s]
+  {{#s2s_default_policy}}
+  default_policy = {{{s2s_default_policy}}}
+  {{/s2s_default_policy}}
+
+  [s2s.outgoing]
+    {{#max_retry_delay}}
+    max_retry_delay = {{{max_retry_delay}}}
+    {{/max_retry_delay}}
+    port = {{{outgoing_s2s_port}}}
+    tls.mode = "starttls"
+    tls.verify_mode = "none"
+    tls.certfile = {{{s2s_certfile}}}
+    {{#s2s_addr}}
+
+    {{{s2s_addr}}}
+    {{/s2s_addr}}
+
+{{#host_config}}
+{{{host_config}}}
+{{/host_config}}
+{{^host_config}}
+#[[host_config]]
+#  host = "anonymous.localhost"
+#
+#  [host_config.auth.anonymous]
+#    allow_multiple_connections = true
+#    protocol = "both"
+{{/host_config}}

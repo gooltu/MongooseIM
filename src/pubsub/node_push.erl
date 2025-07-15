@@ -18,7 +18,10 @@
 -include("pubsub.hrl").
 
 -export([based_on/0, init/3, terminate/2, options/0, features/0,
-         publish_item/9, node_to_path/1, should_delete_when_owner_removed/0]).
+         publish_item/9, node_to_path/1, should_delete_when_owner_removed/0,
+         check_publish_options/2]).
+
+-ignore_xref([check_publish_options/2]).
 
 based_on() ->  node_flat.
 
@@ -72,18 +75,19 @@ publish_item(ServerHost, Nidx, Publisher, Model, _MaxItems, _ItemId, _ItemPublis
             {error, mongoose_xmpp_errors:forbidden()}
     end.
 
+-spec check_publish_options(#{binary() => [binary()]} | invalid_form, #{binary() => [binary()]}) ->
+    boolean().
+check_publish_options(#{<<"device_id">> := _, <<"service">> := _}, _) ->
+    false;
+check_publish_options(_, _) ->
+    true.
+
 do_publish_item(ServerHost, PublishOptions,
                 [#xmlel{name = <<"notification">>} | _] = Notifications) ->
-    case catch parse_form(PublishOptions) of
-        #{<<"device_id">> := _, <<"service">> := _} = OptionMap ->
-            NotificationRawForms = [exml_query:subelement(El, <<"x">>) || El <- Notifications],
-            NotificationForms = [parse_form(Form) || Form <- NotificationRawForms],
-            Result = mongoose_hooks:push_notifications(ServerHost, ok,
-                                                       NotificationForms, OptionMap),
-            handle_push_hook_result(Result);
-        _ ->
-            {error, mod_pubsub:extended_error(mongoose_xmpp_errors:conflict(), <<"precondition-not-met">>)}
-    end;
+    NotificationForms = [parse_form(El) || El <- Notifications],
+    OptionMap = parse_form(PublishOptions),
+    Result = mongoose_hooks:push_notifications(ServerHost, ok, NotificationForms, OptionMap),
+    handle_push_hook_result(Result);
 do_publish_item(_ServerHost, _PublishOptions, _Payload) ->
     {error, mongoose_xmpp_errors:bad_request()}.
 
@@ -110,25 +114,15 @@ is_allowed_to_publish(PublishModel, Affiliation) ->
               or (Affiliation == publisher)
               or (Affiliation == publish_only)).
 
-
--spec parse_form(undefined | exml:element()) -> invalid_form | #{atom() => binary()}.
+-spec parse_form(undefined | exml:element()) -> invalid_form | #{binary() => binary()}.
 parse_form(undefined) ->
     #{};
-parse_form(Form) ->
-    IsForm = ?NS_XDATA == exml_query:attr(Form, <<"xmlns">>),
-    IsSubmit = <<"submit">> == exml_query:attr(Form, <<"type">>, <<"submit">>),
-
-    FieldsXML = exml_query:subelements(Form, <<"field">>),
-    Fields = [{exml_query:attr(Field, <<"var">>),
-               exml_query:path(Field, [{element, <<"value">>}, cdata])} || Field <- FieldsXML],
-    {_, CustomFields} = lists:partition(
-        fun({Name, _}) ->
-            Name == <<"FORM_TYPE">>
-        end, Fields),
-
-    case IsForm andalso IsSubmit of
-        true ->
-            maps:from_list(CustomFields);
-        false ->
+parse_form(Parent) ->
+    case mongoose_data_forms:find_and_parse_form(Parent) of
+        #{type := <<"submit">>, kvs := KVs} ->
+            maps:filtermap(fun(_, [V]) -> {true, V};
+                              (_, _) -> false
+                           end, KVs);
+        _ ->
             invalid_form
     end.

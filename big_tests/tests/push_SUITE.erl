@@ -1,11 +1,9 @@
 -module(push_SUITE).
--compile(export_all).
--include_lib("escalus/include/escalus.hrl").
+-compile([export_all, nowarn_export_all]).
+
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
--include_lib("escalus/include/escalus_xmlns.hrl").
 -include_lib("exml/include/exml.hrl").
--include("push_helper.hrl").
 
 -import(muc_light_helper,
     [
@@ -13,6 +11,9 @@
         create_room/6
     ]).
 -import(escalus_ejabberd, [rpc/3]).
+-import(distributed_helper, [subhost_pattern/1]).
+-import(domain_helper, [host_type/0]).
+-import(config_parser_helper, [mod_config/2, config/2]).
 -import(push_helper, [
     enable_stanza/2, enable_stanza/3, enable_stanza/4,
     disable_stanza/1, disable_stanza/2, become_unavailable/1
@@ -21,31 +22,27 @@
 -define(RPC_SPEC, distributed_helper:mim()).
 -define(SESSION_KEY, publish_service).
 
+-define(VIRTUAL_PUBSUB_DOMAIN, <<"virtual.domain">>).
+
 %%--------------------------------------------------------------------
 %% Suite configuration
 %%--------------------------------------------------------------------
 
 all() ->
     [
-        {group, disco},
         {group, toggling},
         {group, pubsub_ful},
         {group, pubsub_less}
     ].
 
 groups() ->
-    G = [
-         {disco, [], [
-                      push_notifications_listed_disco_when_available,
-                      push_notifications_not_listed_disco_when_not_available
-                     ]},
+    [
          {toggling, [parallel], [
                                  enable_should_fail_with_missing_attributes,
                                  enable_should_fail_with_invalid_attributes,
                                  enable_should_succeed_without_form,
                                  enable_with_form_should_fail_with_incorrect_from,
                                  enable_should_accept_correct_from,
-                                 enable_should_fail_with_invalid_pubsub_jid,
                                  disable_should_fail_with_missing_attributes,
                                  disable_should_fail_with_invalid_attributes,
                                  disable_all,
@@ -61,7 +58,8 @@ groups() ->
                                              pm_no_msg_notifications_if_user_online,
                                              pm_msg_notify_if_user_offline,
                                              pm_msg_notify_if_user_offline_with_publish_options,
-                                             pm_msg_notify_stops_after_disabling
+                                             pm_msg_notify_stops_after_disabling,
+                                             pm_msg_notify_stops_after_removal
                                             ]},
          {muclight_msg_notifications, [parallel], [
                                                    muclight_no_msg_notifications_if_not_enabled,
@@ -70,8 +68,7 @@ groups() ->
                                                    muclight_msg_notify_if_user_offline_with_publish_options,
                                                    muclight_msg_notify_stops_after_disabling
                                                   ]}
-        ],
-    ct_helper:repeat_all_until_all_ok(G).
+    ].
 
 notification_groups() ->
     [
@@ -91,145 +88,71 @@ suite() ->
 init_per_suite(Config) ->
     %% For mocking with unnamed functions
     mongoose_helper:inject_module(?MODULE),
-    start_execution_queue(),
     escalus:init_per_suite(Config).
 end_per_suite(Config) ->
     escalus_fresh:clean(),
-    stop_execution_queue(),
     escalus:end_per_suite(Config).
 
-init_per_group(disco, Config) ->
-    escalus:create_users(Config, escalus:get_users([alice]));
 init_per_group(pubsub_ful, Config) ->
     [{pubsub_host, real} | Config];
 init_per_group(pubsub_less, Config) ->
     [{pubsub_host, virtual} | Config];
-init_per_group(muclight_msg_notifications, Config0) ->
-    Host = ct:get_config({hosts, mim, domain}),
-    Config = ensure_pusher_module_and_save_old_mods(Config0),
-    dynamic_modules:ensure_modules(Host, [{mod_muc_light,
-                                           [{host, binary_to_list(?MUCHOST)},
-                                            {backend, mongoose_helper:mnesia_or_rdbms_backend()},
-                                            {rooms_in_rosters, true}]}]),
-    rpc(mod_muc_light_db_backend, force_clear, []),
+init_per_group(muclight_msg_notifications = GroupName, Config0) ->
+    HostType = host_type(),
+    Config = dynamic_modules:save_modules(HostType, Config0),
+    dynamic_modules:ensure_modules(HostType, required_modules(GroupName)),
+    muc_light_helper:clear_db(HostType),
     Config;
-init_per_group(_, Config) ->
-    ensure_pusher_module_and_save_old_mods(Config).
+init_per_group(GroupName, Config0) ->
+    HostType = host_type(),
+    Config = dynamic_modules:save_modules(HostType, Config0),
+    dynamic_modules:ensure_modules(HostType, required_modules(GroupName)),
+    Config.
 
-end_per_group(disco, Config) ->
-    escalus:delete_users(Config),
-    Config;
 end_per_group(ComplexGroup, Config) when ComplexGroup == pubsub_ful;
                                          ComplexGroup == pubsub_less ->
     Config;
 end_per_group(_, Config) ->
-    restore_modules(Config),
-    Config.
+    dynamic_modules:restore_modules(Config).
 
-init_per_testcase(CaseName = push_notifications_listed_disco_when_available, Config1) ->
-    Config2 = ensure_pusher_module_and_save_old_mods(Config1),
-    escalus:init_per_testcase(CaseName, Config2);
-init_per_testcase(CaseName = push_notifications_not_listed_disco_when_not_available, Config) ->
-    escalus:init_per_testcase(CaseName, Config);
 init_per_testcase(CaseName, Config0) ->
     Config1 = escalus_fresh:create_users(Config0, [{bob, 1}, {alice, 1}, {kate, 1}]),
-    Config = [{case_name, CaseName} | Config1],
+    Config2 = add_pubsub_jid([{case_name, CaseName} | Config1]),
 
-    case ?config(pubsub_host, Config0) of
-        virtual ->
-            add_virtual_host_to_pusher(pubsub_jid(Config)),
-            start_hook_listener();
-        _ ->
-            start_route_listener(CaseName)
-    end,
+    Config = case ?config(pubsub_host, Config0) of
+                 virtual ->
+                     start_hook_listener(Config2);
+                 _ ->
+                     start_route_listener(Config2)
+             end,
 
     escalus:init_per_testcase(CaseName, Config).
 
-end_per_testcase(CaseName = push_notifications_listed_disco_when_available, Config) ->
-    restore_modules(Config),
-    escalus:end_per_testcase(CaseName, Config);
-end_per_testcase(CaseName = push_notifications_not_listed_disco_when_not_available, Config) ->
-    escalus:end_per_testcase(CaseName, Config);
 end_per_testcase(CaseName, Config) ->
-    rpc(ejabberd_router, unregister_route, [atom_to_binary(CaseName, utf8)]),
+    case ?config(pubsub_host, Config) of
+        virtual ->
+            stop_hook_listener(Config);
+        _ ->
+            stop_route_listener(Config)
+    end,
     escalus:end_per_testcase(CaseName, Config).
 
 %% --------------------- Helpers ------------------------
-execution_queue() ->
-    receive
-        {Pid, Fun, Args} when is_pid(Pid), is_list(Args), is_function(Fun, length(Args)) ->
-            Ret = (catch apply(Fun, Args)),
-            Pid ! {ret, Ret},
-            execution_queue();
-        {Pid, stop} when is_pid(Pid) ->
-            Pid ! stopped
-    end.
 
-start_execution_queue() ->
-    register(execution_queue, spawn(fun execution_queue/0)).
+required_modules(muclight_msg_notifications) ->
+    [pusher_module(), muc_light_module()];
+required_modules(_) ->
+    [pusher_module()].
 
-stop_execution_queue() ->
-    execution_queue ! {self(), stop},
-    receive
-        stopped -> ok
-    end.
+pusher_module() ->
+    PushOpts = #{backend => mongoose_helper:mnesia_or_rdbms_backend(),
+                 virtual_pubsub_hosts => [subhost_pattern(?VIRTUAL_PUBSUB_DOMAIN)]},
+    {mod_event_pusher, #{push => config([modules, mod_event_pusher, push], PushOpts)}}.
 
-queue(F, A) -> queue(F, A, 5000).
-
-queue(F, A, Timeout) ->
-    execution_queue ! {self(), F, A},
-    receive
-        {ret, Ret} -> Ret
-    after Timeout ->
-        error({timeout, F, A, Timeout})
-    end.
-
-add_virtual_host_to_pusher(VirtualHost) ->
-    %% this function is executed in parallel environment,
-    %% so to prevent race conditions queue rpc calls.
-    Args = [mod_event_pusher_push, add_virtual_pubsub_host, [<<"localhost">>, VirtualHost]],
-    queue(fun escalus_ejabberd:rpc/3, Args).
-
-ensure_pusher_module_and_save_old_mods(Config) ->
-    PushOpts = [{backend, mongoose_helper:mnesia_or_rdbms_backend()}],
-    Host = ct:get_config({hosts, mim, domain}),
-    Config1 = dynamic_modules:save_modules(Host, Config),
-    PusherMod = {mod_event_pusher, [{backends, [{push, PushOpts}]}]},
-    dynamic_modules:ensure_modules(Host, [PusherMod]),
-    [{push_opts, PushOpts} | Config1].
-
-restore_modules(Config) ->
-    Host = ct:get_config({hosts, mim, domain}),
-    dynamic_modules:restore_modules(Host, Config).
-
-%%--------------------------------------------------------------------
-%% GROUP disco
-%%--------------------------------------------------------------------
-
-push_notifications_listed_disco_when_available(Config) ->
-    escalus:story(
-        Config, [{alice, 1}],
-        fun(Alice) ->
-            Server = escalus_client:server(Alice),
-            escalus:send(Alice, escalus_stanza:disco_info(Server)),
-            Stanza = escalus:wait_for_stanza(Alice),
-            escalus:assert(is_iq_result, Stanza),
-            escalus:assert(has_feature, [push_helper:ns_push()], Stanza),
-            ok
-        end).
-
-push_notifications_not_listed_disco_when_not_available(Config) ->
-    escalus:story(
-        Config, [{alice, 1}],
-        fun(Alice) ->
-            Server = escalus_client:server(Alice),
-            escalus:send(Alice, escalus_stanza:disco_info(Server)),
-            Stanza = escalus:wait_for_stanza(Alice),
-            escalus:assert(is_iq_result, Stanza),
-            Pred = fun(Feature, Stanza0) -> not escalus_pred:has_feature(Feature, Stanza0) end,
-            escalus:assert(Pred, [push_helper:ns_push()], Stanza),
-            ok
-        end).
+muc_light_module() ->
+    {mod_muc_light,
+     mod_config(mod_muc_light, #{backend => mongoose_helper:mnesia_or_rdbms_backend(),
+                                 rooms_in_rosters => true})}.
 
 %%--------------------------------------------------------------------
 %% GROUP toggling
@@ -251,10 +174,10 @@ enable_should_fail_with_missing_attributes(Config) ->
 
             %% Sending only one attribute should fail
             lists:foreach(
-                fun(Attr) ->
+                fun({K, V}) ->
                     escalus:send(Bob, escalus_stanza:iq(<<"set">>,
                                                         [#xmlel{name = <<"enable">>,
-                                                                attrs = [Attr]}])),
+                                                                attrs = #{K => V}}])),
                     escalus:assert(is_error, [<<"modify">>, <<"bad-request">>],
                                    escalus:wait_for_stanza(Bob))
                 end, CorrectAttrs),
@@ -262,9 +185,10 @@ enable_should_fail_with_missing_attributes(Config) ->
             %% Sending all but one attribute should fail
             lists:foreach(
                 fun(Attr) ->
+                    Attrs = #{K => V || {K, V} <- CorrectAttrs -- [Attr]},
                     escalus:send(Bob, escalus_stanza:iq(<<"set">>,
                                                         [#xmlel{name = <<"enable">>,
-                                                                attrs = CorrectAttrs -- [Attr]}])),
+                                                                attrs = Attrs}])),
                     escalus:assert(is_error, [<<"modify">>, <<"bad-request">>],
                                    escalus:wait_for_stanza(Bob))
                 end, CorrectAttrs),
@@ -285,6 +209,12 @@ enable_should_fail_with_invalid_attributes(Config) ->
 
             %% Empty node
             escalus:send(Bob, enable_stanza(PubsubJID, <<>>)),
+            escalus:assert(is_error, [<<"modify">>, <<"bad-request">>],
+                           escalus:wait_for_stanza(Bob)),
+
+            %% Missing value
+            escalus:send(Bob, enable_stanza(PubsubJID, <<"nodeId">>,
+                                            [{<<"secret1">>, undefined}])),
             escalus:assert(is_error, [<<"modify">>, <<"bad-request">>],
                            escalus:wait_for_stanza(Bob)),
             ok
@@ -333,16 +263,6 @@ enable_should_accept_correct_from(Config) ->
             ok
         end).
 
-enable_should_fail_with_invalid_pubsub_jid(Config) ->
-    escalus:story(
-        Config, [{bob, 1}],
-        fun(Bob) ->
-            escalus:send(Bob, enable_stanza(<<"invalid_pubsub_jid">>, <<"NodeId">>)),
-            escalus:assert(is_error, [<<"cancel">>, <<"remote-server-not-found">>],
-                           escalus:wait_for_stanza(Bob)),
-            ok
-        end).
-
 disable_should_fail_with_missing_attributes(Config) ->
     escalus:story(
         Config, [{bob, 1}],
@@ -357,10 +277,10 @@ disable_should_fail_with_missing_attributes(Config) ->
 
             %% Sending only one attribute should fail
             lists:foreach(
-                fun(Attr) ->
+                fun({K,V}) ->
                     escalus:send(Bob, escalus_stanza:iq(<<"set">>,
                                                         [#xmlel{name = <<"disable">>,
-                                                                attrs = [Attr]}])),
+                                                                attrs = #{K => V}}])),
                     escalus:assert(is_error, [<<"modify">>, <<"bad-request">>],
                                    escalus:wait_for_stanza(Bob))
                 end, CorrectAttrs),
@@ -416,13 +336,13 @@ disable_node_enabled_in_session_removes_it_from_session_info(Config) ->
             escalus:assert(is_iq_result, escalus:wait_for_stanza(Bob)),
 
             Info = mongoose_helper:get_session_info(?RPC_SPEC, Bob),
-            {?SESSION_KEY, {_JID, NodeId, _}} = lists:keyfind(?SESSION_KEY, 1, Info),
+            {_JID, NodeId, _} = maps:get(?SESSION_KEY, Info),
 
             escalus:send(Bob, disable_stanza(PubsubJID, NodeId)),
             escalus:assert(is_iq_result, escalus:wait_for_stanza(Bob)),
 
             Info2 = mongoose_helper:get_session_info(?RPC_SPEC, Bob),
-            false = lists:keyfind(?SESSION_KEY, 1, Info2)
+            false = maps:get(?SESSION_KEY, Info2, false)
         end).
 
 disable_all_nodes_removes_it_from_all_user_session_infos(Config) ->
@@ -440,10 +360,10 @@ disable_all_nodes_removes_it_from_all_user_session_infos(Config) ->
             escalus:assert(is_iq_result, escalus:wait_for_stanza(Bob2)),
 
             Info = mongoose_helper:get_session_info(?RPC_SPEC, Bob1),
-            {?SESSION_KEY, {_JID, NodeId, _}} = lists:keyfind(?SESSION_KEY, 1, Info),
+            {JID, NodeId, _} = maps:get(?SESSION_KEY, Info),
 
             Info2 = mongoose_helper:get_session_info(?RPC_SPEC, Bob2),
-            {?SESSION_KEY, {_JID, NodeId2, _}} = lists:keyfind(?SESSION_KEY, 1, Info2),
+            {JID, NodeId2, _} = maps:get(?SESSION_KEY, Info2),
 
             %% Now Bob1 disables all nodes
             escalus:send(Bob1, disable_stanza(PubsubJID)),
@@ -451,10 +371,10 @@ disable_all_nodes_removes_it_from_all_user_session_infos(Config) ->
 
             %% And we check if Bob1 and Bob2 have push notifications cleared from session info
             Info3 = mongoose_helper:get_session_info(?RPC_SPEC, Bob1),
-            false = lists:keyfind(?SESSION_KEY, 1, Info3),
+            false = maps:get(?SESSION_KEY, Info3, false),
 
             Info4 = mongoose_helper:get_session_info(?RPC_SPEC, Bob2),
-            false = lists:keyfind(?SESSION_KEY, 1, Info4)
+            false = maps:get(?SESSION_KEY, Info4, false)
         end).
 
 disable_node_enabled_in_other_session_leaves_current_info_unchanged(Config) ->
@@ -472,10 +392,10 @@ disable_node_enabled_in_other_session_leaves_current_info_unchanged(Config) ->
             escalus:assert(is_iq_result, escalus:wait_for_stanza(Bob2)),
 
             Info = mongoose_helper:get_session_info(?RPC_SPEC, Bob1),
-            {?SESSION_KEY, {_JID, NodeId, _}} = lists:keyfind(?SESSION_KEY, 1, Info),
+            {JID, NodeId, _} = maps:get(?SESSION_KEY, Info),
 
             Info2 = mongoose_helper:get_session_info(?RPC_SPEC, Bob2),
-            {?SESSION_KEY, {_JID, NodeId2, _}} = lists:keyfind(?SESSION_KEY, 1, Info2),
+            {JID, NodeId2, _} = maps:get(?SESSION_KEY, Info2),
 
             %% Now Bob1 disables the node registered by Bob2
             escalus:send(Bob1, disable_stanza(PubsubJID, NodeId)),
@@ -483,7 +403,7 @@ disable_node_enabled_in_other_session_leaves_current_info_unchanged(Config) ->
 
             %% And we check if Bob1 still has its own Node in the session info
             Info3 = mongoose_helper:get_session_info(?RPC_SPEC, Bob1),
-            false = lists:keyfind(?SESSION_KEY, 1, Info3)
+            false = maps:get(?SESSION_KEY, Info3, false)
         end).
 
 %%--------------------------------------------------------------------
@@ -497,7 +417,7 @@ pm_no_msg_notifications_if_not_enabled(Config) ->
             become_unavailable(Bob),
             escalus:send(Alice, escalus_stanza:chat_to(Bob, <<"OH, HAI!">>)),
 
-            ?assert(not truly(received_push(Config))),
+            ?assert(not truly(received_push())),
             ok
         end).
 
@@ -511,8 +431,9 @@ pm_no_msg_notifications_if_user_online(Config) ->
             escalus:assert(is_iq_result, escalus:wait_for_stanza(Bob)),
 
             escalus:send(Alice, escalus_stanza:chat_to(Bob, <<"OH, HAI!">>)),
+            escalus:assert(is_message, escalus:wait_for_stanza(Bob)),
 
-            ?assert(not truly(received_push(Config))),
+            ?assert(not truly(received_push())),
             ok
         end).
 
@@ -529,7 +450,7 @@ pm_msg_notify_if_user_offline(Config) ->
 
             escalus:send(Alice, escalus_stanza:chat_to(Bob, <<"OH, HAI!">>)),
 
-            #{ payload := Payload } = received_push(Config),
+            #{ payload := Payload } = received_push(),
             ?assertMatch(<<"OH, HAI!">>, proplists:get_value(<<"last-message-body">>, Payload)),
             ?assertMatch(AliceJID,
                          proplists:get_value(<<"last-message-sender">>, Payload)),
@@ -551,7 +472,7 @@ pm_msg_notify_if_user_offline_with_publish_options(Config) ->
 
             escalus:send(Alice, escalus_stanza:chat_to(Bob, <<"OH, HAI!">>)),
 
-            #{ publish_options := PublishOptions } = received_push(Config),
+            #{ publish_options := PublishOptions } = received_push(),
 
             ?assertMatch(<<"value1">>, proplists:get_value(<<"field1">>, PublishOptions)),
             ?assertMatch(<<"value2">>, proplists:get_value(<<"field2">>, PublishOptions)),
@@ -575,9 +496,34 @@ pm_msg_notify_stops_after_disabling(Config) ->
 
             escalus:send(Alice, escalus_stanza:chat_to(Bob, <<"OH, HAI!">>)),
 
-            ?assert(not received_push(Config)),
+            ?assert(not received_push()),
 
             ok
+        end).
+
+pm_msg_notify_stops_after_removal(Config) ->
+    PubsubJID = pubsub_jid(Config),
+    escalus:story(
+        Config, [{bob, 1}],
+        fun(Bob) ->
+            %% Enable
+            escalus:send(Bob, enable_stanza(PubsubJID, <<"NodeId">>, [])),
+            escalus:assert(is_iq_result, escalus:wait_for_stanza(Bob)),
+
+            %% Remove account - this should disable the notifications
+            Pid = mongoose_helper:get_session_pid(Bob, distributed_helper:mim()),
+            escalus_connection:send(Bob, escalus_stanza:remove_account()),
+            escalus:assert(is_iq_result, escalus:wait_for_stanza(Bob)),
+            mongoose_helper:wait_for_pid_to_die(Pid)
+        end),
+    BobUser = lists:keyfind(bob, 1, escalus_config:get_config(escalus_users, Config)),
+    escalus_users:create_user(Config, BobUser),
+    escalus:story(
+        Config, [{bob, 1}, {alice, 1}],
+        fun(Bob, Alice) ->
+            become_unavailable(Bob),
+            escalus:send(Alice, escalus_stanza:chat_to(Bob, <<"OH, HAI!">>)),
+            ?assert(not truly(received_push()))
         end).
 
 %%--------------------------------------------------------------------
@@ -598,7 +544,7 @@ muclight_no_msg_notifications_if_not_enabled(Config) ->
 
             escalus:send(Bob, Stanza),
 
-            ?assert(not truly(received_push(Config))),
+            ?assert(not truly(received_push())),
 
             ok
         end).
@@ -619,7 +565,7 @@ muclight_no_msg_notifications_if_user_online(Config) ->
             Stanza = escalus_stanza:groupchat_to(room_bin_jid(Room), Msg),
             escalus:send(Bob, Stanza),
 
-            ?assert(not truly(received_push(Config))),
+            ?assert(not truly(received_push())),
             ok
         end).
 
@@ -640,7 +586,7 @@ muclight_msg_notify_if_user_offline(Config) ->
             Stanza = escalus_stanza:groupchat_to(room_bin_jid(Room), Msg),
             escalus:send(Bob, Stanza),
 
-            #{ payload := Payload } = received_push(Config),
+            #{ payload := Payload } = received_push(),
 
             ?assertMatch(Msg, proplists:get_value(<<"last-message-body">>, Payload)),
             SenderId = <<(room_bin_jid(Room))/binary, "/" ,BobJID/binary>>,
@@ -667,7 +613,7 @@ muclight_msg_notify_if_user_offline_with_publish_options(Config) ->
             Stanza = escalus_stanza:groupchat_to(room_bin_jid(Room), Msg),
             escalus:send(Bob, Stanza),
 
-            #{ publish_options := PublishOptions } = received_push(Config),
+            #{ publish_options := PublishOptions } = received_push(),
 
             ?assertMatch(<<"value1">>, proplists:get_value(<<"field1">>, PublishOptions)),
             ?assertMatch(<<"value2">>, proplists:get_value(<<"field2">>, PublishOptions)),
@@ -695,7 +641,7 @@ muclight_msg_notify_stops_after_disabling(Config) ->
             Stanza = escalus_stanza:groupchat_to(room_bin_jid(Room), Msg),
             escalus:send(Bob, Stanza),
 
-            ?assert(not truly(received_push(Config))),
+            ?assert(not truly(received_push())),
             ok
         end).
 
@@ -704,15 +650,21 @@ muclight_msg_notify_stops_after_disabling(Config) ->
 %% Functions that will be executed in MongooseIM context + helpers that set them up
 %%--------------------------------------------------------------------
 
-start_route_listener(CaseName) ->
+start_route_listener(Config) ->
     %% We put namespaces in the state to avoid injecting push_helper module to MIM as well
     State = #{ pid => self(),
                pub_options_ns => push_helper:ns_pubsub_pub_options(),
                push_form_ns => push_helper:push_form_type() },
-    Handler = rpc(mongoose_packet_handler, new, [?MODULE, State]),
-    rpc(ejabberd_router, register_route, [atom_to_binary(CaseName, utf8), Handler]).
+    Handler = rpc(mongoose_packet_handler, new, [?MODULE, #{state => State}]),
+    Domain = pubsub_domain(Config),
+    rpc(mongoose_router, register_route, [Domain, Handler]),
+    Config.
 
-process_packet(_Acc, _From, To, El, State) ->
+stop_route_listener(Config) ->
+    Domain = pubsub_domain(Config),
+    rpc(mongoose_router, unregister_route, [Domain]).
+
+process_packet(Acc, _From, To, El, #{state := State}) ->
     #{ pid := TestCasePid, pub_options_ns := PubOptionsNS, push_form_ns := PushFormNS } = State,
     PublishXML = exml_query:path(El, [{element, <<"pubsub">>},
                                       {element, <<"publish-options">>},
@@ -729,16 +681,15 @@ process_packet(_Acc, _From, To, El, State) ->
     case valid_ns_if_defined(PubOptionsNS, PublishOptions) andalso
          valid_ns_if_defined(PushFormNS, Payload) of
         true ->
-            TestCasePid ! #{ publish_options => PublishOptions,
-                             payload => Payload,
-                             pubsub_jid_bin => jid:to_binary(To) };
+            TestCasePid ! push_notification(jid:to_binary(To), Payload, PublishOptions);
         false ->
             %% We use publish_options0 and payload0 to avoid accidental match in received_push
             %% even after some tests updates and refactors
             TestCasePid ! #{ error => invalid_namespace,
                              publish_options0 => PublishOptions,
                              payload0 => Payload }
-    end.
+    end,
+    Acc.
 
 parse_form(undefined) ->
     undefined;
@@ -756,45 +707,57 @@ valid_ns_if_defined(_, undefined) ->
 valid_ns_if_defined(NS, FormProplist) ->
     NS =:= proplists:get_value(<<"FORM_TYPE">>, FormProplist).
 
-start_hook_listener() ->
+start_hook_listener(Config) ->
     TestCasePid = self(),
-    rpc(?MODULE, rpc_start_hook_handler, [TestCasePid]).
+    PubSubJID = pubsub_jid(Config),
+    rpc(?MODULE, rpc_start_hook_handler, [TestCasePid, PubSubJID]),
+    [{pid, TestCasePid}, {jid, PubSubJID} | Config].
 
-rpc_start_hook_handler(TestCasePid) ->
-    Handler = fun(Acc, _Host, [PayloadMap], OptionMap) ->
-                      try jid:to_binary(mongoose_acc:get(push_notifications, pubsub_jid, Acc)) of
-                          PubsubJIDBin ->
-                              TestCasePid ! #{ publish_options => maps:to_list(OptionMap),
-                                               payload => maps:to_list(PayloadMap),
-                                               pubsub_jid_bin => PubsubJIDBin },
-                              Acc
-                      catch
-                          C:R:S ->
-                              TestCasePid ! #{ event => handler_error,
-                                               class => C,
-                                               reason => R,
-                                               stacktrace => S },
-                              Acc
-                      end
-              end,
-    ejabberd_hooks:add(push_notifications, <<"localhost">>, Handler, 50).
+stop_hook_listener(Config) ->
+    TestCasePid = proplists:get_value(pid, Config),
+    PubSubJID = proplists:get_value(jid, Config),
+    rpc(?MODULE, rpc_stop_hook_handler, [TestCasePid, PubSubJID]).
+
+rpc_start_hook_handler(TestCasePid, PubSubJID) ->
+    gen_hook:add_handler(push_notifications,  <<"localhost">>,
+                         fun ?MODULE:hook_handler_fn/3,
+                         #{pid => TestCasePid, jid => PubSubJID}, 50).
+
+hook_handler_fn(Acc,
+                #{notification_forms := [PayloadMap], options := OptionMap} = _Params,
+                #{pid := TestCasePid, jid := PubSubJID} = _Extra) ->
+    try jid:to_binary(mongoose_acc:get(push_notifications, pubsub_jid, Acc)) of
+        PubSubJIDBin when PubSubJIDBin =:= PubSubJID ->
+            TestCasePid ! push_notification(PubSubJIDBin,
+                                            maps:to_list(PayloadMap),
+                                            maps:to_list(OptionMap));
+        _ -> ok
+    catch
+        C:R:S ->
+            TestCasePid ! #{event => handler_error,
+                            class => C,
+                            reason => R,
+                            stacktrace => S}
+    end,
+    {ok, Acc}.
+
+rpc_stop_hook_handler(TestCasePid, PubSubJID) ->
+    gen_hook:delete_handler(push_notifications, <<"localhost">>,
+                            fun ?MODULE:hook_handler_fn/3,
+                            #{pid => TestCasePid, jid => PubSubJID}, 50).
 
 %%--------------------------------------------------------------------
 %% Test helpers
 %%--------------------------------------------------------------------
 
 create_room(Room, [Owner | Members], Config) ->
-    Domain = ct:get_config({hosts, mim, domain}),
+    Domain = domain_helper:domain(),
     create_room(Room, <<"muclight.", Domain/binary>>, Owner, Members,
                                 Config, <<"v1">>).
 
-received_push(Config) ->
-    ExpectedPubsubJIDBin = pubsub_jid(Config),
-    %% With parallel test cases execution we might receive notifications from other cases
-    %% so it's essential to filter by our pubsub JID
+received_push() ->
     receive
-        #{ pubsub_jid_bin := PubsubJIDBin } = Push when PubsubJIDBin =:= ExpectedPubsubJIDBin ->
-            Push
+        #{ push_notification := true } = Push -> Push
     after
         timer:seconds(5) ->
             ct:pal("~p", [#{ result => nomatch, msg_inbox => process_info(self(), messages) }]),
@@ -803,32 +766,46 @@ received_push(Config) ->
 
 truly(false) ->
     false;
-truly(undefined) ->
-    false;
-truly(_) ->
+truly(#{ push_notification := true }) ->
     true.
+
+push_notification(PubsubJID, Payload, PublishOpts) ->
+    #{push_notification => true, pubsub_jid_bin => PubsubJID,
+      publish_options => PublishOpts, payload => Payload}.
 
 bare_jid(JIDOrClient) ->
     ShortJID = escalus_client:short_jid(JIDOrClient),
-    list_to_binary(string:to_lower(binary_to_list(ShortJID))).
+    string:lowercase(ShortJID).
 
-pubsub_jid(Config) ->
+add_pubsub_jid(Config) ->
     CaseName = proplists:get_value(case_name, Config),
     CaseNameBin = atom_to_binary(CaseName, utf8),
-    case ?config(pubsub_host, Config) of
-        virtual -> <<CaseNameBin/binary, ".hyperion">>;
-        _ -> <<"pubsub@", CaseNameBin/binary>>
-    end.
+    NameSuffix = uniq_name_suffix(),
+    UniqID = <<CaseNameBin/binary, "_", NameSuffix/binary>>,
+    {PubSubNodeName, PubSubDomain} =
+        case ?config(pubsub_host, Config) of
+            virtual ->
+                %% unique node name, but preconfigured domain name
+                {UniqID, ?VIRTUAL_PUBSUB_DOMAIN};
+            _ ->
+                %% any node name, but unique domain. unique domain
+                %% is required to intercept safely message routing
+                {<<"pub-sub">>, UniqID}
+        end,
+    PubSubJID = <<PubSubNodeName/binary, "@", PubSubDomain/binary>>,
+    [{pubsub_jid, PubSubJID}, {pubsub_domain, PubSubDomain} | Config].
+
+uniq_name_suffix() ->
+    {_, S, US} = erlang:timestamp(),
+    L = lists:flatten([integer_to_list(S rem 100), ".", integer_to_list(US)]),
+    list_to_binary(L).
+
+pubsub_domain(Config) ->
+    proplists:get_value(pubsub_domain, Config).
+
+pubsub_jid(Config) ->
+    proplists:get_value(pubsub_jid, Config).
 
 room_name(Config) ->
     CaseName = proplists:get_value(case_name, Config),
     <<"room_", (atom_to_binary(CaseName, utf8))/binary>>.
-
-is_offline(LUser, LServer) ->
-    case catch lists:max(rpc(ejabberd_sm, get_user_present_pids, [LUser, LServer])) of
-        {Priority, _} when is_integer(Priority), Priority >= 0 ->
-            false;
-        _ ->
-            true
-    end.
-

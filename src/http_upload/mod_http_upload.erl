@@ -19,90 +19,136 @@
 -behaviour(gen_mod).
 -behaviour(mongoose_module_metrics).
 
--xep([{xep, 363}, {version, "0.2.5"}]).
--xep([{xep, 363}, {version, "0.3.0"}]).
+-xep([{xep, 363}, {version, "1.1.0"}]).
 
 -include("jlib.hrl").
 -include("mongoose.hrl").
+-include("mongoose_config_spec.hrl").
 
 -define(DEFAULT_TOKEN_BYTES, 32).
 -define(DEFAULT_MAX_FILE_SIZE, 10 * 1024 * 1024). % 10 MB
 -define(DEFAULT_SUBHOST, <<"upload.@HOST@">>).
 
--export([start/2, stop/1, iq_handler/4, get_urls/5]).
+%% gen_mod callbacks
+-export([start/2,
+         stop/1,
+         hooks/1,
+         config_spec/0,
+         supported_features/0]).
 
-%% Hook implementations
--export([get_disco_identity/5, get_disco_items/5, get_disco_features/5, get_disco_info/5]).
+%% IQ and hooks handlers
+-export([process_iq/5,
+         process_disco_iq/5,
+         disco_local_items/3]).
 
+%% API
+-export([get_urls/5]).
+
+%% mongoose_module_metrics callbacks
 -export([config_metrics/1]).
-
-%%--------------------------------------------------------------------
-%% Callbacks
-%%--------------------------------------------------------------------
-
--callback create_slot(UTCDateTime :: calendar:datetime(), UUID :: binary(),
-                      Filename :: unicode:unicode_binary(), ContentType :: binary() | undefined,
-                      Size :: pos_integer(), Opts :: proplists:proplist()) ->
-    {PUTURL :: binary(), GETURL :: binary(), Headers :: #{binary() => binary()}}.
 
 %%--------------------------------------------------------------------
 %% API
 %%--------------------------------------------------------------------
 
--spec start(Host :: jid:server(), Opts :: list()) -> any().
-start(Host, Opts) ->
-    IQDisc = gen_mod:get_opt(iqdisc, Opts, one_queue),
-    SubHost = subhost(Host),
-    mod_disco:register_subhost(Host, SubHost),
-    mongoose_subhosts:register(Host, SubHost),
-    ejabberd_hooks:add(disco_local_features, SubHost, ?MODULE, get_disco_features, 90),
-    ejabberd_hooks:add(disco_local_identity, SubHost, ?MODULE, get_disco_identity, 90),
-    ejabberd_hooks:add(disco_info, SubHost, ?MODULE, get_disco_info, 90),
-    ejabberd_hooks:add(disco_local_items, Host, ?MODULE, get_disco_items, 90),
-    gen_iq_handler:add_iq_handler(ejabberd_local, SubHost, ?NS_HTTP_UPLOAD_025, ?MODULE,
-                                  iq_handler, IQDisc),
-    gen_iq_handler:add_iq_handler(ejabberd_local, SubHost, ?NS_HTTP_UPLOAD_030, ?MODULE,
-                                  iq_handler, IQDisc),
-    gen_mod:start_backend_module(?MODULE, with_default_backend(Opts), [create_slot]).
+-spec start(HostType :: mongooseim:host_type(), Opts :: gen_mod:module_opts()) -> ok.
+start(HostType, Opts = #{iqdisc := IQDisc}) ->
+    SubdomainPattern = subdomain_pattern(HostType),
+    PacketHandler = mongoose_packet_handler:new(ejabberd_local),
 
+    mongoose_domain_api:register_subdomain(HostType, SubdomainPattern, PacketHandler),
+    [gen_iq_handler:add_iq_handler_for_subdomain(HostType, SubdomainPattern, Namespace,
+                                                 Component, Fn, #{}, IQDisc) ||
+        {Component, Namespace, Fn} <- iq_handlers()],
+    mod_http_upload_backend:init(HostType, Opts),
+    ok.
 
--spec stop(Host :: jid:server()) -> any().
-stop(Host) ->
-    SubHost = subhost(Host),
-    gen_iq_handler:remove_iq_handler(ejabberd_local, SubHost, ?NS_HTTP_UPLOAD_030),
-    gen_iq_handler:remove_iq_handler(ejabberd_local, SubHost, ?NS_HTTP_UPLOAD_025),
-    ejabberd_hooks:delete(disco_local_items, Host, ?MODULE, get_disco_items, 90),
-    ejabberd_hooks:delete(disco_info, SubHost, ?MODULE, get_disco_info, 90),
-    ejabberd_hooks:delete(disco_local_identity, SubHost, ?MODULE, get_disco_identity, 90),
-    ejabberd_hooks:delete(disco_local_features, SubHost, ?MODULE, get_disco_features, 90),
-    mongoose_subhosts:unregister(SubHost),
-    mod_disco:unregister_subhost(Host, SubHost).
+-spec stop(HostType :: mongooseim:host_type()) -> ok.
+stop(HostType) ->
+    SubdomainPattern = subdomain_pattern(HostType),
 
+    [gen_iq_handler:remove_iq_handler_for_subdomain(HostType, SubdomainPattern, Namespace,
+                                                    Component) ||
+        {Component, Namespace, _Fn} <- iq_handlers()],
 
--spec iq_handler(From :: jid:jid(), To :: jid:jid(), Acc :: mongoose_acc:t(),
-                 IQ :: jlib:iq()) ->
+    mongoose_domain_api:unregister_subdomain(HostType, SubdomainPattern),
+    ok.
+
+iq_handlers() ->
+    [{ejabberd_local, ?NS_HTTP_UPLOAD_030, fun ?MODULE:process_iq/5},
+     {ejabberd_local, ?NS_DISCO_INFO, fun ?MODULE:process_disco_iq/5}].
+
+hooks(HostType) ->
+    [{disco_local_items, HostType, fun ?MODULE:disco_local_items/3, #{}, 90}].
+
+%%--------------------------------------------------------------------
+%% config_spec
+%%--------------------------------------------------------------------
+
+-spec config_spec() -> mongoose_config_spec:config_section().
+config_spec() ->
+    #section{
+        items = #{<<"iqdisc">> => mongoose_config_spec:iqdisc(),
+                  <<"host">> => #option{type = binary,
+                                        validate = subdomain_template,
+                                        process = fun mongoose_subdomain_utils:make_subdomain_pattern/1},
+                  <<"backend">> => #option{type = atom,
+                                           validate = {module, mod_http_upload}},
+                  <<"expiration_time">> => #option{type = integer,
+                                                   validate = positive},
+                  <<"token_bytes">> => #option{type = integer,
+                                               validate = positive},
+                  <<"max_file_size">> => #option{type = int_or_infinity,
+                                                 validate = positive},
+                  <<"s3">> => s3_spec()
+        },
+        defaults = #{<<"iqdisc">> => one_queue,
+                     <<"host">> => <<"upload.@HOST@">>,
+                     <<"backend">> => s3,
+                     <<"expiration_time">> => 60,
+                     <<"token_bytes">> => 32,
+                     <<"max_file_size">> => ?DEFAULT_MAX_FILE_SIZE
+        },
+        required = [<<"s3">>]
+    }.
+
+s3_spec() ->
+    #section{
+        items = #{<<"bucket_url">> => #option{type = binary,
+                                              validate = url},
+                  <<"add_acl">> => #option{type = boolean},
+                  <<"region">> => #option{type = binary},
+                  <<"access_key_id">> => #option{type = binary},
+                  <<"secret_access_key">> => #option{type = binary}
+        },
+        defaults = #{<<"add_acl">> => false},
+        required = [<<"bucket_url">>, <<"region">>, <<"access_key_id">>, <<"secret_access_key">>]
+    }.
+
+-spec supported_features() -> [atom()].
+supported_features() ->
+    [dynamic_domains].
+
+%%--------------------------------------------------------------------
+%% IQ and hook handlers
+%%--------------------------------------------------------------------
+
+-spec process_iq(Acc :: mongoose_acc:t(), From :: jid:jid(), To :: jid:jid(),
+                 IQ :: jlib:iq(), map()) ->
     {mongoose_acc:t(), jlib:iq() | ignore}.
-iq_handler(_From, _To, Acc, IQ = #iq{type = set, sub_el = SubEl}) ->
-    {Acc, IQ#iq{type = error, sub_el = [SubEl, mongoose_xmpp_errors:not_allowed()]}};
-iq_handler(_From, _To = #jid{lserver = SubHost}, Acc, IQ = #iq{type = get, sub_el = Request}) ->
-    {ok, Host} = mongoose_subhosts:get_host(SubHost),
+process_iq(Acc, _From, _To, IQ = #iq{type = set, lang = Lang, sub_el = SubEl}, _Extra) ->
+    Error = mongoose_xmpp_errors:not_allowed(Lang, <<"IQ set is not allowed for HTTP upload">>),
+    {Acc, IQ#iq{type = error, sub_el = [SubEl, Error]}};
+process_iq(Acc,  _From, _To, IQ = #iq{type = get, sub_el = Request}, _Extra) ->
+    HostType = mongoose_acc:host_type(Acc),
     Res = case parse_request(Request) of
-        {Filename, Size, ContentType, Namespace} ->
-            MaxFileSize = max_file_size(Host),
-            case MaxFileSize =:= undefined orelse Size =< MaxFileSize of
-                true ->
-                    UTCDateTime = calendar:universal_time(),
-                    Token = generate_token(Host),
-                    Opts = module_opts(Host),
-
-                    {PutUrl, GetUrl, Headers} =
-                        mod_http_upload_backend:create_slot(UTCDateTime, Token, Filename,
-                                                            ContentType, Size, Opts),
-
-                    compose_iq_reply(IQ, Namespace, PutUrl, GetUrl, Headers);
-
-                false ->
-                    IQ#iq{type = error, sub_el = [file_too_large_error(MaxFileSize, Namespace)]}
+        {Filename, Size, ContentType} ->
+            Opts = module_opts(HostType),
+            case get_urls_helper(HostType, Filename, Size, ContentType, Opts) of
+                {PutUrl, GetUrl, Headers} ->
+                    compose_iq_reply(IQ, PutUrl, GetUrl, Headers);
+                file_too_large_error ->
+                    IQ#iq{type = error, sub_el = [file_too_large_error(max_file_size(HostType))]}
             end;
 
         bad_request ->
@@ -110,175 +156,164 @@ iq_handler(_From, _To = #jid{lserver = SubHost}, Acc, IQ = #iq{type = get, sub_e
     end,
     {Acc, Res}.
 
+-spec process_disco_iq(Acc :: mongoose_acc:t(), From :: jid:jid(), To :: jid:jid(),
+                       IQ :: jlib:iq(), map()) ->
+          {mongoose_acc:t(), jlib:iq()}.
+process_disco_iq(Acc, _From, _To, #iq{type = set, lang = Lang, sub_el = SubEl} = IQ, _Extra) ->
+    ErrorMsg = <<"IQ set is not allowed for service discovery">>,
+    Error = mongoose_xmpp_errors:not_allowed(Lang, ErrorMsg),
+    {Acc, IQ#iq{type = error, sub_el = [SubEl, Error]}};
+process_disco_iq(Acc, _From, _To, #iq{type = get, lang = Lang, sub_el = SubEl} = IQ, _Extra) ->
+    case exml_query:attr(SubEl, <<"node">>, <<>>) of
+        <<>> ->
+            Identity = mongoose_disco:identities_to_xml(disco_identity(Lang)),
+            Info = disco_info(mongoose_acc:host_type(Acc)),
+            Features = mongoose_disco:features_to_xml([?NS_HTTP_UPLOAD_030]),
+            {Acc, IQ#iq{type = result,
+                        sub_el = [#xmlel{name = <<"query">>,
+                                         attrs = #{<<"xmlns">> => ?NS_DISCO_INFO},
+                                         children = Identity ++ Info ++ Features}]}};
+        _ ->
+            ErrorMsg = <<"Node is not supported by HTTP upload">>,
+            Error = mongoose_xmpp_errors:item_not_found(Lang, ErrorMsg),
+            {Acc, IQ#iq{type = error, sub_el = [SubEl, Error]}}
+    end.
 
--spec get_urls(Host :: jid:lserver(), Filename :: binary(), Size :: pos_integer(),
+-spec disco_local_items(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: mongoose_disco:item_acc(),
+    Params :: map(),
+    Extra :: gen_hook:extra().
+disco_local_items(Acc = #{host_type := HostType, to_jid := #jid{lserver = Domain}, node := <<>>, lang := Lang}, _, _) ->
+    {ok, mongoose_disco:add_items([#{jid => subdomain(HostType, Domain), name => my_disco_name(Lang)}], Acc)};
+disco_local_items(Acc, _, _) ->
+    {ok, Acc}.
+
+-spec get_urls(HostType :: mongooseim:host_type(), Filename :: binary(), Size :: pos_integer(),
                ContentType :: binary() | undefined, Timeout :: pos_integer()) ->
-                  {PutURL :: binary(), GetURL :: binary(), Headers :: #{binary() => binary()}}.
-get_urls(Host, Filename, Size, ContentType, Timeout) ->
-    UTCDateTime = calendar:universal_time(),
-    Token = generate_token(Host),
-    Opts = module_opts(Host),
-    NewOpts = gen_mod:set_opt(expiration_time, Opts, Timeout),
-    mod_http_upload_backend:create_slot(UTCDateTime, Token, Filename,
-                                        ContentType, Size, NewOpts).
-
--spec get_disco_identity(Acc :: term(), From :: jid:jid(), To :: jid:jid(),
-                         Node :: binary(), ejabberd:lang()) -> [exml:element()] | term().
-get_disco_identity(Acc, _From, _To, _Node = <<>>, Lang) ->
-    [#xmlel{name = <<"identity">>,
-            attrs = [{<<"category">>, <<"store">>},
-                     {<<"type">>, <<"file">>},
-                     {<<"name">>, my_disco_name(Lang)}]} | Acc];
-get_disco_identity(Acc, _From, _To, _Node, _Lang) ->
-    Acc.
-
-
--spec get_disco_items(Acc :: {result, [exml:element()]} | {error, any()} | empty,
-                      From :: jid:jid(), To :: jid:jid(),
-                      Node :: binary(), ejabberd:lang())
-                     -> {result, [exml:element()]} | {error, any()}.
-get_disco_items({result, Nodes}, _From, #jid{lserver = Host} = _To, <<"">>, Lang) ->
-    Item = #xmlel{name  = <<"item">>,
-                  attrs = [{<<"jid">>, subhost(Host)}, {<<"name">>, my_disco_name(Lang)}]},
-    {result, [Item | Nodes]};
-get_disco_items(empty, From, To, Node, Lang) ->
-    get_disco_items({result, []}, From, To, Node, Lang);
-get_disco_items(Acc, _From, _To, _Node, _Lang) ->
-    Acc.
-
-
--spec get_disco_features(Acc :: term(), From :: jid:jid(), To :: jid:jid(),
-                         Node :: binary(), ejabberd:lang()) -> {result, [exml:element()]} | term().
-get_disco_features({result, Nodes}, _From, _To, _Node = <<>>, _Lang) ->
-    {result, [?NS_HTTP_UPLOAD_025, ?NS_HTTP_UPLOAD_030 | Nodes]};
-get_disco_features(empty, From, To, Node, Lang) ->
-    get_disco_features({result, []}, From, To, Node, Lang);
-get_disco_features(Acc, _From, _To, _Node, _Lang) ->
-    Acc.
-
-
--spec get_disco_info(Acc :: [exml:element()], jid:server(), module(), Node :: binary(),
-                     Lang :: ejabberd:lang()) -> [exml:element()].
-get_disco_info(Acc, SubHost, _Mod, _Node = <<>>, _Lang) ->
-    {ok, Host} = mongoose_subhosts:get_host(SubHost),
-    case max_file_size(Host) of
-        undefined -> Acc;
-        MaxFileSize ->
-            MaxFileSizeBin = integer_to_binary(MaxFileSize),
-            [get_disco_info_form(?NS_HTTP_UPLOAD_025, MaxFileSizeBin),
-             get_disco_info_form(?NS_HTTP_UPLOAD_030, MaxFileSizeBin) | Acc]
-    end;
-get_disco_info(Acc, _Host, _Mod, _Node, _Lang) ->
-    Acc.
+                  file_too_large_error | {PutURL :: binary(), GetURL :: binary(),
+                                          Headers :: #{binary() => binary()}}.
+get_urls(HostType, Filename, Size, ContentType, Timeout) ->
+    Opts = module_opts(HostType),
+    get_urls_helper(HostType, Filename, Size, ContentType, Opts#{expiration_time := Timeout}).
 
 %%--------------------------------------------------------------------
 %% Helpers
 %%--------------------------------------------------------------------
 
--spec subhost(Host :: jid:server()) -> binary().
-subhost(Host) ->
-    gen_mod:get_module_opt_subhost(Host, ?MODULE, ?DEFAULT_SUBHOST).
+get_urls_helper(HostType, Filename, Size, ContentType, Opts) ->
+    MaxFileSize = max_file_size(HostType),
+    case Size =< MaxFileSize of
+        true ->
+            UTCDateTime = calendar:universal_time(),
+            Token = generate_token(HostType),
+            mod_http_upload_backend:create_slot(HostType, UTCDateTime, Token, Filename,
+                                                ContentType, Size, Opts);
+        false ->
+            file_too_large_error
+    end.
 
+-spec disco_identity(ejabberd:lang()) -> [mongoose_disco:identity()].
+disco_identity(Lang) ->
+    [#{category => <<"store">>,
+       type => <<"file">>,
+       name => my_disco_name(Lang)}].
+
+-spec disco_info(mongooseim:host_type()) -> [exml:element()].
+disco_info(HostType) ->
+    MaxFileSize = max_file_size(HostType),
+    MaxFileSizeBin = integer_to_binary(MaxFileSize),
+    [get_disco_info_form(MaxFileSizeBin)].
+
+-spec subdomain(mongooseim:host_type(), mongooseim:domain_name()) -> mongooseim:domain_name().
+subdomain(HostType, Domain) ->
+    SubdomainPattern = subdomain_pattern(HostType),
+    mongoose_subdomain_utils:get_fqdn(SubdomainPattern, Domain).
+
+-spec subdomain_pattern(mongooseim:host_type()) ->
+    mongoose_subdomain_utils:subdomain_pattern().
+subdomain_pattern(HostType) ->
+    gen_mod:get_module_opt(HostType, ?MODULE, host).
 
 -spec my_disco_name(ejabberd:lang()) -> binary().
 my_disco_name(Lang) ->
-    translate:translate(Lang, <<"HTTP File Upload">>).
+    service_translations:do(Lang, <<"HTTP File Upload">>).
 
 
--spec compose_iq_reply(IQ :: jlib:iq(), Namespace :: binary(),
-                       PutUrl :: binary(), GetUrl :: binary(),
+-spec compose_iq_reply(IQ :: jlib:iq(),
+		       PutUrl :: binary(),
+		       GetUrl :: binary(),
                        Headers :: #{binary() => binary()}) ->
-                              Reply :: jlib:iq().
-compose_iq_reply(IQ, Namespace, PutUrl, GetUrl, Headers) ->
+    Reply :: jlib:iq().
+compose_iq_reply(IQ, PutUrl, GetUrl, Headers) ->
     Slot = #xmlel{
               name     = <<"slot">>,
-              attrs    = [{<<"xmlns">>, Namespace}],
-              children = [create_url_xmlel(<<"put">>, PutUrl, Headers, Namespace),
-                          create_url_xmlel(<<"get">>, GetUrl, #{}, Namespace)]},
+              attrs    = #{<<"xmlns">> => ?NS_HTTP_UPLOAD_030},
+              children = [create_url_xmlel(<<"put">>, PutUrl, Headers),
+                          create_url_xmlel(<<"get">>, GetUrl, #{})]},
     IQ#iq{type = result, sub_el =[Slot]}.
 
 
--spec token_bytes(jid:server()) -> pos_integer().
-token_bytes(Host) ->
-    gen_mod:get_module_opt(Host, ?MODULE, token_bytes, ?DEFAULT_TOKEN_BYTES).
+-spec token_bytes(mongooseim:host_type()) -> pos_integer().
+token_bytes(HostType) ->
+    gen_mod:get_module_opt(HostType, ?MODULE, token_bytes).
 
 
--spec max_file_size(jid:server()) -> pos_integer() | undefined.
-max_file_size(Host) ->
-    gen_mod:get_module_opt(Host, ?MODULE, max_file_size, ?DEFAULT_MAX_FILE_SIZE).
+-spec max_file_size(mongooseim:host_type()) -> pos_integer() | infinity.
+max_file_size(HostType) ->
+    gen_mod:get_module_opt(HostType, ?MODULE, max_file_size).
+
+-spec module_opts(mongooseim:host_type())-> gen_mod:module_opts().
+module_opts(HostType) ->
+    gen_mod:get_module_opts(HostType, ?MODULE).
 
 
--spec with_default_backend(Opts :: proplists:proplist()) -> proplists:proplist().
-with_default_backend(Opts) ->
-    case lists:keyfind(backend, 1, Opts) of
-        false -> [{backend, s3} | Opts];
-        _ -> Opts
-    end.
+-spec generate_token(mongooseim:host_type()) -> binary().
+generate_token(HostType) ->
+    binary:encode_hex(crypto:strong_rand_bytes(token_bytes(HostType)), lowercase).
 
 
--spec module_opts(jid:server()) -> proplists:proplist().
-module_opts(Host) ->
-    gen_mod:get_module_opts(Host, ?MODULE).
-
-
--spec generate_token(jid:server()) -> binary().
-generate_token(Host) ->
-    base16:encode(crypto:strong_rand_bytes(token_bytes(Host))).
-
-
--spec file_too_large_error(MaxFileSize :: non_neg_integer(), Namespace :: binary()) -> exml:element().
-file_too_large_error(MaxFileSize, Namespace) ->
+-spec file_too_large_error(MaxFileSize :: non_neg_integer()) -> exml:element().
+file_too_large_error(MaxFileSize) ->
     MaxFileSizeBin = integer_to_binary(MaxFileSize),
     MaxSizeEl = #xmlel{name = <<"max-file-size">>,
                        children = [#xmlcdata{content = MaxFileSizeBin}]},
     FileTooLargeEl = #xmlel{name = <<"file-too-large">>,
-                            attrs = [{<<"xmlns">>, Namespace}],
+                            attrs = #{<<"xmlns">> => ?NS_HTTP_UPLOAD_030},
                             children = [MaxSizeEl]},
     Error0 = mongoose_xmpp_errors:not_acceptable(),
     Error0#xmlel{children = [FileTooLargeEl | Error0#xmlel.children]}.
 
 
 -spec parse_request(Request :: exml:element()) ->
-                           {Filename :: binary(), Size :: integer(),
-                            ContentType :: binary() | undefined, Namespace :: binary()} |
-                           bad_request.
+    {Filename :: binary(), Size :: integer(), ContentType :: binary() | undefined} | bad_request.
 parse_request(Request) ->
-    Namespace = exml_query:attr(Request, <<"xmlns">>),
     Keys = [<<"filename">>, <<"size">>, <<"content-type">>],
-    [Filename, SizeBin, ContentType] =
-        case Namespace of
-            ?NS_HTTP_UPLOAD_025 -> [exml_query:path(Request, [{element, K}, cdata]) || K <- Keys];
-            ?NS_HTTP_UPLOAD_030 -> [exml_query:attr(Request, K) || K <- Keys]
-        end,
+    [Filename, SizeBin, ContentType] = [exml_query:attr(Request, K) || K <- Keys],
     Size = (catch erlang:binary_to_integer(SizeBin)),
     case is_nonempty_binary(Filename) andalso is_positive_integer(Size) of
         false -> bad_request;
-        true -> {Filename, Size, ContentType, Namespace}
+        true -> {Filename, Size, ContentType}
     end.
 
 
--spec get_disco_info_form(Namespace :: binary(), MaxFileSizeBin :: binary()) -> exml:element().
-get_disco_info_form(Namespace, MaxFileSizeBin) ->
-    #xmlel{name     = <<"x">>,
-           attrs    = [{<<"xmlns">>, ?NS_XDATA}, {<<"type">>, <<"result">>}],
-           children = [jlib:form_field({<<"FORM_TYPE">>, <<"hidden">>, Namespace}),
-                       jlib:form_field({<<"max-file-size">>, MaxFileSizeBin})]}.
+-spec get_disco_info_form(MaxFileSizeBin :: binary()) -> exml:element().
+get_disco_info_form(MaxFileSizeBin) ->
+    Fields = [#{var => <<"max-file-size">>, values => [MaxFileSizeBin]}],
+    mongoose_data_forms:form(#{type => <<"result">>, ns => ?NS_HTTP_UPLOAD_030, fields => Fields}).
 
 
 -spec header_to_xmlel({Key :: binary(), Value :: binary()}) -> exml:element().
 header_to_xmlel({Key, Value}) ->
     #xmlel{name = <<"header">>,
-           attrs = [{<<"name">>, Key}],
+           attrs = #{<<"name">> => Key},
            children = [#xmlcdata{content = Value}]}.
 
 
--spec create_url_xmlel(Name :: binary(), Url :: binary(), Headers :: #{binary() => binary()},
-                       Namespace :: binary()) -> exml:element().
-create_url_xmlel(Name, Url, _Headers, ?NS_HTTP_UPLOAD_025) ->
-    #xmlel{name = Name, children = [#xmlcdata{content = Url}]};
-create_url_xmlel(Name, Url, Headers, ?NS_HTTP_UPLOAD_030) ->
+-spec create_url_xmlel(Name :: binary(), Url :: binary(), Headers :: #{binary() => binary()}) ->
+    exml:element().
+create_url_xmlel(Name, Url, Headers) ->
     HeadersXml = [header_to_xmlel(H) || H <- maps:to_list(Headers)],
-    #xmlel{name = Name, attrs = [{<<"url">>, Url}], children = HeadersXml}.
+    #xmlel{name = Name, attrs = #{<<"url">> => Url}, children = HeadersXml}.
 
 
 -spec is_nonempty_binary(term()) -> boolean().
@@ -290,6 +325,5 @@ is_nonempty_binary(_) -> false.
 is_positive_integer(X) when is_integer(X) -> X > 0;
 is_positive_integer(_) -> false.
 
-config_metrics(Host) ->
-    OptsToReport = [{backend, s3}], %list of tuples {option, defualt_value}
-    mongoose_module_metrics:opts_for_module(Host, ?MODULE, OptsToReport).
+config_metrics(HostType) ->
+    mongoose_module_metrics:opts_for_module(HostType, ?MODULE, [backend]).

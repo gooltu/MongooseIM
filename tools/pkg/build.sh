@@ -72,16 +72,26 @@ for (( i = 0; i < $len - 1; i++ )); do
     i=$((i+1))
 done
 
-dockerfile_platform=${platform/_/:}
+builder_image="erlangsolutions/erlang:${platform}-${erlang_version}"
+target_image="${platform/-/:}"
 docker build -t mongooseim-${platform}:${version}-${revision} \
-    --build-arg dockerfile_platform=${dockerfile_platform} \
+    --progress=plain \
+    --build-arg builder_image=${builder_image} \
+    --build-arg target_image=${target_image} \
     --build-arg version=${version} \
     --build-arg revision=${revision} \
     --build-arg erlang_version=${erlang_version} \
+    --secret id=GPG_PUBLIC_KEY \
+    --secret id=GPG_PRIVATE_KEY \
+    --secret id=GPG_PASS \
     -f ${dockerfile_path} \
     $context_path
 
+docker rm -f mongooseim-pkg-container &>/dev/null || echo "ok"
+
 # Run ready docker image with tested mongooseim package and move it to
 # built packages directory
-docker run --rm -v "${built_packages_directory}:/built_packages" \
-    "mongooseim-${platform}:${version}-${revision}"
+docker run --name=mongooseim-pkg-container "mongooseim-${platform}:${version}-${revision}"
+# Dot is like /*, but for docker.
+# Moves all files in the directory.
+docker cp "mongooseim-pkg-container:/built_packages/." "${built_packages_directory}/"

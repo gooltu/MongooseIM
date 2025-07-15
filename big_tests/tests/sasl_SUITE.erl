@@ -15,7 +15,7 @@
 %%==============================================================================
 
 -module(sasl_SUITE).
--compile(export_all).
+-compile([export_all, nowarn_export_all]).
 
 -include_lib("escalus/include/escalus.hrl").
 -include_lib("common_test/include/ct.hrl").
@@ -29,19 +29,17 @@
 -import(distributed_helper, [mim/0,
                              require_rpc_nodes/1,
                              rpc/4]).
+-import(domain_helper, [host_type/0]).
 
 %%--------------------------------------------------------------------
 %% Suite configuration
 %%--------------------------------------------------------------------
 
 all() ->
-    [{group, domain_config},
-     {group, node_config}].
+    [{group, host_type_config}].
 
 groups() ->
-    G = [{domain_config, [sequence], all_tests()},
-         {node_config, [sequence], all_tests()}],
-    ct_helper:repeat_all_until_all_ok(G).
+    [{host_type_config, [sequence], all_tests()}].
 
 all_tests() ->
     [text_response].
@@ -58,12 +56,12 @@ init_per_suite(Config) ->
 end_per_suite(Config) ->
     escalus:end_per_suite(Config).
 
-init_per_group(GroupName, Config) ->
-    Config1 = set_sasl_mechanisms(mech_option_key(GroupName), Config),
+init_per_group(_GroupName, Config) ->
+    Config1 = set_sasl_mechanisms(Config),
     escalus:create_users(Config1, escalus:get_users([alice])).
 
-end_per_group(GroupName, Config) ->
-    reset_sasl_mechanisms(mech_option_key(GroupName), Config),
+end_per_group(_GroupName, Config) ->
+    reset_sasl_mechanisms(Config),
     escalus:delete_users(Config, escalus:get_users([alice])).
 
 init_per_testcase(CaseName, Config) ->
@@ -89,28 +87,20 @@ text_response(Config) ->
 %% Helpers
 %%--------------------------------------------------------------------
 
-mech_option_key(domain_config) ->
-    Domain = ct:get_config({hosts, mim, domain}),
-    {sasl_mechanisms, Domain};
-mech_option_key(node_config) ->
-    sasl_mechanisms.
-
-set_sasl_mechanisms(Key, Config) ->
+set_sasl_mechanisms(Config) ->
     %% pretend that an auth module is set for this mechanism
     rpc(mim(), meck, new, [ejabberd_auth, [no_link, passthrough]]),
     rpc(mim(), meck, expect, [ejabberd_auth, supports_sasl_module,
                               fun(_, M) -> M =:= ?MODULE end]),
 
     %% configure the mechanism
-    Mechs = rpc(mim(), ejabberd_config, get_local_option, [Key]),
-    rpc(mim(), ejabberd_config, add_local_option, [Key, [?MODULE]]),
-    [{mechs, Mechs} | Config].
+    Key = {auth, host_type()},
+    AuthOpts = rpc(mim(), mongoose_config, get_opt, [Key]),
+    NewAuthOpts = AuthOpts#{sasl_mechanisms => [?MODULE]},
+    mongoose_helper:backup_and_set_config_option(Config, Key, NewAuthOpts).
 
-reset_sasl_mechanisms(Key, Config) ->
-    case ?config(mechs, Config) of
-        undefined -> rpc(mim(), ejabberd_config, del_local_option, [Key]);
-        Mechs -> rpc(mim(), ejabberd_config, add_local_option, [Key, Mechs])
-    end,
+reset_sasl_mechanisms(Config) ->
+    mongoose_helper:restore_config_option(Config, {auth, host_type()}),
     rpc(mim(), meck, unload, [ejabberd_auth]).
 
 assert_is_failure_with_text(#xmlel{name = <<"failure">>,

@@ -29,11 +29,11 @@
 -export([start/2,
          stop/1,
          init/2,
-         check_password/3,
-         set_password/3,
-         try_register/3,
-         remove_user/2,
-         is_user_exists/2]).
+         check_password/4,
+         set_password/4,
+         try_register/4,
+         remove_user/3,
+         does_user_exist/3]).
 
 -include("mongoose.hrl").
 
@@ -41,13 +41,13 @@
 -define(CALL_TIMEOUT, 10000). % Timeout is in milliseconds: 10 seconds == 10000
 
 
--spec start(atom() | binary(), _) -> 'ok'.
-start(Host, ExtPrg) ->
+-spec start(mongooseim:host_type(), _) -> 'ok'.
+start(HostType, ExtPrg) ->
     lists:foreach(
         fun(This) ->
-            start_instance(get_process_name(Host, This), ExtPrg)
+            start_instance(get_process_name(HostType, This), ExtPrg)
         end,
-        lists:seq(0, get_instances(Host)-1)
+        lists:seq(0, get_instances(HostType) - 1)
     ).
 
 
@@ -71,52 +71,52 @@ init(ProcessName, ExtPrg) ->
 
 
 -spec stop(atom() | binary()) -> 'ok'.
-stop(Host) ->
+stop(HostType) ->
     lists:foreach(
         fun(This) ->
-            get_process_name(Host, This) ! stop
+            get_process_name(HostType, This) ! stop
         end,
-        lists:seq(0, get_instances(Host)-1)
+        lists:seq(0, get_instances(HostType) - 1)
     ).
 
 
 -spec get_process_name(binary(), integer()) -> atom().
-get_process_name(Host, Integer) ->
-    gen_mod:get_module_proc(lists:append([erlang:binary_to_list(Host), integer_to_list(Integer)]), eauth).
+get_process_name(HostType, Integer) ->
+    gen_mod:get_module_proc(lists:append([erlang:binary_to_list(HostType),
+                                          integer_to_list(Integer)]), eauth).
 
 
--spec check_password(jid:user(), jid:server(), binary()) -> boolean().
-check_password(User, Server, Password) ->
-    call_port(Server, [<<"auth">>, User, Server, Password]).
+-spec check_password(mongooseim:host_type(), jid:user(), jid:server(), binary()) -> boolean().
+check_password(HostType, User, Server, Password) ->
+    call_port(HostType, [<<"auth">>, User, Server, Password]).
 
 
--spec is_user_exists(jid:user(), jid:server()) -> boolean().
-is_user_exists(User, Server) ->
-    call_port(Server, [<<"isuser">>, User, Server]).
+-spec does_user_exist(mongooseim:host_type(), jid:user(), jid:server()) -> boolean().
+does_user_exist(HostType, User, Server) ->
+    call_port(HostType, [<<"isuser">>, User, Server]).
 
 
--spec set_password(jid:user(), jid:server(), binary()) -> any().
-set_password(User, Server, Password) ->
-    call_port(Server, [<<"setpass">>, User, Server, Password]).
+-spec set_password(mongooseim:host_type(), jid:user(), jid:server(), binary()) -> any().
+set_password(HostType, User, Server, Password) ->
+    call_port(HostType, [<<"setpass">>, User, Server, Password]).
 
 
--spec try_register(jid:user(), jid:server(), binary()
-                  ) -> ok | {error, not_allowed}.
-try_register(User, Server, Password) ->
-    case call_port(Server, [<<"tryregister">>, User, Server, Password]) of
+-spec try_register(mongooseim:host_type(), jid:user(), jid:server(), binary()) ->
+          ok | {error, not_allowed}.
+try_register(HostType, User, Server, Password) ->
+    case call_port(HostType, [<<"tryregister">>, User, Server, Password]) of
         true -> ok;
         false -> {error, not_allowed}
     end.
 
 
--spec remove_user(jid:user(), jid:server()) -> any().
-remove_user(User, Server) ->
-    call_port(Server, [<<"removeuser">>, User, Server]).
+-spec remove_user(mongooseim:host_type(), jid:user(), jid:server()) -> any().
+remove_user(HostType, User, Server) ->
+    call_port(HostType, [<<"removeuser">>, User, Server]).
 
--spec call_port(jid:server(), [any(), ...]) -> any().
-call_port(Server, Msg) ->
-    LServer = jid:nameprep(Server),
-    ProcessName = get_process_name(LServer, random_instance(get_instances(LServer))),
+-spec call_port(mongooseim:host_type(), [any(), ...]) -> any().
+call_port(HostType, Msg) ->
+    ProcessName = get_process_name(HostType, random_instance(get_instances(HostType))),
     ProcessName ! {call, self(), Msg},
     receive
         {eauth, Result} ->
@@ -129,12 +129,9 @@ random_instance(MaxNum) ->
     rand:uniform(MaxNum) - 1.
 
 
--spec get_instances(atom() | binary()) -> integer().
-get_instances(Server) ->
-    case ejabberd_config:get_local_option({extauth_instances, Server}) of
-        Num when is_integer(Num) -> Num;
-        _ -> 1
-    end.
+-spec get_instances(mongooseim:host_type()) -> integer().
+get_instances(HostType) ->
+    mongoose_config:get_opt([{auth, HostType}, external, instances]).
 
 
 -spec loop(port(), integer(), atom(), any()) -> no_return().
@@ -144,16 +141,21 @@ loop(Port, Timeout, ProcessName, ExtPrg) ->
             port_command(Port, encode(Msg)),
             receive
                 {Port, {data, Data}} ->
-                    ?DEBUG("extauth call '~p' received data response:~n~p", [Msg, Data]),
+                    ?LOG_DEBUG(#{what => extauth_result,
+                                 extauth_call => Msg, result => Data,
+                                 text => <<"extauth call received data response">>}),
                     Caller ! {eauth, decode(Data)},
                     loop(Port, ?CALL_TIMEOUT, ProcessName, ExtPrg);
                 {Port, Other} ->
-                    ?ERROR_MSG("extauth call '~p' received strange response:~n~p", [Msg, Other]),
+                    ?LOG_ERROR(#{what => extauth_unexpected_message,
+                                 extauth_call => Msg, unexpected_message => Other,
+                                 text => <<"extauth call received strange response">>}),
                     Caller ! {eauth, false},
                     loop(Port, ?CALL_TIMEOUT, ProcessName, ExtPrg)
             after
                 Timeout ->
-                    ?ERROR_MSG("extauth call '~p' didn't receive response", [Msg]),
+                    ?LOG_ERROR(#{what => extauth_timeout, extauth_call => Msg,
+                                 text => <<"extauth call didn't receive response, restarting instance">>}),
                     Caller ! {eauth, false},
                     Pid = restart_instance(ProcessName, ExtPrg),
                     flush_buffer_and_forward_messages(Pid),
@@ -166,7 +168,9 @@ loop(Port, Timeout, ProcessName, ExtPrg) ->
                     exit(normal)
             end;
         {'EXIT', Port, Reason} ->
-            ?CRITICAL_MSG("extauth script has exitted abruptly with reason '~p'", [Reason]),
+            ?LOG_CRITICAL(#{what => extauth_crash,
+                            text => <<"extauth script has exitted abruptly, restarting instance">>,
+                            reason => Reason}),
             Pid = restart_instance(ProcessName, ExtPrg),
             flush_buffer_and_forward_messages(Pid),
             exit(port_terminated)

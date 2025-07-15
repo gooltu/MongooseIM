@@ -1,12 +1,12 @@
 -module(push_pubsub_SUITE).
--compile(export_all).
--include_lib("escalus/include/escalus.hrl").
--include_lib("common_test/include/ct.hrl").
+-compile([export_all, nowarn_export_all]).
 -include_lib("eunit/include/eunit.hrl").
--include_lib("escalus/include/escalus_xmlns.hrl").
 -include_lib("exml/include/exml.hrl").
 -include("push_helper.hrl").
 
+-import(distributed_helper, [subhost_pattern/1]).
+-import(domain_helper, [domain/0]).
+-import(config_parser_helper, [config/2]).
 
 %%--------------------------------------------------------------------
 %% Suite configuration
@@ -57,16 +57,16 @@ init_per_suite(Config) ->
     escalus:create_users(Config3, escalus:get_users([bob, alice])).
 end_per_suite(Config) ->
     escalus_fresh:clean(),
-    dynamic_modules:restore_modules(domain(), Config),
+    dynamic_modules:restore_modules(Config),
     escalus:delete_users(Config, escalus:get_users([bob, alice])),
     escalus:end_per_suite(Config).
 
 init_per_group(rest_integration_v1, Config) ->
-    restart_modules(Config, "v1");
+    restart_modules(Config, <<"v1">>);
 init_per_group(rest_integration_v2, Config) ->
-    restart_modules(Config, "v2");
+    restart_modules(Config, <<"v2">>);
 init_per_group(_, Config) ->
-    restart_modules(Config, "v2").
+    restart_modules(Config, <<"v2">>).
 
 end_per_group(_, Config) ->
     Config.
@@ -75,14 +75,13 @@ init_per_testcase(CaseName, Config) ->
     MongoosePushMockPort = setup_mock_rest(),
 
     %% Start HTTP pool
-    HTTPOpts = [
-        {server, "http://localhost:" ++ integer_to_list(MongoosePushMockPort)}
-    ],
-    PoolOpts = [{strategy, available_worker}, {workers, 20}],
-    rpc(mongoose_wpool, start_configured_pools,
-        [[{http, global, mongoose_push_http, PoolOpts, HTTPOpts}]]),
+    PoolOpts = #{strategy => available_worker, workers => 20},
+    ConnOpts = #{host => "http://localhost:" ++ integer_to_list(MongoosePushMockPort),
+                 request_timeout => 2000},
+    Pool = config([outgoing_pools, http, mongoose_push_http],
+                  #{opts => PoolOpts, conn_opts => ConnOpts}),
+    [{ok, _Pid}] = rpc(mongoose_wpool, start_configured_pools, [[Pool]]),
     escalus:init_per_testcase(CaseName, Config).
-
 
 end_per_testcase(CaseName, Config) ->
     rpc(mongoose_wpool, stop, [http, global, mongoose_push_http]),
@@ -127,9 +126,15 @@ publish_fails_with_invalid_item(Config) ->
 
             Item =
                 #xmlel{name = <<"invalid-item">>,
-                       attrs = [{<<"xmlns">>, ?NS_PUSH}]},
+                       attrs = #{<<"xmlns">> => ?NS_PUSH}},
 
-            Publish = escalus_pubsub_stanza:publish(Alice, <<"itemid">>, Item, <<"id">>, Node),
+            Options = [
+                {<<"device_id">>, <<"sometoken">>},
+                {<<"service">>, <<"apns">>}
+            ],
+
+            Publish = escalus_pubsub_stanza:publish_with_options(Alice, <<"itemid">>, Item,
+                                                                 <<"id">>, Node, Options),
             escalus:send(Alice, Publish),
             escalus:assert(is_error, [<<"modify">>, <<"bad-request">>],
                            escalus:wait_for_stanza(Alice)),
@@ -146,7 +151,6 @@ publish_fails_with_no_options(Config) ->
             pubsub_tools:create_node(Alice, Node, [{type, <<"push">>}]),
 
             ContentFields = [
-                {<<"FORM_TYPE">>, ?PUSH_FORM_TYPE},
                 {<<"message-count">>, <<"1">>},
                 {<<"last-message-sender">>, <<"senderId">>},
                 {<<"last-message-body">>, <<"message body">>}
@@ -154,8 +158,8 @@ publish_fails_with_no_options(Config) ->
 
             Item =
                 #xmlel{name = <<"notification">>,
-                       attrs = [{<<"xmlns">>, ?NS_PUSH}],
-                       children = [push_helper:make_form(ContentFields)]},
+                       attrs = #{<<"xmlns">> => ?NS_PUSH},
+                       children = push_helper:maybe_form(ContentFields, ?PUSH_FORM_TYPE)},
 
             Publish = escalus_pubsub_stanza:publish(Alice, <<"itemid">>, Item, <<"id">>, Node),
             escalus:send(Alice, Publish),
@@ -354,15 +358,13 @@ setup_pubsub(User) ->
 %% ----------------------------------
 
 publish_iq(Client, Node, Content, Options) ->
-    ContentFields = [{<<"FORM_TYPE">>, ?PUSH_FORM_TYPE}] ++ Content,
-    OptionFileds = [{<<"FORM_TYPE">>, ?NS_PUBSUB_PUB_OPTIONS}] ++ Options,
-
     Item =
         #xmlel{name = <<"notification">>,
-               attrs = [{<<"xmlns">>, ?NS_PUSH}],
-               children = [push_helper:make_form(ContentFields)]},
+               attrs = #{<<"xmlns">> => ?NS_PUSH},
+               children = push_helper:maybe_form(Content, ?PUSH_FORM_TYPE)},
     OptionsEl =
-        #xmlel{name = <<"publish-options">>, children = [push_helper:make_form(OptionFileds)]},
+        #xmlel{name = <<"publish-options">>,
+               children = push_helper:maybe_form(Options, ?NS_PUBSUB_PUB_OPTIONS)},
 
     Publish = escalus_pubsub_stanza:publish(Client, <<"itemid">>, Item, <<"id">>, Node),
     #xmlel{children = [#xmlel{} = PubsubEl]} = Publish,
@@ -373,9 +375,6 @@ publish_iq(Client, Node, Content, Options) ->
 %% ----------------------------------
 %% Other helpers
 %% ----------------------------------
-
-domain() ->
-    ct:get_config({hosts, mim, domain}).
 
 push_pubsub_node() ->
     pubsub_tools:pubsub_node_with_subdomain(?PUBSUB_SUB_DOMAIN ++ ".").
@@ -397,7 +396,7 @@ rpc(M, F, A) ->
 
 bare_jid(JIDOrClient) ->
     ShortJID = escalus_client:short_jid(JIDOrClient),
-    list_to_binary(string:to_lower(binary_to_list(ShortJID))).
+    string:lowercase(ShortJID).
 
 %% ----------------------------------------------
 %% REST mock handler
@@ -429,17 +428,18 @@ pubsub_host(Host) ->
 
 %% Module config
 required_modules(APIVersion) ->
-    [{mod_pubsub, [
-        {plugins, [<<"dag">>, <<"push">>]},
-        {nodetree, <<"dag">>},
-        {host, ?PUBSUB_SUB_DOMAIN ++ ".@HOST@"}
-    ]},
-     {mod_push_service_mongoosepush, [
-         {pool_name, mongoose_push_http},
-         {api_version, APIVersion}
-     ]}].
+    [{mod_pubsub, config_parser_helper:mod_config(mod_pubsub, #{
+        plugins => [<<"dag">>, <<"push">>],
+        nodetree => nodetree_dag,
+        host => subhost_pattern(?PUBSUB_SUB_DOMAIN ++ ".@HOST@"),
+        backend => mongoose_helper:mnesia_or_rdbms_backend()
+    })},
+     {mod_push_service_mongoosepush,
+      config_parser_helper:mod_config(mod_push_service_mongoosepush, #{pool_name => mongoose_push_http,
+                                                                       api_version => APIVersion})
+     }].
 
 restart_modules(Config, APIVersion) ->
-    dynamic_modules:restore_modules(domain(), Config),
+    dynamic_modules:restore_modules(Config),
     dynamic_modules:ensure_modules(domain(), required_modules(APIVersion)),
     Config.

@@ -378,6 +378,7 @@ paths:
               "affiliation":"member"}
              ```
         For more details please refer to the [rooms API specifications](#/Rooms)
+        Note: The SSE connection will be closed after 1 hour of idle time.
       tags:
         - "Server Sent Events"
       produces:
@@ -453,6 +454,14 @@ definitions:
         type: string
         description: Message content.
         example: "Hello Alice!"
+      thread:
+        type: string
+        description: Message thread ID.
+        example: "e0ffe42b28561960c6b12b944a092794b9683a38"
+      parent:
+        type: string
+        description: Message thread parent ID.
+        example: "7edac73ab41e45c4aafa7b2d7b749080"
   CreateRoomBody:
     properties:
       subject:
@@ -529,7 +538,7 @@ definitions:
       timestamp:
         type: integer
         format: int64
-        description: Unix timestamp in miliseconds.
+        description: Unix timestamp in milliseconds.
       body:
         type: string
         description: |

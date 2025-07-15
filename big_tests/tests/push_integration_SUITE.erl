@@ -1,13 +1,11 @@
 -module(push_integration_SUITE).
--compile(export_all).
--include_lib("escalus/include/escalus.hrl").
+-compile([export_all, nowarn_export_all]).
+
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
--include_lib("escalus/include/escalus_xmlns.hrl").
 -include_lib("exml/include/exml.hrl").
 -include_lib("inbox.hrl").
 
--define(MUCLIGHTHOST, <<"muclight.localhost">>).
 -define(RPC_SPEC, distributed_helper:mim()).
 -define(SESSION_KEY, publish_service).
 
@@ -24,7 +22,9 @@
          become_unavailable/1,
          become_available/2
         ]).
--import(distributed_helper, [rpc/4]).
+-import(distributed_helper, [rpc/4, subhost_pattern/1]).
+-import(domain_helper, [domain/0]).
+-import(config_parser_helper, [mod_config/2, config/2]).
 
 %%--------------------------------------------------------------------
 %% Suite configuration
@@ -45,14 +45,15 @@ basic_groups() ->
      {group, failure_cases_v3},
      {group, failure_cases_v2},
      {group, integration_with_sm_and_offline_storage},
-     {group, enhanced_integration_with_sm}
+     {group, enhanced_integration_with_sm},
+     {group, disco}
     ].
 
 groups() ->
     G = [
          {pubsub_ful, [], basic_groups()},
          {pubsub_less, [], basic_groups()},
-         {integration_with_sm_and_offline_storage,[parallel],
+         {integration_with_sm_and_offline_storage,[],
           [
            no_duplicates_default_plugin,
            sm_unack_messages_notified_default_plugin
@@ -62,7 +63,7 @@ groups() ->
               immediate_notification,
               double_notification_with_two_sessions_in_resume
           ]},
-         {pm_msg_notifications, [parallel],
+         {pm_msg_notifications, [],
           [
            pm_msg_notify_on_apns_w_high_priority,
            pm_msg_notify_on_fcm_w_high_priority,
@@ -76,7 +77,7 @@ groups() ->
            pm_msg_notify_on_fcm_silent,
            pm_msg_notify_on_apns_w_topic
           ]},
-         {muclight_msg_notifications, [parallel],
+         {muclight_msg_notifications, [],
           [
            muclight_msg_notify_on_apns_w_high_priority,
            muclight_msg_notify_on_fcm_w_high_priority,
@@ -90,22 +91,27 @@ groups() ->
            muclight_msg_notify_on_fcm_silent,
            muclight_msg_notify_on_w_topic
           ]},
-         {groupchat_notifications_with_inbox, [parallel],
+         {groupchat_notifications_with_inbox, [],
           [
            muclight_inbox_msg_unread_count_apns,
            muclight_inbox_msg_unread_count_fcm,
            muclight_aff_change_fcm,
            muclight_aff_change_apns
           ]},
-         {pm_notifications_with_inbox, [parallel],
+         {pm_notifications_with_inbox, [],
           [
            inbox_msg_unread_count_apns,
            inbox_msg_unread_count_fcm,
            inbox_msg_reset_unread_count_apns,
            inbox_msg_reset_unread_count_fcm
           ]},
-         {failure_cases_v3, [parallel], failure_cases()},
-         {failure_cases_v2, [parallel], failure_cases()}
+         {failure_cases_v3, [], failure_cases()},
+         {failure_cases_v2, [], failure_cases()},
+         {disco, [],
+          [
+            push_notifications_listed_disco_when_available,
+            push_notifications_not_listed_disco_when_not_available
+          ]}
         ],
     G.
 
@@ -126,14 +132,13 @@ init_per_suite(Config) ->
     catch mongoose_push_mock:stop(),
     mongoose_push_mock:start(Config),
     Port = mongoose_push_mock:port(),
-
-    PoolOpts = [{strategy, available_worker}, {workers, 20}],
-    HTTPOpts = [{server, "https://localhost:" ++ integer_to_list(Port)}],
-    rpc(?RPC_SPEC, mongoose_wpool, start_configured_pools,
-        [[{http, global, mongoose_push_http, PoolOpts, HTTPOpts}]]),
+    PoolOpts = #{strategy => available_worker, workers => 20},
+    ConnOpts = #{host => "https://localhost:" ++ integer_to_list(Port), request_timeout => 2000,
+                 tls => #{verify_mode => none}},
+    Pool = config([outgoing_pools, http, mongoose_push_http], #{opts => PoolOpts, conn_opts => ConnOpts}),
+    [{ok, _Pid}] = rpc(?RPC_SPEC, mongoose_wpool, start_configured_pools, [[Pool]]),
     ConfigWithModules = dynamic_modules:save_modules(domain(), Config),
     escalus:init_per_suite(ConfigWithModules).
-
 
 end_per_suite(Config) ->
     escalus_fresh:clean(),
@@ -145,6 +150,8 @@ init_per_group(pubsub_less, Config) ->
     [{pubsub_host, virtual} | Config];
 init_per_group(pubsub_ful, Config) ->
     [{pubsub_host, real} | Config];
+init_per_group(disco, Config) ->
+    escalus:create_users(Config, escalus:get_users([alice]));
 init_per_group(G, Config) when G =:= pm_notifications_with_inbox;
                                G =:= groupchat_notifications_with_inbox;
                                G =:= integration_with_sm_and_offline_storage ->
@@ -157,18 +164,43 @@ init_per_group(G, Config) when G =:= pm_notifications_with_inbox;
 init_per_group(G, Config) ->
     %% Some cleaning up
     C = init_modules(G, Config),
-    catch rpc(?RPC_SPEC, mod_muc_light_db_backend, force_clear, []),
+    ReqMods = proplists:get_value(required_modules, C, []),
+    case lists:keymember(mod_muc_light, 1, ReqMods) of
+        true ->
+            muc_light_helper:clear_db(domain_helper:host_type());
+        false ->
+            ct:log("Skip muc_light_helper:clear_db()", [])
+    end,
     C.
 
+end_per_group(disco, Config) ->
+    escalus:delete_users(Config);
 end_per_group(_, Config) ->
-    dynamic_modules:restore_modules(domain(), Config),
-    Config.
+    dynamic_modules:restore_modules(Config).
 
+init_per_testcase(CaseName = push_notifications_listed_disco_when_available, Config) ->
+    init_modules(disco, Config),
+    escalus:init_per_testcase(CaseName, Config);
 init_per_testcase(CaseName, Config) ->
+    %% unfortunately meck:reset(Module) doesn't result
+    %% in 'valid' flag resetting (see meck_proc module),
+    %% so we have to unload existing mocking and mock
+    %% module again before running every test case.
+    catch rpc(?RPC_SPEC, meck, unload, [mod_event_pusher]),
+    rpc(?RPC_SPEC, meck, new, [mod_event_pusher, [no_link, passthrough]]),
     escalus:init_per_testcase(CaseName, Config).
 
+end_per_testcase(CaseName = push_notifications_listed_disco_when_available, Config) ->
+    dynamic_modules:restore_modules(Config),
+    escalus:end_per_testcase(CaseName, Config);
 end_per_testcase(CaseName, Config) ->
-    escalus:end_per_testcase(CaseName, Config).
+    Valid = rpc(?RPC_SPEC, meck, validate, [mod_event_pusher]),
+    rpc(?RPC_SPEC, meck, unload, [mod_event_pusher]),
+    escalus:end_per_testcase(CaseName, Config),
+    case Valid of
+        false -> {fail, "mod_event_pusher crashed"};
+        true -> ok
+    end.
 
 %%------------------------------------------------------------------------------------
 %% GROUP integration_with_sm_and_offline_storage & enhanced_integration_with_sm
@@ -194,7 +226,7 @@ no_duplicates_default_plugin(Config) ->
     push_helper:wait_for_user_offline(Alice),
 
     escalus_connection:send(Bob, escalus_stanza:chat_to(bare_jid(Alice), <<"msg-1">>)),
-    mongoose_helper:wait_until(fun() -> get_number_of_offline_msgs(AliceSpec) end, 1),
+    wait_helper:wait_until(fun() -> get_number_of_offline_msgs(AliceSpec) end, 1),
     verify_notification(APNSDevice, <<"apns">>, [], BobJID, <<"msg-1">>),
     {ok, NewAlice, _} = escalus_connection:start([{manual_ack, true} | AliceSpec],
                                                  ConnSteps ++ [stream_management]),
@@ -203,7 +235,7 @@ no_duplicates_default_plugin(Config) ->
     escalus:assert_many([is_presence, is_chat_message], Stanzas),
 
     escalus_connection:stop(NewAlice),
-    mongoose_helper:wait_until(fun() -> get_number_of_offline_msgs(AliceSpec) end, 1),
+    wait_helper:wait_until(fun() -> get_number_of_offline_msgs(AliceSpec) end, 1),
 
     ?assertExit({test_case_failed, _}, wait_for_push_request(APNSDevice, 500)),
 
@@ -788,27 +820,28 @@ no_push_notification_for_expired_device(Config) ->
 
 mongoose_push_unregistered_device_resp(Config) ->
     case ?config(api_v, Config) of
-        "v3" ->
+        <<"v3">> ->
             {410, jiffy:encode(#{<<"reason">> => <<"unregistered">>})};
-        "v2" ->
+        <<"v2">> ->
             {500, jiffy:encode(#{<<"details">> => <<"probably_unregistered">>})}
     end.
 
-maybe_check_if_push_node_was_disabled("v2", _, _) ->
+maybe_check_if_push_node_was_disabled(<<"v2">>, _, _) ->
     ok;
-maybe_check_if_push_node_was_disabled("v3", User, PushNode) ->
+maybe_check_if_push_node_was_disabled(<<"v3">>, User, PushNode) ->
     JID = rpc(?RPC_SPEC, jid, binary_to_bare, [escalus_utils:get_jid(User)]),
+    Host = escalus_utils:get_server(User),
     Fun = fun() ->
-                  {ok, Services} = rpc(?RPC_SPEC, mod_event_pusher_push_backend, get_publish_services, [JID]),
+                  {ok, Services} = rpc(?RPC_SPEC, mod_event_pusher_push_backend, get_publish_services, [Host, JID]),
                   lists:keymember(PushNode, 2, Services)
           end,
-    mongoose_helper:wait_until(Fun, false),
+    wait_helper:wait_until(Fun, false),
 
     Fun2 = fun() ->
                    Info = mongoose_helper:get_session_info(?RPC_SPEC, User),
-                   lists:keyfind(?SESSION_KEY, 1, Info)
+                   maps:get(?SESSION_KEY, Info, false)
            end,
-    mongoose_helper:wait_until(Fun2, false).
+    wait_helper:wait_until(Fun2, false).
 
 no_push_notification_for_internal_mongoose_push_error(Config) ->
     escalus:fresh_story(
@@ -822,6 +855,34 @@ no_push_notification_for_internal_mongoose_push_error(Config) ->
 
         end).
 
+%%--------------------------------------------------------------------
+%% GROUP disco
+%%--------------------------------------------------------------------
+
+push_notifications_listed_disco_when_available(Config) ->
+    escalus:story(
+        Config, [{alice, 1}],
+        fun(Alice) ->
+            Server = escalus_client:server(Alice),
+            escalus:send(Alice, escalus_stanza:disco_info(Server)),
+            Stanza = escalus:wait_for_stanza(Alice),
+            escalus:assert(is_iq_result, Stanza),
+            escalus:assert(has_feature, [push_helper:ns_push()], Stanza),
+            ok
+        end).
+
+push_notifications_not_listed_disco_when_not_available(Config) ->
+    escalus:story(
+        Config, [{alice, 1}],
+        fun(Alice) ->
+            Server = escalus_client:server(Alice),
+            escalus:send(Alice, escalus_stanza:disco_info(Server)),
+            Stanza = escalus:wait_for_stanza(Alice),
+            escalus:assert(is_iq_result, Stanza),
+            Pred = fun(Feature, Stanza0) -> not escalus_pred:has_feature(Feature, Stanza0) end,
+            escalus:assert(Pred, [push_helper:ns_push()], Stanza),
+            ok
+        end).
 
 %%--------------------------------------------------------------------
 %% Test helpers
@@ -881,10 +942,10 @@ enable_push_for_user(User, Service, EnableOpts, MockResponse, Config) ->
 
 add_user_server_to_whitelist(User, {NodeAddr, NodeName}) ->
     AffList = [ #xmlel{ name = <<"affiliation">>,
-                        attrs = [{<<"jid">>, escalus_utils:get_server(User)},
-                                 {<<"affiliation">>, <<"publish-only">>}] }
+                        attrs = #{<<"jid">> => escalus_utils:get_server(User),
+                                  <<"affiliation">> => <<"publish-only">>} }
               ],
-    Affiliations = #xmlel{ name = <<"affiliations">>, attrs = [{<<"node">>, NodeName}],
+    Affiliations = #xmlel{ name = <<"affiliations">>, attrs = #{<<"node">> => NodeName},
                            children = AffList },
     Id = base64:encode(crypto:strong_rand_bytes(5)),
     Stanza = escalus_pubsub_stanza:pubsub_owner_iq(<<"set">>, User, Id, NodeAddr, [Affiliations]),
@@ -893,9 +954,9 @@ add_user_server_to_whitelist(User, {NodeAddr, NodeName}) ->
 
 assert_push_notification_in_session(User, NodeName, Service, DeviceToken) ->
     Info = mongoose_helper:get_session_info(?RPC_SPEC, User),
-    {?SESSION_KEY, {_JID, NodeName, Details}} = lists:keyfind(?SESSION_KEY, 1, Info),
-    ?assertMatch({<<"service">>, Service}, lists:keyfind(<<"service">>, 1, Details)),
-    ?assertMatch({<<"device_id">>, DeviceToken}, lists:keyfind(<<"device_id">>, 1, Details)).
+    {_JID, NodeName, Details} = maps:get(?SESSION_KEY, Info),
+    ?assertMatch(#{<<"service">> := Service}, Details),
+    ?assertMatch(#{<<"device_id">> := DeviceToken}, Details).
 
 wait_for_push_request(DeviceToken) ->
     mongoose_push_mock:wait_for_push_request(DeviceToken, 10000).
@@ -911,7 +972,7 @@ fresh_room_name(Username) ->
     escalus_utils:jid_to_lower(<<"room-", Username/binary>>).
 
 fresh_room_name() ->
-    fresh_room_name(base16:encode(crypto:strong_rand_bytes(5))).
+    fresh_room_name(binary:encode_hex(crypto:strong_rand_bytes(5), lowercase)).
 
 
 bare_jid(JIDOrClient) ->
@@ -922,10 +983,7 @@ gen_token() ->
     integer_to_binary(binary:decode_unsigned(crypto:strong_rand_bytes(16)), 24).
 
 lower(Bin) when is_binary(Bin) ->
-    list_to_binary(string:to_lower(binary_to_list(Bin))).
-
-domain() ->
-    ct:get_config({hosts, mim, domain}).
+    string:lowercase(Bin).
 
 pubsub_node_from_host(Config) ->
     case ?config(pubsub_host, Config) of
@@ -943,94 +1001,85 @@ getenv(VarName, Default) ->
             Value
     end.
 
-h2_req(Conn, Method, Path) ->
-    h2_req(Conn, Method, Path, <<>>).
-h2_req(Conn, Method, Path, Body) ->
-    BinMethod = list_to_binary(string:to_upper(atom_to_list(Method))),
-    Headers = [
-        {<<":method">>, BinMethod},
-        {<<":path">>, Path},
-        {<<":authority">>, <<"localhost">>},
-        {<<":scheme">>, <<"https">>}
-    ],
-    case h2_client:sync_request(Conn, Headers, Body) of
-        {ok, {RespHeaders, RespBody}} ->
-            Status = proplists:get_value(<<":status">>, RespHeaders),
-            {ok, binary_to_integer(Status), iolist_to_binary(RespBody)};
-        {error, Reason} ->
-            {error, Reason}
-    end.
-
 init_modules(G, Config) ->
     MongoosePushAPI = mongoose_push_api_for_group(G),
     PubSubHost = ?config(pubsub_host, Config),
     Modules = required_modules_for_group(G, MongoosePushAPI, PubSubHost),
     C = dynamic_modules:save_modules(domain(), Config),
     Fun = fun() -> catch dynamic_modules:ensure_modules(domain(), Modules) end,
-    mongoose_helper:wait_until(Fun, ok),
-    [{api_v, MongoosePushAPI} | C].
+    wait_helper:wait_until(Fun, ok),
+    [{api_v, MongoosePushAPI}, {required_modules, Modules} | C].
 
 mongoose_push_api_for_group(failure_cases_v2) ->
-    "v2";
+    <<"v2">>;
 mongoose_push_api_for_group(_) ->
-    "v3".
+    <<"v3">>.
 
 required_modules_for_group(pm_notifications_with_inbox, API, PubSubHost) ->
-    [{mod_inbox, inbox_opts()} | required_modules(API, PubSubHost)];
-required_modules_for_group(groupchat_notifications_with_inbox, API, PubSubHost)->
+    Backend = mongoose_helper:mnesia_or_rdbms_backend(),
+    [{mod_inbox, inbox_opts()},
+     {mod_offline, config_parser_helper:mod_config(mod_offline, #{backend => Backend})} |
+     required_modules(API, PubSubHost)];
+required_modules_for_group(groupchat_notifications_with_inbox, API, PubSubHost) ->
     [{mod_inbox, inbox_opts()}, {mod_muc_light, muc_light_opts()}
      | required_modules(API, PubSubHost)];
 required_modules_for_group(muclight_msg_notifications, API, PubSubHost) ->
     [{mod_muc_light, muc_light_opts()} | required_modules(API, PubSubHost)];
 required_modules_for_group(integration_with_sm_and_offline_storage, API, PubSubHost) ->
+    Backend = mongoose_helper:mnesia_or_rdbms_backend(),
+    MemBackend = ct_helper:get_internal_database(),
     [{mod_muc_light, muc_light_opts()},
-     {mod_stream_management, [{ack_freq, never},
-                              {resume_timeout,1}]},
-     {mod_offline, []} |
+     {mod_stream_management, config_parser_helper:mod_config(mod_stream_management,
+                                                             #{ack_freq => never, resume_timeout => 1,
+                                                               backend => MemBackend})},
+     {mod_offline, config_parser_helper:mod_config(mod_offline, #{backend => Backend})} |
      required_modules(API, PubSubHost)];
 required_modules_for_group(enhanced_integration_with_sm, API, PubSubHost) ->
-    [{mod_stream_management, [{ack_freq, never}]} |
-     required_modules(API, PubSubHost, mod_event_pusher_push_plugin_enhanced)];
+    MemBackend = ct_helper:get_internal_database(),
+    [{mod_stream_management,
+      config_parser_helper:mod_config(mod_stream_management,
+                                      #{ack_freq => never, backend => MemBackend})} |
+     required_modules(API, PubSubHost, enhanced_plugin_module_opts())];
 required_modules_for_group(_, API, PubSubHost) ->
     required_modules(API, PubSubHost).
 
 required_modules(API, PubSubHost)->
-    required_modules(API, PubSubHost, undefined).
+    required_modules(API, PubSubHost, #{}).
 
-required_modules(API, PubSubHost, PluginModule) ->
-    VirtualHostOpt = case PubSubHost of
-                         virtual -> [{virtual_pubsub_hosts, ["virtual.@HOSTS@"]}];
-                         _ -> []
-                     end,
-    PushOpts = case PluginModule of
-                   undefined -> VirtualHostOpt;
-                   _ -> [{plugin_module, PluginModule} | VirtualHostOpt]
-               end,
-    PubSub = case PubSubHost of
-                 virtual -> [];
-                 _ ->
-                     [{mod_pubsub, [{plugins, [<<"dag">>, <<"push">>]},
-                                    {backend, mongoose_helper:mnesia_or_rdbms_backend()},
-                                    {nodetree, <<"dag">>},
-                                    {host, "pubsub.@HOST@"}]}]
-             end,
-    PushBackend = {push, [{backend, mongoose_helper:mnesia_or_rdbms_backend()} | PushOpts]},
-    [
-        {mod_push_service_mongoosepush, [{pool_name, mongoose_push_http},
-                                         {api_version, API}]},
-        {mod_event_pusher, [{backends, [PushBackend]}]} |
-        PubSub
-    ].
+required_modules(API, PubSubHost, ExtraPushOpts) ->
+    PubSubHostOpts = virtual_pubsub_hosts_opts(PubSubHost),
+    PushOpts = maps:merge(ExtraPushOpts, PubSubHostOpts),
+    pubsub_modules(PubSubHost) ++ event_pusher_modules(API, PushOpts).
+
+pubsub_modules(virtual) ->
+    [];
+pubsub_modules(real) ->
+    [{mod_pubsub, mod_config(mod_pubsub, #{plugins => [<<"dag">>, <<"push">>],
+                                           backend => mongoose_helper:mnesia_or_rdbms_backend(),
+                                           nodetree => nodetree_dag,
+                                           host => subhost_pattern("pubsub.@HOST@")})}].
+
+event_pusher_modules(API, PushOpts) ->
+    [{mod_push_service_mongoosepush, mod_config(mod_push_service_mongoosepush,
+                                                #{pool_name => mongoose_push_http,
+                                                  api_version => API})},
+     {mod_event_pusher, #{push => push_opts(PushOpts)}}].
+
+virtual_pubsub_hosts_opts(virtual) ->
+    #{virtual_pubsub_hosts => [subhost_pattern("virtual.@HOST@")]};
+virtual_pubsub_hosts_opts(real) ->
+    #{}.
+
+push_opts(ExtraOpts) ->
+    config([modules, mod_event_pusher, push],
+           ExtraOpts#{backend => mongoose_helper:mnesia_or_rdbms_backend()}).
+
+enhanced_plugin_module_opts() ->
+    #{plugin_module => mod_event_pusher_push_plugin_enhanced}.
 
 muc_light_opts() ->
-    [
-     {host, binary_to_list(?MUCLIGHTHOST)},
-     {backend, mongoose_helper:mnesia_or_rdbms_backend()},
-     {rooms_in_rosters, true}
-    ].
-inbox_opts() ->
-    [{aff_changes, false},
-     {remove_on_kicked, true},
-     {groupchat, [muclight]},
-     {markers, [displayed]}].
+    mod_config(mod_muc_light, #{backend => mongoose_helper:mnesia_or_rdbms_backend(),
+                                rooms_in_rosters => true}).
 
+inbox_opts() ->
+    (inbox_helper:inbox_opts())#{aff_changes := false}.

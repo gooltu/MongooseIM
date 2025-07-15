@@ -28,210 +28,97 @@
 -behaviour(gen_mod).
 -behaviour(mongoose_module_metrics).
 
+-type command_hook_acc() :: {error, exml:element()} | exml:element() | ignore | empty.
+-export_type([command_hook_acc/0]).
+
+%% Gen_mod callbacks
 -export([start/2,
          stop/1,
-         process_local_iq/4,
-         process_sm_iq/4,
-         get_local_commands/5,
-         get_local_identity/5,
-         get_local_features/5,
-         get_sm_commands/5,
-         get_sm_identity/5,
-         get_sm_features/5,
-         ping_item/4,
-         ping_command/4]).
+         hooks/1,
+         config_spec/0,
+         supported_features/0]).
+
+%% IQ and hook handlers
+-export([process_local_iq/5,
+         process_sm_iq/5,
+         disco_local_items/3,
+         disco_local_identity/3,
+         disco_local_features/3,
+         disco_sm_items/3,
+         disco_sm_identity/3,
+         disco_sm_features/3,
+         ping_command/3]).
 
 -include("mongoose.hrl").
 -include("jlib.hrl").
 -include("adhoc.hrl").
+-include("mongoose_config_spec.hrl").
 
-start(Host, Opts) ->
-    IQDisc = gen_mod:get_opt(iqdisc, Opts, one_queue),
+-spec start(mongooseim:host_type(), gen_mod:module_opts()) -> ok.
+start(HostType, #{iqdisc := IQDisc}) ->
+    [gen_iq_handler:add_iq_handler_for_domain(HostType, ?NS_COMMANDS, Component, Fn, #{}, IQDisc) ||
+        {Component, Fn} <- iq_handlers()],
+    ok.
 
-    gen_iq_handler:add_iq_handler(ejabberd_local, Host, ?NS_COMMANDS,
-                                  ?MODULE, process_local_iq, IQDisc),
-    gen_iq_handler:add_iq_handler(ejabberd_sm, Host, ?NS_COMMANDS,
-                                  ?MODULE, process_sm_iq, IQDisc),
-    ejabberd_hooks:add(hooks(Host)).
+-spec stop(mongooseim:host_type()) -> ok.
+stop(HostType) ->
+    [gen_iq_handler:remove_iq_handler_for_domain(HostType, ?NS_COMMANDS, Component) ||
+        {Component, _Fn} <- iq_handlers()],
+    ok.
 
-stop(Host) ->
-    ejabberd_hooks:delete(hooks(Host)),
+iq_handlers() ->
+    [{ejabberd_local, fun ?MODULE:process_local_iq/5},
+     {ejabberd_sm, fun ?MODULE:process_sm_iq/5}].
 
-    gen_iq_handler:remove_iq_handler(ejabberd_sm, Host, ?NS_COMMANDS),
-    gen_iq_handler:remove_iq_handler(ejabberd_local, Host, ?NS_COMMANDS).
+hooks(HostType) ->
+    [{disco_local_features, HostType, fun ?MODULE:disco_local_features/3, #{}, 99},
+     {disco_local_identity, HostType, fun ?MODULE:disco_local_identity/3, #{}, 99},
+     {disco_local_items, HostType, fun ?MODULE:disco_local_items/3, #{}, 99},
+     {disco_sm_identity, HostType, fun ?MODULE:disco_sm_identity/3, #{}, 99},
+     {disco_sm_features, HostType, fun ?MODULE:disco_sm_features/3, #{}, 99},
+     {disco_sm_items, HostType, fun ?MODULE:disco_sm_items/3, #{}, 99},
+     {adhoc_local_commands, HostType, fun ?MODULE:ping_command/3, #{}, 100}].
 
-hooks(Host) ->
-    [{disco_local_identity, Host, ?MODULE, get_local_identity, 99},
-     {disco_local_features, Host, ?MODULE, get_local_features, 99},
-     {disco_local_items, Host, ?MODULE, get_local_commands, 99},
-     {disco_sm_identity, Host, ?MODULE, get_sm_identity, 99},
-     {disco_sm_features, Host, ?MODULE, get_sm_features, 99},
-     {disco_sm_items, Host, ?MODULE, get_sm_commands, 99},
-     {adhoc_local_items, Host, ?MODULE, ping_item, 100},
-     {adhoc_local_commands, Host, ?MODULE, ping_command, 100}].
-%%-------------------------------------------------------------------------
+%%%
+%%% config_spec
+%%%
 
--spec get_local_commands(Acc :: {result, [exml:element()]} | {error, any()} | empty,
-                         From :: jid:jid(),
-                         To :: jid:jid(),
-                         NS :: binary(),
-                         ejabberd:lang()) -> {result, [exml:element()]} | {error, any()} | empty.
-get_local_commands(Acc, _From, #jid{lserver = LServer} = _To, <<"">>, Lang) ->
-    Display = gen_mod:get_module_opt(LServer, ?MODULE, report_commands_node, false),
-    case Display of
-        false ->
-            Acc;
-        _ ->
-            Items = case Acc of
-                        {result, I} -> I;
-                        _ -> []
-                    end,
-            Nodes = [#xmlel{name = <<"item">>,
-                            attrs = [{<<"jid">>, LServer},
-                                     {<<"node">>, ?NS_COMMANDS},
-                                     {<<"name">>, translate:translate(Lang, <<"Commands">>)}]}],
-            {result, Items ++ Nodes}
-    end;
-get_local_commands(_Acc, From, #jid{lserver = LServer} = To, ?NS_COMMANDS, Lang) ->
-    mongoose_hooks:adhoc_local_items(LServer, {result, []}, From, To, Lang);
-get_local_commands(_Acc, _From, _To, <<"ping">>, _Lang) ->
-    {result, []};
-get_local_commands(Acc, _From, _To, _Node, _Lang) ->
-    Acc.
+-spec config_spec() -> mongoose_config_spec:config_section().
+config_spec() ->
+    #section{
+       items = #{<<"report_commands_node">> => #option{type = boolean},
+                 <<"iqdisc">> => mongoose_config_spec:iqdisc()},
+       defaults = #{<<"report_commands_node">> => false,
+                    <<"iqdisc">> => one_queue}
+      }.
 
-%%-------------------------------------------------------------------------
+-spec supported_features() -> [atom()].
+supported_features() -> [dynamic_domains].
 
--spec get_sm_commands(Acc :: [exml:element()],
-                      From :: jid:jid(),
-                      To :: jid:jid(),
-                      NS :: binary(),
-                      ejabberd:lang()) -> {result, [exml:element()]} | [exml:element()].
-get_sm_commands(Acc, _From, #jid{lserver = LServer} = To, <<"">>, Lang) ->
-    Display = gen_mod:get_module_opt(LServer, ?MODULE, report_commands_node, false),
-    case Display of
-        false ->
-            Acc;
-        _ ->
-            Items = case Acc of
-                        {result, I} -> I;
-                        _ -> []
-                    end,
-            Nodes = [#xmlel{name = <<"item">>,
-                            attrs = [{<<"jid">>, jid:to_binary(To)},
-                                     {<<"node">>, ?NS_COMMANDS},
-                                     {<<"name">>, translate:translate(Lang, <<"Commands">>)}]}],
-            {result, Items ++ Nodes}
-    end;
+%%%
+%%% IQ handlers
+%%%
 
-get_sm_commands(_Acc, From, #jid{lserver = LServer} = To, ?NS_COMMANDS, Lang) ->
-    mongoose_hooks:adhoc_sm_items(LServer, {result, []}, From, To, Lang);
+-spec process_local_iq(mongoose_acc:t(), jid:jid(), jid:jid(), jlib:iq(), map())
+        -> {mongoose_acc:t(), ignore | jlib:iq()}.
+process_local_iq(Acc, From, To, IQ, _Extra) ->
+    {Acc, process_adhoc_request(Acc, From, To, IQ, adhoc_local_commands)}.
 
-get_sm_commands(Acc, _From, _To, _Node, _Lang) ->
-    Acc.
-
-%%-------------------------------------------------------------------------
-
-%% @doc On disco info request to the ad-hoc node, return automation/command-list.
--spec get_local_identity(Acc :: [exml:element()],
-                         From :: jid:jid(),
-                         To :: jid:jid(),
-                         NS :: binary(),
-                         ejabberd:lang()) -> [exml:element()].
-get_local_identity(Acc, _From, _To, ?NS_COMMANDS, Lang) ->
-    [#xmlel{name = <<"identity">>,
-            attrs = [{<<"category">>, <<"automation">>},
-                     {<<"type">>, <<"command-list">>},
-                     {<<"name">>, translate:translate(Lang, <<"Commands">>)}]} | Acc];
-get_local_identity(Acc, _From, _To, <<"ping">>, Lang) ->
-    [#xmlel{name = <<"identity">>,
-            attrs = [{<<"category">>, <<"automation">>},
-                     {<<"type">>, <<"command-node">>},
-                     {<<"name">>, translate:translate(Lang, <<"Ping">>)}]} | Acc];
-get_local_identity(Acc, _From, _To, _Node, _Lang) ->
-    Acc.
-
-%%-------------------------------------------------------------------------
-
-%% @doc On disco info request to the ad-hoc node, return automation/command-list.
--spec get_sm_identity(Acc :: [exml:element()],
-                     From :: jid:jid(),
-                     To :: jid:jid(),
-                     NS :: binary(),
-                     ejabberd:lang()) -> [exml:element()].
-get_sm_identity(Acc, _From, _To, ?NS_COMMANDS, Lang) ->
-    [#xmlel{name = <<"identity">>,
-            attrs = [{<<"category">>, <<"automation">>},
-                     {<<"type">>, <<"command-list">>},
-                     {<<"name">>, translate:translate(Lang, <<"Commands">>)}]} | Acc];
-get_sm_identity(Acc, _From, _To, _Node, _Lang) ->
-    Acc.
-
-%%-------------------------------------------------------------------------
-
--spec get_local_features(Acc :: {result, [exml:element()]} | empty | {error, any()},
-                         From :: jid:jid(),
-                         To :: jid:jid(),
-                         NS :: binary(),
-                         ejabberd:lang()) -> {result, [exml:element()]} | {error, any()}.
-get_local_features(Acc, _From, _To, <<"">>, _Lang) ->
-    Feats = case Acc of
-                {result, I} -> I;
-                _ -> []
-            end,
-    {result, Feats ++ [?NS_COMMANDS]};
-get_local_features(_Acc, _From, _To, ?NS_COMMANDS, _Lang) ->
-    %% override all lesser features...
-    {result, []};
-get_local_features(_Acc, _From, _To, <<"ping">>, _Lang) ->
-    %% override all lesser features...
-    {result, [?NS_COMMANDS]};
-get_local_features(Acc, _From, _To, _Node, _Lang) ->
-    Acc.
-
-%%-------------------------------------------------------------------------
-
--spec get_sm_features(Acc :: {result, [exml:element()]} | {error, any()} | empty,
-                             From :: jid:jid(),
-                             To :: jid:jid(),
-                             NS :: binary(),
-                             ejabberd:lang()) -> {result, [exml:element()]} | {error, any()} | empty.
-get_sm_features(Acc, _From, _To, <<"">>, _Lang) ->
-    Feats = case Acc of
-                {result, I} -> I;
-                _ -> []
-            end,
-    {result, Feats ++ [?NS_COMMANDS]};
-get_sm_features(_Acc, _From, _To, ?NS_COMMANDS, _Lang) ->
-    %% override all lesser features...
-    {result, []};
-get_sm_features(Acc, _From, _To, _Node, _Lang) ->
-    Acc.
-
-%%-------------------------------------------------------------------------
-
--spec process_local_iq(jid:jid(), jid:jid(), mongoose_acc:t(), jlib:iq()) ->
+-spec process_sm_iq(mongoose_acc:t(), jid:jid(), jid:jid(), jlib:iq(), map()) ->
     {mongoose_acc:t(), ignore | jlib:iq()}.
-process_local_iq(From, To, Acc, IQ) ->
-    {Acc, process_adhoc_request(From, To, IQ, adhoc_local_commands)}.
+process_sm_iq(Acc, From, To, IQ, _Extra) ->
+    {Acc, process_adhoc_request(Acc, From, To, IQ, adhoc_sm_commands)}.
 
-
--spec process_sm_iq(jid:jid(), jid:jid(), mongoose_acc:t(), jlib:iq()) ->
-    {mongoose_acc:t(), ignore | jlib:iq()}.
-process_sm_iq(From, To, Acc, IQ) ->
-    {Acc, process_adhoc_request(From, To, IQ, adhoc_sm_commands)}.
-
-
--spec process_adhoc_request(jid:jid(), jid:jid(), jlib:iq(),
+-spec process_adhoc_request(mongoose_acc:t(), jid:jid(), jid:jid(), jlib:iq(),
         Hook :: atom()) -> ignore | jlib:iq().
-process_adhoc_request(From, To, #iq{sub_el = SubEl} = IQ, Hook) ->
-    ?DEBUG("About to parse ~p...", [IQ]),
+process_adhoc_request(Acc, From, To, #iq{sub_el = SubEl} = IQ, Hook) ->
+    ?LOG_DEBUG(#{what => adhoc_parse_request, iq => IQ, hook => Hook}),
     case adhoc:parse_request(IQ) of
         {error, Error} ->
             IQ#iq{type = error, sub_el = [SubEl, Error]};
         #adhoc_request{} = AdhocRequest ->
-            Host = To#jid.lserver,
-            case ejabberd_hooks:run_fold(Hook, Host, empty,
-                                         [From, To, AdhocRequest]) of
+            HostType = mongoose_acc:host_type(Acc),
+            case run_request_hook(Hook, HostType, From, To, AdhocRequest) of
                 ignore ->
                     ignore;
                 empty ->
@@ -243,45 +130,146 @@ process_adhoc_request(From, To, #iq{sub_el = SubEl} = IQ, Hook) ->
             end
     end.
 
+run_request_hook(adhoc_local_commands, HostType, From, To, AdhocRequest) ->
+    mongoose_hooks:adhoc_local_commands(HostType, From, To, AdhocRequest);
+run_request_hook(adhoc_sm_commands, HostType, From, To, AdhocRequest) ->
+    mongoose_hooks:adhoc_sm_commands(HostType, From, To, AdhocRequest).
 
--spec ping_item(Acc :: {result, [exml:element()]},
-                From :: jid:jid(),
-                To :: jid:jid(),
-                ejabberd:lang()) -> {result, [exml:element()]}.
-ping_item(Acc, _From, #jid{lserver = Server} = _To, Lang) ->
-    Items = case Acc of
-                {result, I} ->
-                    I;
+%%%
+%%% Hooks handlers
+%%%
+
+-spec disco_local_items(Acc, Params, Extra) -> {ok, Acc} when
+      Acc :: mongoose_disco:item_acc(),
+      Params :: map(),
+      Extra :: #{host_type := mongooseim:host_type()}.
+disco_local_items(Acc = #{to_jid := #jid{lserver = LServer}, node := <<>>, lang := Lang}, _, #{host_type := HostType}) ->
+    Items = case are_commands_visible(HostType) of
+                false ->
+                    [];
                 _ ->
-                    []
+                    [item(LServer, ?NS_COMMANDS, <<"Commands">>, Lang)]
             end,
-    Nodes = [#xmlel{name = <<"item">>,
-                    attrs = [{<<"jid">>, Server},
-                             {<<"node">>, <<"ping">>},
-                             {<<"name">>, translate:translate(Lang, <<"Ping">>)}]}],
-    {result, Items ++ Nodes}.
+    {ok, mongoose_disco:add_items(Items, Acc)};
+disco_local_items(Acc = #{to_jid := #jid{lserver = LServer}, node := ?NS_COMMANDS, lang := Lang}, _, _) ->
+    Items = [item(LServer, <<"ping">>, <<"Ping">>, Lang)],
+    {ok, mongoose_disco:add_items(Items, Acc)};
+disco_local_items(Acc = #{node := <<"ping">>}, _, _) ->
+    {ok, Acc#{result := []}}; % override the result
+disco_local_items(Acc, _, _) ->
+    {ok, Acc}.
 
+%%-------------------------------------------------------------------------
 
--spec ping_command(Acc :: _,
-                   From :: jid:jid(),
-                   To :: jid:jid(),
-                   adhoc:request()) -> {error, _} | adhoc:response().
-ping_command(_Acc, _From, _To,
-             #adhoc_request{lang = Lang,
-                            node = <<"ping">> = Node,
-                            session_id = SessionID,
-                            action = Action}) ->
-    case Action == <<"">> orelse Action == <<"execute">> of
+-spec disco_sm_items(Acc, Params, Extra) -> {ok, Acc} when
+      Acc :: mongoose_disco:item_acc(),
+      Params :: map(),
+      Extra :: #{host_type := mongooseim:host_type()}.
+disco_sm_items(Acc = #{to_jid := To, node := <<>>, lang := Lang}, _, #{host_type := HostType}) ->
+    Items = case are_commands_visible(HostType) of
+                false ->
+                    [];
+                _ ->
+                    [item(jid:to_binary(To), ?NS_COMMANDS, <<"Commands">>, Lang)]
+            end,
+    {ok, mongoose_disco:add_items(Items, Acc)};
+disco_sm_items(Acc, _, _) ->
+    {ok, Acc}.
+
+are_commands_visible(HostType) ->
+    gen_mod:get_module_opt(HostType, ?MODULE, report_commands_node).
+
+item(LServer, Node, Name, Lang) ->
+    #{jid => LServer, node => Node, name => service_translations:do(Lang, Name)}.
+
+%%-------------------------------------------------------------------------
+
+%% @doc On disco info request to the ad-hoc node, return automation/command-list.
+-spec disco_local_identity(Acc, Params, Extra) -> {ok, Acc} when
+      Acc :: mongoose_disco:identity_acc(),
+      Params :: map(),
+      Extra :: gen_hook:extra().
+disco_local_identity(Acc = #{node := ?NS_COMMANDS, lang := Lang}, _, _) ->
+    {ok, mongoose_disco:add_identities([command_list_identity(Lang)], Acc)};
+disco_local_identity(Acc = #{node := <<"ping">>, lang := Lang}, _, _) ->
+    {ok, mongoose_disco:add_identities([ping_identity(Lang)], Acc)};
+disco_local_identity(Acc, _, _) ->
+    {ok, Acc}.
+
+%%-------------------------------------------------------------------------
+
+%% @doc On disco info request to the ad-hoc node, return automation/command-list.
+-spec disco_sm_identity(Acc, Params, Extra) -> {ok, Acc} when
+      Acc :: mongoose_disco:identity_acc(),
+      Params :: map(),
+      Extra :: gen_hook:extra().
+disco_sm_identity(Acc = #{node := ?NS_COMMANDS, lang := Lang}, _, _) ->
+    {ok, mongoose_disco:add_identities([command_list_identity(Lang)], Acc)};
+disco_sm_identity(Acc, _, _) ->
+    {ok, Acc}.
+
+ping_identity(Lang) ->
+    #{category => <<"automation">>,
+      type => <<"command-node">>,
+      name => service_translations:do(Lang, <<"Ping">>)}.
+
+command_list_identity(Lang) ->
+    #{category => <<"automation">>,
+      type => <<"command-list">>,
+      name => service_translations:do(Lang, <<"Commands">>)}.
+
+%%-------------------------------------------------------------------------
+
+-spec disco_local_features(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: mongoose_disco:feature_acc(),
+    Params :: map(),
+    Extra :: gen_hook:extra().
+disco_local_features(Acc = #{node := <<>>}, _, _) ->
+    {ok, mongoose_disco:add_features([?NS_COMMANDS], Acc)};
+disco_local_features(Acc = #{node := ?NS_COMMANDS}, _, _) ->
+    %% override all lesser features...
+    {ok, Acc#{result := []}};
+disco_local_features(Acc = #{node := <<"ping">>}, _, _) ->
+    %% override all lesser features...
+    {ok, Acc#{result := [?NS_COMMANDS]}};
+disco_local_features(Acc, _, _) ->
+    {ok, Acc}.
+
+%%-------------------------------------------------------------------------
+
+-spec disco_sm_features(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: mongoose_disco:feature_acc(),
+    Params :: map(),
+    Extra :: gen_hook:extra().
+disco_sm_features(Acc = #{node := <<>>}, _, _) ->
+    {ok, mongoose_disco:add_features([?NS_COMMANDS], Acc)};
+disco_sm_features(Acc = #{node := ?NS_COMMANDS}, _, _) ->
+    %% override all lesser features...
+    {ok, Acc#{result := []}};
+disco_sm_features(Acc, _, _) ->
+    {ok, Acc}.
+
+%%-------------------------------------------------------------------------
+
+-spec ping_command(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: command_hook_acc(),
+    Params :: #{adhoc_request := adhoc:request()},
+    Extra :: gen_hook:extra().
+ping_command(empty,
+             #{adhoc_request := #adhoc_request{lang = Lang, node = <<"ping">> = Node,
+                                               session_id = SessionID, action = Action}},
+             _) ->
+    NewAcc = case Action == <<"">> orelse Action == <<"execute">> of
         true ->
             adhoc:produce_response(
               #adhoc_response{lang = Lang,
                               node = Node,
                               session_id = SessionID,
                               status = completed,
-                              notes = [{<<"info">>, translate:translate(Lang, <<"Pong">>)}]});
+                              notes = [{<<"info">>, service_translations:do(Lang, <<"Pong">>)}]});
         false ->
             {error, mongoose_xmpp_errors:bad_request()}
-    end;
-ping_command(Acc, _From, _To, _Request) ->
-    Acc.
-
+    end,
+    {ok, NewAcc};
+ping_command(Acc, _, _) ->
+    {ok, Acc}.

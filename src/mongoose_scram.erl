@@ -4,15 +4,7 @@
 -include("scram.hrl").
 
 % Core SCRAM functions
-%% ejabberd doesn't implement SASLPREP, so we use the similar RESOURCEPREP instead
--export([
-         salted_password/4,
-         stored_key/2,
-         server_key/2,
-         server_signature/3,
-         client_signature/3,
-         client_key/2,
-         client_proof_key/2]).
+-export([salted_password/4]).
 
 -export([
          enabled/1,
@@ -21,6 +13,7 @@
          iterations/1,
          password_to_scram/2,
          password_to_scram/3,
+         password_to_scram_sha/3,
          check_password/2,
          check_digest/4
         ]).
@@ -29,7 +22,7 @@
 
 -export([scram_to_tuple/1, scram_record_to_map/1]).
 
--type sha_type() :: crypto:sha1() | crypto:sha2().
+-ignore_xref([password_to_scram/2, scram_to_tuple/1]).
 
 -type scram_tuple() :: { StoredKey :: binary(), ServerKey :: binary(),
                          Salt :: binary(), Iterations :: non_neg_integer() }.
@@ -58,82 +51,57 @@
 -define(SCRAM_SHA384_PREFIX, "==SHA384==").
 -define(SCRAM_SHA512_PREFIX, "==SHA512==").
 
--spec salted_password(sha_type(), binary(), binary(), non_neg_integer()) -> binary().
+%% ejabberd doesn't implement SASLPREP, so we use the similar RESOURCEPREP instead
 salted_password(Sha, Password, Salt, IterationCount) ->
-    fast_scram:hi(Sha, jid:resourceprep(Password), Salt, IterationCount).
+    fast_scram:salted_password(Sha, jid:resourceprep(Password), Salt, IterationCount).
 
--spec client_key(sha_type(), binary()) -> binary().
-client_key(Sha, SaltedPassword) ->
-    crypto:hmac(Sha, SaltedPassword, <<"Client Key">>).
+enabled(HostType) ->
+    mongoose_config:get_opt([{auth, HostType}, password, format]) =:= scram.
 
--spec stored_key(sha_type(), binary()) -> binary().
-stored_key(Sha, ClientKey) -> crypto:hash(Sha, ClientKey).
+enabled(HostType, cyrsasl_scram_sha1)   -> is_password_format_allowed(HostType, sha);
+enabled(HostType, cyrsasl_scram_sha224) -> is_password_format_allowed(HostType, sha224);
+enabled(HostType, cyrsasl_scram_sha256) -> is_password_format_allowed(HostType, sha256);
+enabled(HostType, cyrsasl_scram_sha384) -> is_password_format_allowed(HostType, sha384);
+enabled(HostType, cyrsasl_scram_sha512) -> is_password_format_allowed(HostType, sha512);
+enabled(HostType, cyrsasl_scram_sha1_plus) -> is_password_format_allowed(HostType, sha);
+enabled(HostType, cyrsasl_scram_sha224_plus) -> is_password_format_allowed(HostType, sha224);
+enabled(HostType, cyrsasl_scram_sha256_plus) -> is_password_format_allowed(HostType, sha256);
+enabled(HostType, cyrsasl_scram_sha384_plus) -> is_password_format_allowed(HostType, sha384);
+enabled(HostType, cyrsasl_scram_sha512_plus) -> is_password_format_allowed(HostType, sha512);
+enabled(_HostType, _Mechanism) -> false.
 
--spec server_key(sha_type(), binary()) -> binary().
-server_key(Sha, SaltedPassword) ->
-    crypto:hmac(Sha, SaltedPassword, <<"Server Key">>).
-
--spec client_signature(sha_type(), binary(), binary()) -> binary().
-client_signature(Sha, StoredKey, AuthMessage) ->
-    crypto:hmac(Sha, StoredKey, AuthMessage).
-
--spec client_proof_key(binary(), binary()) -> binary().
-client_proof_key(ClientProof, ClientSignature) ->
-    crypto:exor(ClientProof, ClientSignature).
-
--spec server_signature(sha_type(), binary(), binary()) -> binary().
-server_signature(Sha, ServerKey, AuthMessage) ->
-    crypto:hmac(Sha, ServerKey, AuthMessage).
-
-
-enabled(Host) ->
-    case ejabberd_auth:get_opt(Host, password_format, scram) of
-        plain -> false;
-        {scram, _Sha} -> true;
-        scram -> true
-    end.
-
-enabled(Host, cyrsasl_scram_sha1)   -> is_password_format_allowed(Host, sha);
-enabled(Host, cyrsasl_scram_sha224) -> is_password_format_allowed(Host, sha224);
-enabled(Host, cyrsasl_scram_sha256) -> is_password_format_allowed(Host, sha256);
-enabled(Host, cyrsasl_scram_sha384) -> is_password_format_allowed(Host, sha384);
-enabled(Host, cyrsasl_scram_sha512) -> is_password_format_allowed(Host, sha512);
-enabled(Host, cyrsasl_scram_sha1_plus) -> is_password_format_allowed(Host, sha);
-enabled(Host, cyrsasl_scram_sha224_plus) -> is_password_format_allowed(Host, sha224);
-enabled(Host, cyrsasl_scram_sha256_plus) -> is_password_format_allowed(Host, sha256);
-enabled(Host, cyrsasl_scram_sha384_plus) -> is_password_format_allowed(Host, sha384);
-enabled(Host, cyrsasl_scram_sha512_plus) -> is_password_format_allowed(Host, sha512);
-enabled(_Host, _Mechanism) -> false.
-
-is_password_format_allowed(Host, Sha) ->
-    case ejabberd_auth:get_opt(Host, password_format, scram) of
-        plain -> true;
-        scram -> true;
-        {scram, ConfiguredSha} -> lists:member(Sha, ConfiguredSha)
+is_password_format_allowed(HostType, Sha) ->
+    case mongoose_config:get_opt([{auth, HostType}, password]) of
+        #{format := scram, hash := ConfiguredSha} -> lists:member(Sha, ConfiguredSha);
+        #{format := _PlainOrScram} -> true
     end.
 
 %% This function is exported and used from other modules
 iterations() -> ?SCRAM_DEFAULT_ITERATION_COUNT.
 
-iterations(Host) ->
-    ejabberd_auth:get_opt(Host, scram_iterations, ?SCRAM_DEFAULT_ITERATION_COUNT).
+iterations(HostType) ->
+    mongoose_config:get_opt([{auth, HostType}, password, scram_iterations]).
 
-password_to_scram(Host, Password) ->
-    password_to_scram(Host, Password, ?SCRAM_DEFAULT_ITERATION_COUNT).
+password_to_scram_sha(Password, IterationCount, HashType) ->
+    ScramHash = do_password_to_scram(Password, IterationCount, HashType),
+    maps:from_list([{iteration_count, IterationCount}, ScramHash]).
+
+password_to_scram(HostType, Password) ->
+    password_to_scram(HostType, Password, ?SCRAM_DEFAULT_ITERATION_COUNT).
 
 password_to_scram(_, #scram{} = Password, _) ->
     scram_record_to_map(Password);
-password_to_scram(Host, Password, IterationCount) ->
+password_to_scram(HostType, Password, IterationCount) ->
     ServerStoredKeys = [do_password_to_scram(Password, IterationCount, HashType)
-                            || {HashType, _Prefix} <- configured_sha_types(Host)],
+                            || {HashType, _Prefix} <- configured_sha_types(HostType)],
     ResultList = lists:merge([{iteration_count, IterationCount}], ServerStoredKeys),
     maps:from_list(ResultList).
 
 do_password_to_scram(Password, IterationCount, HashType) ->
     Salt = crypto:strong_rand_bytes(?SALT_LENGTH),
     SaltedPassword = salted_password(HashType, Password, Salt, IterationCount),
-    StoredKey = stored_key(HashType, client_key(HashType, SaltedPassword)),
-    ServerKey = server_key(HashType, SaltedPassword),
+    StoredKey = fast_scram:stored_key(HashType, fast_scram:client_key(HashType, SaltedPassword)),
+    ServerKey = fast_scram:server_key(HashType, SaltedPassword),
     {HashType, #{salt       => base64:encode(Salt),
                  server_key => base64:encode(ServerKey),
                  stored_key => base64:encode(StoredKey)}}.
@@ -147,7 +115,7 @@ check_password(Password, ScramMap) when is_map(ScramMap) ->
                                                 maps:is_key(ShaKey, ScramMap)],
     #{Sha := #{salt := Salt, stored_key := StoredKey}} = ScramMap,
     SaltedPassword = salted_password(Sha, Password, base64:decode(Salt), IterationCount),
-    ClientStoredKey = stored_key(Sha, client_key(Sha, SaltedPassword)),
+    ClientStoredKey = fast_scram:stored_key(Sha, fast_scram:client_key(Sha, SaltedPassword)),
     ClientStoredKey == base64:decode(StoredKey).
 
 serialize(#scram{storedkey = StoredKey, serverkey = ServerKey,
@@ -181,7 +149,7 @@ deserialize(<<?SCRAM_SERIAL_PREFIX, Serialized/binary>>) ->
                             stored_key => StoredKey,
                             server_key => ServerKey}}};
         _ ->
-            ?WARNING_MSG("Incorrect serialized SCRAM: ~p", [Serialized]),
+            ?LOG_WARNING(#{what => scram_serialisation_incorrect}),
             {error, incorrect_scram}
     end;
 deserialize(<<?MULTI_SCRAM_SERIAL_PREFIX, Serialized/binary>>) ->
@@ -194,11 +162,11 @@ deserialize(<<?MULTI_SCRAM_SERIAL_PREFIX, Serialized/binary>>) ->
                                      lists:flatten(DeserializedKeys)),
             {ok, maps:from_list(ResultList)};
         _ ->
-            ?WARNING_MSG("Incorrect serialized SCRAM: ~p", [Serialized]),
+            ?LOG_WARNING(#{what => scram_serialisation_incorrect}),
             {error, incorrect_scram}
     end;
-deserialize(Bin) ->
-    ?WARNING_MSG("Corrupted serialized SCRAM: ~p", [Bin]),
+deserialize(_) ->
+    ?LOG_WARNING(#{what => scram_serialisation_corrupted}),
     {error, corrupted_scram}.
 
 deserialize([], _) ->
@@ -209,7 +177,7 @@ deserialize([{Sha, Prefix} | _RemainingSha],
         [Salt, StoredKey, ServerKey] ->
             {Sha, #{salt => Salt, server_key => ServerKey, stored_key => StoredKey}};
         _ ->
-            ?WARNING_MSG("Incorrect serialized SCRAM: ~p", [ShaDetails])
+            ?LOG_WARNING(#{what => scram_serialisation_incorrect})
     end;
 deserialize([_CurrentSha | RemainingSha], ShaDetails) ->
     deserialize(RemainingSha, ShaDetails).
@@ -253,9 +221,9 @@ supported_sha_types() ->
      {sha384,   <<?SCRAM_SHA384_PREFIX>>},
      {sha512,   <<?SCRAM_SHA512_PREFIX>>}].
 
-configured_sha_types(Host) ->
-    case catch ejabberd_auth:get_opt(Host, password_format) of
-        {scram, ScramSha} when length(ScramSha) > 0 ->
+configured_sha_types(HostType) ->
+    case mongoose_config:lookup_opt([{auth, HostType}, password, hash]) of
+        {ok, ScramSha} ->
             lists:filter(fun({Sha, _Prefix}) ->
                             lists:member(Sha, ScramSha) end, supported_sha_types());
         _ -> supported_sha_types()

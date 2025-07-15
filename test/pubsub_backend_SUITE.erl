@@ -15,7 +15,7 @@
 %%==============================================================================
 
 -module(pubsub_backend_SUITE).
--compile(export_all).
+-compile([export_all, nowarn_export_all]).
 -author('michael.uvarov@erlang-solutions.com').
 
 -include_lib("common_test/include/ct.hrl").
@@ -51,13 +51,14 @@ suite() ->
 init_per_suite(Config) ->
     ok = mnesia:create_schema([node()]),
     mnesia:start(),
-    mod_pubsub_db_mnesia:start(),
+    mod_pubsub_db_mnesia:init(global, #{}),
     {ok, _} = application:ensure_all_started(jid),
     Config.
 
 end_per_suite(Config) ->
     mod_pubsub_db_mnesia:stop(),
     mnesia:stop(),
+    mnesia:delete_schema([node()]),
     Config.
 
 init_per_group(_GroupName, Config) ->
@@ -188,7 +189,7 @@ people_with_both_parents_unknown() ->
      <<"Suzi Q Joestar">>,
      <<"Tomoko Higashikata">>].
 
-%% Compare lists ignoring order 
+%% Compare lists ignoring order
 compare_lists(L1, L2) ->
     SL1 = lists:sort(L1),
     SL2 = lists:sort(L2),

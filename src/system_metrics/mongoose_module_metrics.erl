@@ -2,18 +2,21 @@
 
 -export([opts_for_module/3]).
 
--callback config_metrics(string()) -> any().
+-ignore_xref([behaviour_info/1]).
+
+-callback config_metrics(mongooseim:host_type()) -> any().
 
 -optional_callbacks([config_metrics/1]).
 
-opts_for_module(Host, Module, OptsToReport) ->
+-spec opts_for_module(mongooseim:host_type(), module(), [gen_mod:opt_key()]) ->
+          [{gen_mod:opt_key(), gen_mod:opt_value()}].
+opts_for_module(HostType, Module, OptsToReport) ->
     try
-        Opts = gen_mod:opts_for_module(Host, Module),
-        lists:map(
-            fun({OptToReport, DefaultValue}) ->
-                    Value = proplists:get_value(OptToReport, Opts, DefaultValue),
-                    {OptToReport, Value}
-            end,OptsToReport)
+        Opts = gen_mod:get_module_opts(HostType, Module),
+        [get_opt(OptToReport, Opts) || OptToReport <- OptsToReport]
     catch
-        _:_ -> {none, none}
+        _:_ -> [{none, none}]
     end.
+
+get_opt(Opt, Opts) ->
+    {Opt, gen_mod:get_opt(Opt, Opts)}.

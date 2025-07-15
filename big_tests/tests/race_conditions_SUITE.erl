@@ -14,15 +14,19 @@
 %% limitations under the License.
 %%==============================================================================
 -module(race_conditions_SUITE).
--compile(export_all).
+-compile([export_all, nowarn_export_all]).
 
--export([handle_delayiq_iq/4]).
+-export([handle_delayiq_iq/5]).
 
 -include_lib("escalus/include/escalus.hrl").
 -include_lib("exml/include/exml.hrl").
 -include_lib("common_test/include/ct.hrl").
 
 -include("mam_helper.hrl"). %% mam? we need assert_equal_extra
+
+-import(distributed_helper, [mim/0, rpc/4]).
+
+-import(domain_helper, [host_type/0]).
 
 %%--------------------------------------------------------------------
 %% Suite configuration
@@ -85,7 +89,7 @@ delayiq_handler_works(Config) ->
             {ok, DelayIqConfirmation} = receive_delayiq_confirmation(),
             %% HAVING waiting iq handler
             resume_delayiq(DelayIqConfirmation),
-            %% HAVING result IQ stanza put into ejabberd_c2s process
+            %% HAVING result IQ stanza put into mongoose_c2s process
             %% (if there is any)
             wait_for_delayiq_handler_to_finish(DelayIqConfirmation),
             receive_delayiq(Alice, RequestIQ),
@@ -96,8 +100,7 @@ delayiq_handler_works(Config) ->
 %% IQ result from IQ, sent using the old connection.
 %%
 %% If old and new resources are different, that the stanza would not be routed
-%% to the new connection in any case (with or without
-%% check_incoming_accum_for_conflicts check in ejabberd_c2s).
+%% to the new connection in any case
 ignore_iq_result_from_old_session(Config) ->
     escalus:fresh_story_with_config(Config, [{alice, 1}],
         fun(FreshConfig, Alice) ->
@@ -114,7 +117,7 @@ ignore_iq_result_from_old_session(Config) ->
             Resource = escalus_client:resource(Alice),
             Alice2 = login_send_and_receive_presence(FreshConfig, alice, Resource),
             resume_delayiq(DelayIqConfirmation),
-            %% HAVING result IQ stanza put into ejabberd_c2s process
+            %% HAVING result IQ stanza put into mongoose_c2s process
             %% (if there is any)
             %% We expect, that Alice2 c2s process receives the route message,
             %% but would ignore it.
@@ -129,21 +132,22 @@ ignore_iq_result_from_old_session(Config) ->
 
 start_delayiq_handler() ->
     NS = delayiq_ns(),
-    Domain = domain(),
+    HostType = host_type(),
     %% Register our module as an iq handler.
     %% It's important to use IQDisc=parallel, because
     %% this particular IQ should be executed in a separate process.
-    Args = [ejabberd_sm, Domain, NS, ?MODULE, handle_delayiq_iq, parallel],
-    mongoose_helper:successful_rpc(gen_iq_handler, add_iq_handler, Args).
+    rpc(mim(), gen_iq_handler, add_iq_handler_for_domain,
+        [HostType, NS, ejabberd_sm,
+         fun ?MODULE:handle_delayiq_iq/5, #{}, parallel]).
 
 stop_delayiq_handler() ->
     NS = delayiq_ns(),
-    Domain = domain(),
+    HostType = host_type(),
     %% Register our module as an iq handler.
     %% It's important to use IQDisc=parallel, because
     %% this particular IQ should be executed in a separate process.
-    Args = [ejabberd_sm, Domain, NS],
-    mongoose_helper:successful_rpc(gen_iq_handler, remove_iq_handler, Args).
+    rpc(mim(), gen_iq_handler, remove_iq_handler_for_domain,
+        [HostType, NS, ejabberd_sm]).
 
 %% Brand new IQ namespace.
 %% Send IQ get with this namespace, and MongooseIM would send you
@@ -156,14 +160,11 @@ delayiq_ns() ->
 delayiq_iq() ->
     BinCallerPid = encode_pid(self()),
     Payload = #xmlel{name = <<"data">>,
-                     attrs = [{<<"caller_pid">>, BinCallerPid}]},
+                     attrs = #{<<"caller_pid">> => BinCallerPid}},
     escalus_stanza:iq_get(delayiq_ns(), [Payload]).
 
-domain() ->
-    ct:get_config({hosts, mim, domain}).
-
 %% This function is executed by MongooseIM
-handle_delayiq_iq(_From, _To, Acc, IQ) ->
+handle_delayiq_iq(Acc, _From, _To, IQ, _Extra) ->
     SubEl = mongoose_iq:iq_to_sub_el(IQ),
     BinCallerPid = exml_query:path(SubEl, [{element, <<"data">>},
                                            {attr, <<"caller_pid">>}]),

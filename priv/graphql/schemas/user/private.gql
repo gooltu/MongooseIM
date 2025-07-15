@@ -1,0 +1,15 @@
+"""
+Allow user to set own private
+"""
+type PrivateUserMutation @protected @use(modules: ["mod_private"]){
+    "Set user's own private"
+setPrivate(elementString: XmlElement!): XmlElement @use
+}
+
+"""
+Allow user to get own private
+"""
+type PrivateUserQuery @protected @use(modules: ["mod_private"]){
+    "Get user's own private"
+    getPrivate(element: String!, nameSpace: NonEmptyString!): XmlElement @use
+}

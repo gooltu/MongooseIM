@@ -6,121 +6,23 @@
 
 -module(pubsub_SUITE).
 
--include_lib("escalus/include/escalus.hrl").
--include_lib("common_test/include/ct.hrl").
+-compile([export_all, nowarn_export_all]).
+
 -include_lib("escalus/include/escalus_xmlns.hrl").
 -include_lib("exml/include/exml.hrl").
--include_lib("exml/include/exml_stream.hrl").
+-include_lib("eunit/include/eunit.hrl").
 
--export([suite/0, all/0, groups/0]).
--export([init_per_suite/1, end_per_suite/1,
-         init_per_group/2, end_per_group/2,
-         init_per_testcase/2, end_per_testcase/2]).
-
--export([
-         discover_nodes_test/1,
-         create_delete_node_test/1,
-         subscribe_unsubscribe_test/1,
-         subscribe_options_test/1,
-         subscribe_options_deliver_option_test/1,
-         subscribe_options_separate_request_test/1,
-         publish_test/1,
-         publish_with_max_items_test/1,
-         publish_with_existing_id_test/1,
-         notify_test/1,
-         request_all_items_test/1,
-         request_particular_item_test/1,
-         retract_test/1,
-         retract_when_user_goes_offline_test/1,
-         purge_all_items_test/1,
-         publish_only_retract_items_scope_test/1
-        ]).
-
--export([
-         max_subscriptions_test/1
-        ]).
-
--export([
-         retrieve_configuration_test/1,
-         set_configuration_test/1,
-         notify_config_test/1,
-         disable_notifications_test/1,
-         disable_payload_test/1,
-         disable_persist_items_test/1,
-         notify_only_available_users_test/1,
-         notify_unavailable_user_test/1,
-         send_last_published_item_test/1,
-         send_last_published_item_no_items_test/1
-        ]).
-
--export([
-         get_affiliations_test/1,
-         add_publisher_and_member_test/1,
-         swap_owners_test/1,
-         deny_no_owner_test/1
-        ]).
-
--export([
-         retrieve_user_subscriptions_test/1,
-         retrieve_node_subscriptions_test/1,
-         modify_node_subscriptions_test/1,
-         process_subscription_requests_test/1,
-         retrieve_pending_subscription_requests_test/1
-        ]).
-
--export([
-         create_delete_collection_test/1,
-         subscribe_unsubscribe_collection_test/1,
-         collection_delete_makes_leaf_parentless/1,
-         notify_collection_test/1,
-         notify_collection_leaf_and_item_test/1,
-         notify_collection_bare_jid_test/1,
-         notify_collection_and_leaf_test/1,
-         notify_collection_and_leaf_same_user_test/1,
-         notify_collections_with_same_leaf_test/1,
-         notify_nested_collections_test/1,
-         retrieve_subscriptions_collection_test/1,
-         discover_top_level_nodes_test/1,
-         discover_child_nodes_test/1,
-         request_all_items_leaf_test/1
-        ]).
-
--export([
-         disable_notifications_leaf_test/1,
-         disable_payload_leaf_test/1,
-         disable_persist_items_leaf_test/1
-        ]).
-
--export([
-         debug_get_items_test/1,
-         debug_get_item_test/1
-        ]).
-
--export([
-         can_create_node_with_existing_parent_path/1,
-         cant_create_node_with_missing_parent_path/1,
-         disco_node_children_by_path_prefix/1,
-         deleting_parent_path_deletes_children/1
-        ]).
-
-%% Disabled tests - broken support in mod_pubsub
--export([
-         disable_payload_and_persist_test/1,
-         disable_delivery_test/1
-        ]).
-
--export([
-         get_item_with_publisher_option_test/1,
-         receive_item_notification_with_publisher_option_test/1
-        ]).
 -import(pubsub_tools, [pubsub_node/0,
                        domain/0,
                        node_addr/0,
                        encode_group_name/2,
-                       decode_group_name/1]).
+                       decode_group_name/1,
+                       nodetree_to_mod/1]).
 -import(distributed_helper, [mim/0,
                              require_rpc_nodes/1,
+                             subhost_pattern/1,
                              rpc/4]).
+-import(domain_helper, [host_type/0]).
 
 %%--------------------------------------------------------------------
 %% Suite configuration
@@ -148,28 +50,35 @@ group_is_compatible(hometree_specific, OnlyNodetreeTree) -> OnlyNodetreeTree =:=
 group_is_compatible(_, _) -> true.
 
 base_groups() ->
-    %% NOTE: basic and collection are placed in sequence because they run bigger
-    %% sets of tests, which in parallel might cause deadlocks in the
-    %% transactions for MNESIA and MYSQL.
-    %% TODO: Optimise pubsub backends (MYSQL! Mnesia?)
-    G = [{basic, [sequence], basic_tests()},
-         {service_config, [parallel], service_config_tests()},
-         {node_config, [parallel], node_config_tests()},
-         {node_affiliations, [parallel], node_affiliations_tests()},
-         {manage_subscriptions, [parallel], manage_subscriptions_tests()},
-         {collection, [sequence], collection_tests()},
-         {collection_config, [parallel], collection_config_tests()},
-         {debug_calls, [parallel], debug_calls_tests()},
-         {pubsub_item_publisher_option, [parallel], pubsub_item_publisher_option_tests()},
-         {hometree_specific, [sequence], hometree_specific_tests()},
-         {last_item_cache, [parallel], last_item_cache_tests()}
-        ],
-    ct_helper:repeat_all_until_all_ok(G).
+    [{basic, parallel_props(), basic_tests()},
+     {service_config, parallel_props(), service_config_tests()},
+     {node_config, parallel_props(), node_config_tests()},
+     {node_affiliations, parallel_props(), node_affiliations_tests()},
+     {manage_subscriptions, parallel_props(), manage_subscriptions_tests()},
+     {collection, [sequence], collection_tests()},
+     {collection_config, parallel_props(), collection_config_tests()},
+     {debug_calls, parallel_props(), debug_calls_tests()},
+     {pubsub_item_publisher_option, parallel_props(), pubsub_item_publisher_option_tests()},
+     {hometree_specific, [sequence], hometree_specific_tests()},
+     {last_item_cache, parallel_props(), last_item_cache_tests()}].
+
+parallel_props() ->
+    case rpc(mim(), mongoose_rdbms, db_engine, [host_type()]) of
+        cockroachdb ->
+            %% Parallel pubsub tests are flaky on CockroachDB
+            [parallel, {repeat_until_all_ok, 5}];
+        _ ->
+            [parallel]
+    end.
 
 basic_tests() ->
     [
+     discover_features_test,
+     discover_service_features_test,
+     discover_sm_features_test,
      discover_nodes_test,
      create_delete_node_test,
+     create_node_errors_test,
      subscribe_unsubscribe_test,
      subscribe_options_test,
      subscribe_options_deliver_option_test,
@@ -193,8 +102,10 @@ service_config_tests() ->
 
 node_config_tests() ->
     [
+     retrieve_default_configuration_test,
      retrieve_configuration_test,
      set_configuration_test,
+     set_configuration_errors_test,
      notify_config_test,
      disable_notifications_test,
      disable_payload_test,
@@ -218,7 +129,8 @@ manage_subscriptions_tests() ->
      retrieve_node_subscriptions_test,
      modify_node_subscriptions_test,
      process_subscription_requests_test,
-     retrieve_pending_subscription_requests_test
+     retrieve_pending_subscription_requests_test,
+     retrieve_pending_subscription_requests_errors_test
     ].
 
 collection_tests() ->
@@ -277,9 +189,11 @@ last_item_cache_tests() ->
 %%--------------------------------------------------------------------
 
 init_per_suite(Config) ->
+    instrument_helper:start(instrument_helper:declared_events(mod_pubsub)),
     escalus:init_per_suite(Config).
 
 end_per_suite(Config) ->
+    instrument_helper:stop(),
     escalus_fresh:clean(),
     escalus:end_per_suite(Config).
 
@@ -292,41 +206,35 @@ init_per_group(ComplexName, Config) ->
 
 extra_options_by_group_name(#{ node_tree := NodeTree,
                                base_name := pubsub_item_publisher_option }) ->
-    [{nodetree, NodeTree},
-     {plugins, [plugin_by_nodetree(NodeTree)]},
-     {item_publisher, true}];
+    #{nodetree => nodetree_to_mod(NodeTree),
+      plugins => [plugin_by_nodetree(NodeTree)],
+      item_publisher => true};
 extra_options_by_group_name(#{ node_tree := NodeTree,
                                base_name := hometree_specific }) ->
-    [{nodetree, NodeTree},
-     {plugins, [<<"hometree">>]}];
+    #{nodetree => nodetree_to_mod(NodeTree),
+      plugins => [<<"hometree">>]};
 extra_options_by_group_name(#{ node_tree := NodeTree,
                                base_name := last_item_cache}) ->
-    [{nodetree, NodeTree},
-     {plugins, [plugin_by_nodetree(NodeTree)]},
-     {last_item_cache, mongoose_helper:mnesia_or_rdbms_backend()}];
+    #{nodetree => nodetree_to_mod(NodeTree),
+      plugins => [plugin_by_nodetree(NodeTree)],
+      last_item_cache => mongoose_helper:mnesia_or_rdbms_backend()};
+extra_options_by_group_name(#{base_name := service_config}) ->
+    #{max_subscriptions_node => 1};
 extra_options_by_group_name(#{ node_tree := NodeTree }) ->
-    [{nodetree, NodeTree},
-     {plugins, [plugin_by_nodetree(NodeTree)]}].
+    #{nodetree => nodetree_to_mod(NodeTree),
+      plugins => [plugin_by_nodetree(NodeTree)]}.
 
 plugin_by_nodetree(<<"dag">>) -> <<"dag">>;
 plugin_by_nodetree(<<"tree">>) -> <<"flat">>.
 
 end_per_group(_GroupName, Config) ->
-    dynamic_modules:restore_modules(domain(), Config).
+    dynamic_modules:restore_modules(Config).
 
 init_per_testcase(notify_unavailable_user_test, _Config) ->
     {skip, "mod_offline does not store events"};
-init_per_testcase(max_subscriptions_test, Config) ->
-    MaxSubs = lookup_service_option(domain(), max_subscriptions_node),
-    set_service_option(domain(), max_subscriptions_node, 1),
-    init_per_testcase(generic, [{max_subscriptions_node, MaxSubs} | Config]);
 init_per_testcase(_TestName, Config) ->
     escalus:init_per_testcase(_TestName, Config).
 
-end_per_testcase(max_subscriptions_test, Config1) ->
-    {value, {_, OldMaxSubs}, Config2} = lists:keytake(max_subscriptions_node, 1, Config1),
-    set_service_option(domain(), max_subscriptions_node, OldMaxSubs),
-    end_per_testcase(generic, Config2);
 end_per_testcase(TestName, Config) ->
     escalus:end_per_testcase(TestName, Config).
 
@@ -338,6 +246,39 @@ end_per_testcase(TestName, Config) ->
 %%--------------------------------------------------------------------
 %% Main PubSub cases
 %%--------------------------------------------------------------------
+
+discover_features_test(Config) ->
+    escalus:fresh_story(
+      Config,
+      [{alice, 1}],
+      fun(Alice) ->
+              Server = escalus_client:server(Alice),
+              escalus:send(Alice, escalus_stanza:disco_info(Server)),
+              Stanza = escalus:wait_for_stanza(Alice),
+              escalus:assert(has_feature, [?NS_PUBSUB], Stanza)
+      end).
+
+discover_service_features_test(Config) ->
+    escalus:fresh_story(
+      Config,
+      [{alice, 1}],
+      fun(Alice) ->
+              escalus:send(Alice, escalus_stanza:disco_info(node_addr())),
+              Stanza = escalus:wait_for_stanza(Alice),
+              escalus:assert(has_identity, [<<"pubsub">>, <<"service">>], Stanza),
+              escalus:assert(has_feature, [?NS_PUBSUB], Stanza)
+      end).
+
+discover_sm_features_test(Config) ->
+    escalus:fresh_story(Config, [{alice, 1}],
+        fun(Alice) ->
+                AliceJid = escalus_client:short_jid(Alice),
+                escalus:send(Alice, escalus_stanza:disco_info(AliceJid)),
+                Stanza = escalus:wait_for_stanza(Alice),
+                %% The feature shouldn't be present when PEP is disabled
+                ?assertNot(escalus_pred:has_feature(?NS_PUBSUB, Stanza)),
+                escalus:assert(is_stanza_from, [AliceJid], Stanza)
+        end).
 
 discover_nodes_test(Config) ->
     escalus:fresh_story(
@@ -378,6 +319,31 @@ create_delete_node_test(Config) ->
               pubsub_tools:delete_node(Alice, Node, [])
       end).
 
+create_node_errors_test(Config) ->
+    escalus:fresh_story(
+      Config,
+      [{alice, 1}],
+      fun(Alice) ->
+              Node = pubsub_node(),
+              GoodOpts = [{<<"pubsub#notify_config">>, <<"1">>}],
+              BadOpts = [{<<"pubsub#notify_config">>, <<"7">>}],
+
+              %% Invalid forms
+              pubsub_tools:create_node(Alice, Node,
+                                       [{modify_request, fun form_helper:remove_form_types/1},
+                                        {expected_error_type, <<"modify">>},
+                                        {config, GoodOpts}]),
+              pubsub_tools:create_node(Alice, Node,
+                                       [{expected_error_type, <<"modify">>},
+                                        {config, BadOpts}]),
+
+              %% Empty configuration element should be accepted
+              pubsub_tools:create_node(Alice, Node,
+                                       [{modify_request, fun form_helper:remove_forms/1},
+                                        {config, GoodOpts}]),
+              pubsub_tools:delete_node(Alice, Node, [])
+      end).
+
 subscribe_unsubscribe_test(Config) ->
     escalus:fresh_story(
       Config,
@@ -398,7 +364,10 @@ subscribe_unsubscribe_test(Config) ->
               pubsub_tools:subscribe(Bob, Node, [{jid_type, bare}]),
               pubsub_tools:unsubscribe(Bob, Node, [{jid_type, bare}]),
 
-              pubsub_tools:delete_node(Alice, Node, [])
+              pubsub_tools:delete_node(Alice, Node, []),
+
+              assert_events(mod_pubsub_set_subscribe, Bob, 2),
+              assert_events(mod_pubsub_set_unsubscribe, Bob, 2)
       end).
 
 subscribe_options_test(Config) ->
@@ -425,7 +394,7 @@ subscribe_options_test(Config) ->
               pubsub_tools:get_subscription_options(Bob, {node_addr(), NodeName},
                                                     [{expected_result, BobOpts}]),
 
-              pubsub_tools:delete_node(Alice, Node, [])
+              assert_event(mod_pubsub_get_options, Bob)
       end).
 
 subscribe_options_deliver_option_test(Config) ->
@@ -441,9 +410,9 @@ subscribe_options_deliver_option_test(Config) ->
 
               pubsub_tools:publish(Alice, <<"item1">>, Node, []),
 
-              %% Geralt should recive a notification
+              %% Geralt should receive a notification
               pubsub_tools:receive_item_notification(Geralt, <<"item1">>, Node, [{expected_result, true}]),
-              %% Bob should not recive a notification
+              %% Bob should not receive a notification
               [] = escalus:wait_for_stanzas(Bob, 1, 5000),
 
               pubsub_tools:delete_node(Alice, Node, [])
@@ -474,7 +443,9 @@ subscribe_options_separate_request_test(Config) ->
                                                     [{expected_result, [OptionAfterUpdate]}])
               || Client <- Clients ],
 
-              pubsub_tools:delete_node(Alice, Node, [])
+              pubsub_tools:delete_node(Alice, Node, []),
+
+              assert_event(mod_pubsub_set_options, Alice)
       end).
 
 publish_test(Config) ->
@@ -489,7 +460,9 @@ publish_test(Config) ->
               Node = pubsub_node(),
               pubsub_tools:publish(Alice, <<"item1">>, Node, []),
 
-              pubsub_tools:delete_node(Alice, Node, [])
+              pubsub_tools:delete_node(Alice, Node, []),
+
+              assert_event(mod_pubsub_set_publish, Alice)
       end).
 
 publish_with_max_items_test(Config) ->
@@ -587,7 +560,9 @@ request_all_items_test(Config) ->
                                          [{expected_result, [<<"item2">>, <<"item1">>]}]),
               %% TODO check ordering (although XEP does not specify this)
 
-              pubsub_tools:delete_node(Alice, Node, [])
+              pubsub_tools:delete_node(Alice, Node, []),
+
+              assert_event(mod_pubsub_get_items, Bob)
       end).
 
 request_particular_item_test(Config) ->
@@ -679,7 +654,9 @@ purge_all_items_test(Config) ->
 
               pubsub_tools:get_all_items(Bob, Node, [{expected_result, []}]),
 
-              pubsub_tools:delete_node(Alice, Node, [])
+              pubsub_tools:delete_node(Alice, Node, []),
+
+              assert_event(mod_pubsub_set_purge, Alice)
       end).
 
 publish_only_retract_items_scope_test(Config) ->
@@ -705,7 +682,9 @@ publish_only_retract_items_scope_test(Config) ->
                 pubsub_tools:retract_item(Bob, Node, <<"item2">>, [{expected_error_type, <<"auth">>}]),
                 pubsub_tools:get_all_items(Alice, Node, [{expected_result, [<<"item2">>]}]),
 
-                pubsub_tools:delete_node(Alice, Node, [])
+                pubsub_tools:delete_node(Alice, Node, []),
+
+                assert_event(mod_pubsub_set_retract, Bob)
       end).
 
 
@@ -733,6 +712,18 @@ max_subscriptions_test(Config) ->
 %% Node configuration
 %%--------------------------------------------------------------------
 
+retrieve_default_configuration_test(Config) ->
+    escalus:fresh_story(
+      Config,
+      [{alice, 1}],
+      fun(Alice) ->
+              NodeAddr = node_addr(),
+              pubsub_tools:get_default_configuration(Alice, NodeAddr,
+                                                     [{expected_result, default_config()}]),
+
+              assert_wait_for_event(mod_pubsub_get_default, Alice)
+      end).
+
 retrieve_configuration_test(Config) ->
     escalus:fresh_story(
       Config,
@@ -744,7 +735,9 @@ retrieve_configuration_test(Config) ->
               NodeConfig = pubsub_tools:get_configuration(Alice, Node, []),
               verify_config_fields(NodeConfig),
 
-              pubsub_tools:delete_node(Alice, Node, [])
+              pubsub_tools:delete_node(Alice, Node, []),
+
+              assert_event(mod_pubsub_get_configure, Alice)
       end).
 
 set_configuration_test(Config) ->
@@ -759,6 +752,41 @@ set_configuration_test(Config) ->
               pubsub_tools:set_configuration(Alice, Node, ValidNodeConfig,
                                              [{response_timeout, 10000}]),
               pubsub_tools:get_configuration(Alice, Node, [{expected_result, ValidNodeConfig}]),
+
+              pubsub_tools:delete_node(Alice, Node, []),
+
+              assert_event(mod_pubsub_set_configure, Alice)
+      end).
+
+set_configuration_errors_test(Config) ->
+    escalus:fresh_story(
+      Config,
+      [{alice, 1}],
+      fun(Alice) ->
+              Node = pubsub_node(),
+              pubsub_tools:create_node(Alice, Node, []),
+
+              GoodOpts = [{<<"pubsub#notify_config">>, <<"1">>}],
+              BadOpts = [{<<"pubsub#notify_config">>, <<"7">>}],
+
+              %% Missing <configure> element
+              pubsub_tools:set_configuration(Alice, Node, [], [{expected_error_type, <<"modify">>}]),
+
+              %% Missing data form
+              pubsub_tools:set_configuration(Alice, Node, GoodOpts,
+                                             [{modify_request, fun form_helper:remove_forms/1},
+                                              {expected_error_type, <<"modify">>}]),
+
+              %% Invalid forms
+              pubsub_tools:set_configuration(Alice, Node, GoodOpts,
+                                             [{modify_request, fun form_helper:remove_form_types/1},
+                                              {expected_error_type, <<"modify">>}]),
+              pubsub_tools:set_configuration(Alice, Node, GoodOpts,
+                                             [{modify_request, fun form_helper:remove_form_ns/1},
+                                              {expected_error_type, <<"modify">>}]),
+              pubsub_tools:set_configuration(Alice, Node, BadOpts,
+                                             [{expected_error_type, <<"modify">>}]),
+              assert_no_event(mod_pubsub_set_configure, Alice),
 
               pubsub_tools:delete_node(Alice, Node, [])
       end).
@@ -939,7 +967,9 @@ get_affiliations_test(Config) ->
               verify_affiliations(pubsub_tools:get_affiliations(Alice, Node, []),
                                   [{Alice, <<"owner">>}]),
 
-              pubsub_tools:delete_node(Alice, Node, [])
+              pubsub_tools:delete_node(Alice, Node, []),
+
+              assert_event(mod_pubsub_get_affiliations, Alice)
       end).
 
 add_publisher_and_member_test(Config) ->
@@ -964,7 +994,10 @@ add_publisher_and_member_test(Config) ->
               pubsub_tools:publish(Bob, <<"item1">>, Node, []),
               pubsub_tools:receive_item_notification(Kate, <<"item1">>, Node, []),
 
-              pubsub_tools:delete_node(Alice, Node, [])
+              pubsub_tools:delete_node(Alice, Node, []),
+              assert_event(mod_pubsub_set_create, Alice),
+              assert_event(mod_pubsub_set_affiliations, Alice),
+              assert_wait_for_event(mod_pubsub_set_delete, Alice)
       end).
 
 swap_owners_test(Config) ->
@@ -1037,7 +1070,9 @@ retrieve_user_subscriptions_test(Config) ->
               pubsub_tools:get_user_subscriptions(Alice, node_addr(), [{expected_result, []}]),
 
               pubsub_tools:delete_node(Alice, Node, []),
-              pubsub_tools:delete_node(Alice, Node2, [])
+              pubsub_tools:delete_node(Alice, Node2, []),
+
+              assert_events(mod_pubsub_get_subscriptions, Bob, 3)
       end).
 
 retrieve_node_subscriptions_test(Config) ->
@@ -1101,7 +1136,15 @@ modify_node_subscriptions_test(Config) ->
               ModSubs = [{Geralt, bare, <<"subscribed">>}, {Geralt, full, <<"subscribed">>}],
               pubsub_tools:get_node_subscriptions(Alice, Node, [{expected_result, ModSubs}]),
 
-              pubsub_tools:delete_node(Alice, Node, [])
+              pubsub_tools:delete_node(Alice, Node, []),
+
+              BobJid = escalus_utils:get_jid(Bob),
+              instrument_helper:assert(mod_pubsub_set_subscriptions, #{host_type => domain()},
+                                       fun(#{errors := 1, jid := From}) ->
+                                           BobJid =:= jid:to_binary(From)
+                                       end),
+              assert_events(mod_pubsub_set_subscriptions, Alice, 2),
+              assert_no_event(mod_pubsub_set_subscriptions, Bob)
       end).
 
 process_subscription_requests_test(Config) ->
@@ -1152,6 +1195,23 @@ retrieve_pending_subscription_requests_test(Config) ->
               pubsub_tools:receive_subscription_requests(Alice, [Bob, Kate], Node, []),
               IQRes = escalus:wait_for_stanza(Alice),
               escalus:assert(is_iq_result, [Request], IQRes),
+
+              pubsub_tools:delete_node(Alice, Node, [])
+      end).
+
+retrieve_pending_subscription_requests_errors_test(Config) ->
+    escalus:fresh_story(
+      Config,
+      [{alice, 1}],
+      fun(Alice) ->
+              Node = pubsub_node(),
+              NodeConfig = [{<<"pubsub#access_model">>, <<"authorize">>}],
+              pubsub_tools:create_node(Alice, Node, [{config, NodeConfig}]),
+
+              %% Invalid form
+              pubsub_tools:get_pending_subscriptions(
+                Alice, Node, [{modify_request, fun form_helper:remove_form_types/1},
+                              {expected_error_type, <<"modify">>}]),
 
               pubsub_tools:delete_node(Alice, Node, [])
       end).
@@ -1419,7 +1479,7 @@ notify_nested_collections_test(Config) ->
               pubsub_tools:delete_node(Alice, MiddleCollection, []),
               pubsub_tools:delete_node(Alice, TopCollection, [])
       end).
- 
+
 retrieve_subscriptions_collection_test(Config) ->
     escalus:fresh_story(
       Config,
@@ -1769,7 +1829,7 @@ can_create_node_with_existing_parent_path(Config) ->
               {Parent, Node} = path_node_and_parent(Alice, pubsub_node()),
               pubsub_tools:create_node(Alice, Parent, []),
               pubsub_tools:create_node(Alice, Node, []),
-              
+
               pubsub_tools:delete_node(Alice, Node, []),
               pubsub_tools:delete_node(Alice, Parent, [])
       end).
@@ -1793,9 +1853,9 @@ disco_node_children_by_path_prefix(Config) ->
               pubsub_tools:discover_nodes(Bob, Parent, [{expected_error_type, <<"cancel">>}]),
 
               pubsub_tools:create_node(Alice, Parent, []),
-              
+
               pubsub_tools:discover_nodes(Bob, Parent, [{expected_result, []}]),
-              
+
               pubsub_tools:create_node(Alice, Node, []),
 
               %% Request:  5.2.1 Ex.11 Entity requests child nodes
@@ -1816,7 +1876,7 @@ deleting_parent_path_deletes_children(Config) ->
 
               pubsub_tools:create_node(Alice, Parent, []),
               pubsub_tools:create_node(Alice, Node, []),
-              
+
               pubsub_tools:delete_node(Alice, Parent, []),
 
               pubsub_tools:discover_nodes(Alice, node_addr(),
@@ -1836,11 +1896,10 @@ path_node_and_parent(Client, {NodeAddr, NodeName}) ->
     {{NodeAddr, Prefix}, {NodeAddr, <<Prefix/binary, "/", NodeName/binary>>}}.
 
 required_modules(ExtraOpts) ->
-    [{mod_pubsub, [
-                   {backend, mongoose_helper:mnesia_or_rdbms_backend()},
-                   {host, "pubsub.@HOST@"}
-                   | ExtraOpts
-                  ]}].
+    Opts = maps:merge(#{backend => mongoose_helper:mnesia_or_rdbms_backend(),
+                        host => subhost_pattern("pubsub.@HOST@")},
+                      ExtraOpts),
+    [{mod_pubsub, config_parser_helper:mod_config(mod_pubsub, Opts)}].
 
 verify_config_fields(NodeConfig) ->
     ValidFields = [
@@ -1905,27 +1964,48 @@ node_config_for_test() ->
      % Covered by collection tests: {<<"pubsub#collection">>, <<"text-multi">>}
     ].
 
+default_config() ->
+    [{<<"pubsub#deliver_payloads">>, <<"1">>},
+     {<<"pubsub#deliver_notifications">>, <<"1">>},
+     {<<"pubsub#notify_config">>, <<"0">>},
+     {<<"pubsub#notify_delete">>, <<"0">>},
+     {<<"pubsub#notify_retract">>, <<"0">>},
+     {<<"pubsub#persist_items">>, <<"1">>},
+     {<<"pubsub#title">>, <<>>},
+     {<<"pubsub#max_items">>, <<"10">>},
+     {<<"pubsub#subscribe">>, <<"1">>},
+     {<<"pubsub#access_model">>, <<"open">>},
+     {<<"pubsub#roster_groups_allowed">>, []},
+     {<<"pubsub#publish_model">>, <<"publishers">>},
+     {<<"pubsub#purge_offline">>, <<"0">>},
+     {<<"pubsub#notification_type">>, <<"headline">>},
+     {<<"pubsub#max_payload_size">>, <<"60000">>},
+     {<<"pubsub#send_last_published_item">>, <<"never">>},
+     {<<"pubsub#presence_based_delivery">>, <<"0">>},
+     {<<"pubsub#type">>, <<>>},
+     {<<"pubsub#collection">>, []}].
+
 verify_item_retract({NodeAddr, NodeName}, ItemId, Stanza) ->
     escalus:assert(is_message, Stanza),
     NodeAddr = exml_query:attr(Stanza, <<"from">>),
 
-    [#xmlel{ attrs = [{<<"xmlns">>, ?NS_PUBSUB_EVENT}] } = Event]
-    = exml_query:subelements(Stanza, <<"event">>),
+    [#xmlel{ attrs = #{<<"xmlns">> := ?NS_PUBSUB_EVENT} } = Event]
+        = exml_query:subelements(Stanza, <<"event">>),
 
-    [#xmlel{ attrs = [{<<"node">>, NodeName}] } = Items]
-    = exml_query:subelements(Event, <<"items">>),
+    [#xmlel{ attrs = #{<<"node">> := NodeName} } = Items]
+        = exml_query:subelements(Event, <<"items">>),
 
-    [#xmlel{ attrs = [{<<"id">>, ItemId}] }] = exml_query:subelements(Items, <<"retract">>).
+    [#xmlel{ attrs = #{<<"id">> := ItemId} }] = exml_query:subelements(Items, <<"retract">>).
 
 verify_config_event({NodeAddr, NodeName}, ConfigChange, Stanza) ->
     escalus:assert(is_message, Stanza),
     NodeAddr = exml_query:attr(Stanza, <<"from">>),
 
-    [#xmlel{ attrs = [{<<"xmlns">>, ?NS_PUBSUB_EVENT}] } = Event]
-    = exml_query:subelements(Stanza, <<"event">>),
+    [#xmlel{ attrs = #{<<"xmlns">> := ?NS_PUBSUB_EVENT} } = Event]
+        = exml_query:subelements(Stanza, <<"event">>),
 
-    [#xmlel{ attrs = [{<<"node">>, NodeName}] } = ConfigEl]
-    = exml_query:subelements(Event, <<"configuration">>),
+    [#xmlel{ attrs = #{<<"node">> := NodeName} } = ConfigEl]
+        = exml_query:subelements(Event, <<"configuration">>),
 
     Fields = exml_query:paths(ConfigEl, [{element, <<"x">>},
                                          {element, <<"field">>}]),
@@ -1960,15 +2040,22 @@ is_not_allowed_and_closed(IQError) ->
                                                   {element, <<"closed-node">>},
                                                   {attr, <<"xmlns">>}]).
 
-%% TODO: Functions below will most probably fail when mod_pubsub gets some nice refactoring!
+assert_no_event(EventName, Client) ->
+    assert_events(EventName, Client, 0).
 
-set_service_option(Host, Key, Val) ->
-    true = rpc(mim(), ets, insert, [service_tab_name(Host), {Key, Val}]).
+assert_event(EventName, Client) ->
+    assert_events(EventName, Client, 1).
 
-lookup_service_option(Host, Key) ->
-    [{_, Val}] = rpc(mim(), ets, lookup, [service_tab_name(Host), Key]),
-    Val.
+assert_events(EventName, Client, Count) ->
+    ClientJid = escalus_utils:get_jid(Client),
+    instrument_helper:assert(EventName, #{host_type => domain()},
+                             fun(#{count := 1, jid := From, time := T}) ->
+                                 T >= 0 andalso ClientJid =:= jid:to_binary(From)
+                             end, #{expected_count => Count}).
 
-service_tab_name(Host) ->
-    rpc(mim(), gen_mod, get_module_proc, [Host, config]).
-
+assert_wait_for_event(EventName, Client) ->
+    ClientJid = escalus_utils:get_jid(Client),
+    instrument_helper:wait_and_assert(EventName, #{host_type => domain()},
+                                      fun(#{count := 1, jid := From, time := T}) ->
+                                              T >= 0 andalso ClientJid =:= jid:to_binary(From)
+                                      end).

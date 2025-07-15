@@ -26,7 +26,7 @@
 
 -module(mod_offline).
 -author('alexey@process-one.net').
--xep([{xep, 160}, {version, "1.0"}]).
+-xep([{xep, 160}, {version, "1.0.1"}]).
 -xep([{xep, 23}, {version, "1.3"}]).
 -xep([{xep, 22}, {version, "1.4"}]).
 -xep([{xep, 85}, {version, "2.1"}]).
@@ -34,18 +34,21 @@
 -behaviour(mongoose_module_metrics).
 
 %% gen_mod handlers
--export([start/2, stop/1]).
+-export([start/2, stop/1, hooks/1, config_spec/0, supported_features/0]).
 
 %% Hook handlers
--export([inspect_packet/4,
+-export([inspect_packet/3,
          pop_offline_messages/3,
-         get_sm_features/5,
-         remove_expired_messages/1,
-         remove_old_messages/2,
-         remove_user/2, % for tests
          remove_user/3,
-         determine_amp_strategy/5,
-         amp_failed_event/3]).
+         remove_domain/3,
+         disco_features/3,
+         determine_amp_strategy/3,
+         amp_failed_event/3,
+         get_personal_data/3]).
+
+%% Admin API
+-export([remove_expired_messages/2,
+         remove_old_messages/3]).
 
 %% Internal exports
 -export([start_link/3]).
@@ -57,109 +60,95 @@
 %% helpers to be used from backend moudules
 -export([is_expired_message/2]).
 
-%% GDPR related
--export([get_personal_data/2]).
-
 -export([config_metrics/1]).
+
+-ignore_xref([
+    behaviour_info/1, code_change/3, handle_call/3, handle_cast/2,
+    handle_info/2, init/1, start_link/3, terminate/2
+]).
 
 -include("mongoose.hrl").
 -include("jlib.hrl").
 -include("amp.hrl").
 -include("mod_offline.hrl").
-
--define(PROCNAME, ejabberd_offline).
+-include("mongoose_config_spec.hrl").
 
 %% default value for the maximum number of user messages
 -define(MAX_USER_MESSAGES, infinity).
 
 -type msg() :: #offline_msg{us :: {jid:luser(), jid:lserver()},
-                          timestamp :: erlang:timestamp(),
-                          expire :: erlang:timestamp() | never,
-                          from ::jid:jid(),
-                          to ::jid:jid(),
-                          packet :: exml:element()}.
+                            timestamp :: integer(),
+                            expire :: integer() | never,
+                            from :: jid:jid(),
+                            to :: jid:jid(),
+                            packet :: exml:element()}.
 
 -export_type([msg/0]).
 
--record(state, {
-    host :: jid:server(),
-    access_max_user_messages,
-    message_poppers = monitored_map:new() ::
-        monitored_map:t({LUser :: binary(), LServer :: binary}, pid())
-}).
+-type poppers() :: monitored_map:t({jid:luser(), jid:lserver()}, pid()).
 
-%% ------------------------------------------------------------------
-%% Backend callbacks
+-record(state, {host_type :: mongooseim:host_type(),
+                access_max_user_messages :: atom(),
+                message_poppers = monitored_map:new() :: poppers()
+               }).
 
--callback init(Host, Opts) -> ok when
-    Host :: binary(),
-    Opts :: list().
--callback pop_messages(LUser, LServer) -> {ok, Result} | {error, Reason} when
-    LUser :: jid:luser(),
-    LServer :: jid:lserver(),
-    Reason :: term(),
-    Result :: list(#offline_msg{}).
--callback fetch_messages(LUser, LServer) -> {ok, Result} | {error, Reason} when
-    LUser :: jid:luser(),
-    LServer :: jid:lserver(),
-    Reason :: term(),
-    Result :: list(#offline_msg{}).
--callback write_messages(LUser, LServer, Msgs) ->
-    ok | {error, Reason}  when
-    LUser :: jid:luser(),
-    LServer :: jid:lserver(),
-    Msgs :: list(),
-    Reason :: term().
--callback count_offline_messages(LUser, LServer, MaxToArchive) -> integer() when
-      LUser :: jid:luser(),
-      LServer :: jid:lserver(),
-      MaxToArchive :: integer().
--callback remove_expired_messages(Host) -> {error, Reason} | {ok, Count} when
-    Host :: jid:lserver(),
-    Reason :: term(),
-    Count :: integer().
--callback remove_old_messages(Host, Timestamp) -> {error, Reason} | {ok, Count} when
-    Host :: jid:lserver(),
-    Timestamp :: erlang:timestamp(),
-    Reason :: term(),
-    Count :: integer().
--callback remove_user(LUser, LServer) -> any() when
-    LUser :: binary(),
-    LServer :: binary().
+-type state() :: #state{}.
+
+%% Types used in backend callbacks
+-type msg_count() :: non_neg_integer().
+-type timestamp() :: integer().
+
+-export_type([msg_count/0, timestamp/0]).
 
 %% gen_mod callbacks
 %% ------------------------------------------------------------------
 
-start(Host, Opts) ->
-    AccessMaxOfflineMsgs = gen_mod:get_opt(access_max_user_messages, Opts,
-                                           max_user_offline_messages),
-    gen_mod:start_backend_module(?MODULE, Opts, [pop_messages, write_messages]),
-    mod_offline_backend:init(Host, Opts),
-    start_worker(Host, AccessMaxOfflineMsgs),
-    ejabberd_hooks:add(hooks(Host)),
+-spec start(mongooseim:host_type(), gen_mod:module_opts()) -> ok.
+start(HostType, #{access_max_user_messages := AccessMaxOfflineMsgs} = Opts) ->
+    mod_offline_backend:init(HostType, Opts),
+    start_worker(HostType, AccessMaxOfflineMsgs),
     ok.
 
+-spec stop(mongooseim:host_type()) -> ok.
 stop(Host) ->
-    ejabberd_hooks:delete(hooks(Host)),
     stop_worker(Host),
     ok.
 
-hooks(Host) ->
+-spec config_spec() -> mongoose_config_spec:config_section().
+config_spec() ->
+    #section{
+        items = #{<<"access_max_user_messages">> => #option{type = atom,
+                                                            validate = access_rule},
+                  <<"backend">> => #option{type = atom,
+                                           validate = {module, mod_offline}},
+                  <<"store_groupchat_messages">> => #option{type = boolean}
+                 },
+        defaults = #{<<"access_max_user_messages">> => max_user_offline_messages,
+                     <<"store_groupchat_messages">> => false,
+                     <<"backend">> => mnesia
+                    }
+    }.
+
+supported_features() -> [dynamic_domains].
+
+-spec hooks(mongooseim:host_type()) -> gen_hook:hook_list().
+hooks(HostType) ->
     DefaultHooks = [
-        {offline_message_hook, Host, ?MODULE, inspect_packet, 50},
-        {resend_offline_messages_hook, Host, ?MODULE, pop_offline_messages, 50},
-        {remove_user, Host, ?MODULE, remove_user, 50},
-        {anonymous_purge_hook, Host, ?MODULE, remove_user, 50},
-        {disco_sm_features, Host, ?MODULE, get_sm_features, 50},
-        {disco_local_features, Host, ?MODULE, get_sm_features, 50},
-        {amp_determine_strategy, Host, ?MODULE, determine_amp_strategy, 30},
-        {failed_to_store_message, Host, ?MODULE, amp_failed_event, 30},
-        {get_personal_data, Host, ?MODULE, get_personal_data, 50}
+        {offline_message, HostType, fun ?MODULE:inspect_packet/3, #{}, 50},
+        {resend_offline_messages, HostType, fun ?MODULE:pop_offline_messages/3, #{}, 50},
+        {remove_user, HostType, fun ?MODULE:remove_user/3, #{}, 50},
+        {remove_domain, HostType, fun ?MODULE:remove_domain/3, #{}, 50},
+        {anonymous_purge, HostType, fun ?MODULE:remove_user/3, #{}, 50},
+        {disco_sm_features, HostType, fun ?MODULE:disco_features/3, #{}, 50},
+        {disco_local_features, HostType, fun ?MODULE:disco_features/3, #{}, 50},
+        {amp_determine_strategy, HostType, fun ?MODULE:determine_amp_strategy/3, #{}, 30},
+        {failed_to_store_message, HostType, fun ?MODULE:amp_failed_event/3, #{}, 30},
+        {get_personal_data, HostType, fun ?MODULE:get_personal_data/3, #{}, 50}
     ],
-    case gen_mod:get_module_opt(Host, ?MODULE, store_groupchat_messages, false) of
+    case gen_mod:get_module_opt(HostType, ?MODULE, store_groupchat_messages) of
         true ->
-            GroupChatHook = {offline_groupchat_message_hook,
-                             Host, ?MODULE, inspect_packet, 50},
+            GroupChatHook = {offline_groupchat_message,
+                             HostType, fun ?MODULE:inspect_packet/3, #{}, 50},
             [GroupChatHook | DefaultHooks];
         _ -> DefaultHooks
     end.
@@ -167,55 +156,57 @@ hooks(Host) ->
 %% Server side functions
 %% ------------------------------------------------------------------
 
-amp_failed_event(Acc, From, _Packet) ->
-    mod_amp:check_packet(Acc, From, offline_failed).
+-spec amp_failed_event(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: mongoose_acc:t(),
+    Params :: map(),
+    Extra :: gen_hook:extra().
+amp_failed_event(Acc, _Params, _Extra) ->
+    {ok, mod_amp:check_packet(Acc, offline_failed)}.
 
-handle_offline_msg(Acc, #offline_msg{us=US} = Msg, AccessMaxOfflineMsgs) ->
+handle_offline_msg(HostType, Acc, #offline_msg{us=US} = Msg, AccessMaxOfflineMsgs) ->
     {LUser, LServer} = US,
-    Msgs = receive_all(US, [Msg]),
-    MaxOfflineMsgs = get_max_user_messages(AccessMaxOfflineMsgs, LUser, LServer),
+    Msgs = receive_all(US, [{Acc, Msg}]),
+    MaxOfflineMsgs = get_max_user_messages(HostType, AccessMaxOfflineMsgs, LUser, LServer),
     Len = length(Msgs),
-    case is_message_count_threshold_reached(MaxOfflineMsgs, LUser, LServer, Len) of
+    case is_message_count_threshold_reached(HostType, MaxOfflineMsgs, LUser, LServer, Len) of
         false ->
-            write_messages(Acc, LUser, LServer, Msgs);
+            write_messages(HostType, LUser, LServer, Msgs);
         true ->
-            discard_warn_sender(Acc, Msgs)
+            discard_warn_sender(Msgs)
     end.
 
-write_messages(Acc, LUser, LServer, Msgs) ->
-    case mod_offline_backend:write_messages(LUser, LServer, Msgs) of
+write_messages(HostType, LUser, LServer, Msgs) ->
+    MsgsWithoutAcc = [Msg || {_Acc, Msg} <- Msgs],
+    case mod_offline_backend:write_messages(HostType, LUser, LServer, MsgsWithoutAcc) of
         ok ->
-            lists:foreach(fun(#offline_msg{from = From, to = To, packet = Packet}) ->
-                                  NAcc = mongoose_acc:new(#{ location => ?LOCATION,
-                                                             lserver => LServer,
-                                                             from_jid => From,
-                                                             to_jid => To,
-                                                             element => Packet }),
-                                  mod_amp:check_packet(NAcc, From, archived)
-                          end, Msgs);
+            [mod_amp:check_packet(Acc, archived) || {Acc, _Msg} <- Msgs],
+            ok;
         {error, Reason} ->
-            ?ERROR_MSG("~ts@~ts: write_messages failed with ~p.",
-                [LUser, LServer, Reason]),
-            discard_warn_sender(Acc, Msgs)
+            ?LOG_ERROR(#{what => offline_write_failed,
+                         text => <<"Failed to write offline messages">>,
+                         reason => Reason,
+                         user => LUser, server => LServer, msgs => Msgs}),
+            discard_warn_sender(Msgs)
     end.
 
--spec is_message_count_threshold_reached(integer(), jid:luser(),
-                                         jid:lserver(), integer()) ->
-    boolean().
-is_message_count_threshold_reached(infinity, _LUser, _LServer, _Len) ->
+-spec is_message_count_threshold_reached(mongooseim:host_type(), integer() | infinity,
+                                         jid:luser(), jid:lserver(), integer()) ->
+          boolean().
+is_message_count_threshold_reached(_HostType, infinity, _LUser, _LServer, _Len) ->
     false;
-is_message_count_threshold_reached(MaxOfflineMsgs, _LUser, _LServer, Len)
+is_message_count_threshold_reached(_HostType, MaxOfflineMsgs, _LUser, _LServer, Len)
   when Len > MaxOfflineMsgs ->
     true;
-is_message_count_threshold_reached(MaxOfflineMsgs, LUser, LServer, Len) ->
+is_message_count_threshold_reached(HostType, MaxOfflineMsgs, LUser, LServer, Len) ->
     %% Only count messages if needed.
     MaxArchivedMsg = MaxOfflineMsgs - Len,
     %% Maybe do not need to count all messages in archive
-    MaxArchivedMsg < mod_offline_backend:count_offline_messages(LUser, LServer, MaxArchivedMsg + 1).
+    MaxArchivedMsg < mod_offline_backend:count_offline_messages(HostType, LUser, LServer,
+                                                                MaxArchivedMsg + 1).
 
 
-get_max_user_messages(AccessRule, LUser, Host) ->
-    case acl:match_rule(Host, AccessRule, jid:make(LUser, Host, <<>>)) of
+get_max_user_messages(HostType, AccessRule, LUser, LServer) ->
+    case acl:match_rule(HostType, LServer, AccessRule, jid:make_noprep(LUser, LServer, <<>>)) of
         Max when is_integer(Max) -> Max;
         infinity -> infinity;
         _ -> ?MAX_USER_MESSAGES
@@ -223,7 +214,7 @@ get_max_user_messages(AccessRule, LUser, Host) ->
 
 receive_all(US, Msgs) ->
     receive
-        #offline_msg{us=US} = Msg ->
+        {_Acc, #offline_msg{us=US}} = Msg ->
             receive_all(US, [Msg | Msgs])
     after 0 ->
               Msgs
@@ -232,92 +223,59 @@ receive_all(US, Msgs) ->
 %% Supervision
 %% ------------------------------------------------------------------
 
-start_worker(Host, AccessMaxOfflineMsgs) ->
-    Proc = srv_name(Host),
+start_worker(HostType, AccessMaxOfflineMsgs) ->
+    Proc = srv_name(HostType),
     ChildSpec =
     {Proc,
-     {?MODULE, start_link, [Proc, Host, AccessMaxOfflineMsgs]},
+     {?MODULE, start_link, [Proc, HostType, AccessMaxOfflineMsgs]},
      permanent, 5000, worker, [?MODULE]},
     ejabberd_sup:start_child(ChildSpec).
 
-stop_worker(Host) ->
-    Proc = srv_name(Host),
+stop_worker(HostType) ->
+    Proc = srv_name(HostType),
     ejabberd_sup:stop_child(Proc).
 
-start_link(Name, Host, AccessMaxOfflineMsgs) ->
-    gen_server:start_link({local, Name}, ?MODULE, [Host, AccessMaxOfflineMsgs], []).
+start_link(Name, HostType, AccessMaxOfflineMsgs) ->
+    gen_server:start_link({local, Name}, ?MODULE, [HostType, AccessMaxOfflineMsgs], []).
 
 srv_name() ->
     mod_offline.
 
-srv_name(Host) ->
-    gen_mod:get_module_proc(Host, srv_name()).
-
-determine_amp_strategy(Strategy = #amp_strategy{deliver = [none]},
-                       _FromJID, ToJID, _Packet, initial_check) ->
-    #jid{luser = LUser, lserver = LServer} = ToJID,
-    ShouldBeStored = ejabberd_auth:is_user_exists(LUser, LServer),
-    case ShouldBeStored of
-        true -> Strategy#amp_strategy{deliver = [stored, none]};
-        false -> Strategy
-    end;
-determine_amp_strategy(Strategy, _, _, _, _) ->
-    Strategy.
+srv_name(HostType) ->
+    gen_mod:get_module_proc(HostType, srv_name()).
 
 %%====================================================================
 %% gen_server callbacks
 %%====================================================================
 
-%%--------------------------------------------------------------------
-%% Function: init(Args) -> {ok, State} |
-%%                         {ok, State, Timeout} |
-%%                         ignore               |
-%%                         {stop, Reason}
-%% Description: Initiates the server
-%%--------------------------------------------------------------------
-init([Host, AccessMaxOfflineMsgs]) ->
-    {ok, #state{
-            host = Host,
-            access_max_user_messages = AccessMaxOfflineMsgs}}.
+-spec init(list()) -> {ok, state()}.
+init([HostType, AccessMaxOfflineMsgs]) ->
+    {ok, #state{host_type = HostType,
+                access_max_user_messages = AccessMaxOfflineMsgs}}.
 
-%%--------------------------------------------------------------------
-%% Function: %% handle_call(Request, From, State) -> {reply, Reply, State} |
-%%                                      {reply, Reply, State, Timeout} |
-%%                                      {noreply, State} |
-%%                                      {noreply, State, Timeout} |
-%%                                      {stop, Reason, Reply, State} |
-%%                                      {stop, Reason, State}
-%% Description: Handling call messages
-%%--------------------------------------------------------------------
-handle_call({pop_offline_messages, LUser, LServer}, {Pid, _}, State) ->
-    Result = mod_offline_backend:pop_messages(LUser, LServer),
-    NewPoppers = monitored_map:put({LUser, LServer}, Pid, Pid, State#state.message_poppers),
+-spec handle_call(Request :: any(), {pid(), any()}, state()) -> {reply, Result, state()}
+              when Result :: ok | {ok, [msg()]} | {error, any()}.
+handle_call({pop_offline_messages, JID}, {Pid, _}, State = #state{host_type = HostType}) ->
+    Result = mod_offline_backend:pop_messages(HostType, JID),
+    NewPoppers = monitored_map:put(jid:to_lus(JID), Pid, Pid, State#state.message_poppers),
     {reply, Result, State#state{message_poppers = NewPoppers}};
-handle_call(_, _, State) ->
+handle_call(Request, From, State) ->
+    ?UNEXPECTED_CALL(Request, From),
     {reply, ok, State}.
 
-%%--------------------------------------------------------------------
-%% Function: handle_cast(Msg, State) -> {noreply, State} |
-%%                                      {noreply, State, Timeout} |
-%%                                      {stop, Reason, State}
-%% Description: Handling cast messages
-%%--------------------------------------------------------------------
+-spec handle_cast(any(), state()) -> {noreply, state()}.
 handle_cast(Msg, State) ->
-    ?WARNING_MSG("Strange message ~p.", [Msg]),
+    ?UNEXPECTED_CAST(Msg),
     {noreply, State}.
 
-%%--------------------------------------------------------------------
-%% Function: handle_info(Info, State) -> {noreply, State} |
-%%                                       {noreply, State, Timeout} |
-%%                                       {stop, Reason, State}
-%% Description: Handling all non call/cast messages
-%%--------------------------------------------------------------------
+-spec handle_info(any(), state()) -> {noreply, state()}.
 handle_info({'DOWN', _MonitorRef, _Type, _Object, _Info} = Msg, State) ->
     NewPoppers = monitored_map:handle_info(Msg, State#state.message_poppers),
     {noreply, State#state{message_poppers = NewPoppers}};
 handle_info({Acc, Msg = #offline_msg{us = US}},
-            State = #state{access_max_user_messages = AccessMaxOfflineMsgs}) ->
-    handle_offline_msg(Acc, Msg, AccessMaxOfflineMsgs),
+            State = #state{host_type = HostType,
+                           access_max_user_messages = AccessMaxOfflineMsgs}) ->
+    handle_offline_msg(HostType, Acc, Msg, AccessMaxOfflineMsgs),
     case monitored_map:find(US, State#state.message_poppers) of
         {ok, Pid} ->
             Pid ! new_offline_messages;
@@ -325,61 +283,43 @@ handle_info({Acc, Msg = #offline_msg{us = US}},
     end,
     {noreply, State};
 handle_info(Msg, State) ->
-    ?WARNING_MSG("Strange message ~p.", [Msg]),
+    ?UNEXPECTED_INFO(Msg),
     {noreply, State}.
 
-%%--------------------------------------------------------------------
-%% Function: terminate(Reason, State) -> void()
-%% Description: This function is called by a gen_server when it is about to
-%% terminate. It should be the opposite of Module:init/1 and do any necessary
-%% cleaning up. When it returns, the gen_server terminates with Reason.
-%% The return value is ignored.
-%%--------------------------------------------------------------------
+-spec terminate(any(), state()) -> ok.
 terminate(_Reason, _State) ->
     ok.
 
-%%--------------------------------------------------------------------
-%% Func: code_change(OldVsn, State, Extra) -> {ok, NewState}
-%% Description: Convert process state when code is changed
-%%--------------------------------------------------------------------
+-spec code_change(any(), state(), any()) -> {ok, state()}.
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
-
 
 %% Handlers
 %% ------------------------------------------------------------------
 
-get_sm_features(Acc, _From, _To, <<"">> = _Node, _Lang) ->
-    add_feature(Acc, ?NS_FEATURE_MSGOFFLINE);
-get_sm_features(_Acc, _From, _To, ?NS_FEATURE_MSGOFFLINE, _Lang) ->
-    %% override all lesser features...
-    {result, []};
-get_sm_features(Acc, _From, _To, _Node, _Lang) ->
-    Acc.
-
-add_feature({result, Features}, Feature) ->
-    {result, Features ++ [Feature]};
-add_feature(_, Feature) ->
-    {result, [Feature]}.
-
 %% This function should be called only from a hook
 %% Calling it directly is dangerous and may store unwanted messages
 %% in the offline storage (e.g. messages of type error)
-%% #rh
-inspect_packet(Acc, From, To, Packet) ->
+-spec inspect_packet(Acc, Params, Extra) -> {ok | stop, Acc} when
+    Acc :: mongoose_acc:t(),
+    Params :: map(),
+    Extra :: gen_hook:extra().
+inspect_packet(Acc, #{from := From, to := To, packet := Packet}, _Extra) ->
     case check_event_chatstates(Acc, From, To, Packet) of
         true ->
             Acc1 = store_packet(Acc, From, To, Packet),
             {stop, Acc1};
         false ->
-            Acc
+            {ok, Acc}
     end.
 
+-spec store_packet(mongoose_acc:t(), jid:jid(), jid:jid(), exml:element()) -> mongoose_acc:t().
 store_packet(Acc, From, To = #jid{luser = LUser, lserver = LServer},
              Packet = #xmlel{children = Els}) ->
     TimeStamp = get_or_build_timestamp_from_packet(Packet),
     Expire = find_x_expire(TimeStamp, Els),
-    Pid = srv_name(LServer),
+    HostType = mongoose_acc:host_type(Acc),
+    Pid = srv_name(HostType),
     PermanentFields = mongoose_acc:get_permanent_fields(Acc),
     Msg = #offline_msg{us = {LUser, LServer},
                        timestamp = TimeStamp,
@@ -391,17 +331,17 @@ store_packet(Acc, From, To = #jid{luser = LUser, lserver = LServer},
     Pid ! {Acc, Msg},
     mongoose_acc:set(offline, stored, true, Acc).
 
--spec get_or_build_timestamp_from_packet(exml:element()) -> erlang:timestamp().
+-spec get_or_build_timestamp_from_packet(exml:element()) -> integer().
 get_or_build_timestamp_from_packet(Packet) ->
-    case exml_query:path(Packet, [{element, <<"delay">>},
-                                  {attr, <<"stamp">>}]) of
-        undefined -> erlang:timestamp();
-        Stamp -> try calendar:rfc3339_to_system_time(binary_to_list(Stamp),
-                                                     [{unit, microsecond}]) of
-                     TS -> usec:to_now(TS)
-                 catch error:_Error ->
-                         erlang:timestamp()
-                 end
+    case exml_query:path(Packet, [{element, <<"delay">>}, {attr, <<"stamp">>}]) of
+        undefined ->
+            erlang:system_time(microsecond);
+        Stamp ->
+            try
+                calendar:rfc3339_to_system_time(binary_to_list(Stamp), [{unit, microsecond}])
+            catch
+                error:_Error -> erlang:system_time(microsecond)
+            end
     end.
 
 %% Check if the packet has any content about XEP-0022 or XEP-0085
@@ -447,7 +387,7 @@ patch_offline_message(Packet) ->
 x_elem(ID) ->
     #xmlel{
         name = <<"x">>,
-        attrs = [{<<"xmlns">>, ?NS_EVENT}],
+        attrs = #{<<"xmlns">> => ?NS_EVENT},
         children = [ID, #xmlel{name = <<"offline">>}]}.
 
 %% Check if the packet has subelements about XEP-0022, XEP-0085 or other
@@ -470,63 +410,110 @@ find_x_expire(TimeStamp, [El | Els]) ->
     case exml_query:attr(El, <<"xmlns">>, <<>>) of
         ?NS_EXPIRE ->
             Val = exml_query:attr(El, <<"seconds">>, <<>>),
-            case catch list_to_integer(binary_to_list(Val)) of
-                {'EXIT', _} ->
-                    never;
+            try binary_to_integer(Val) of
                 Int when Int > 0 ->
-                    {MegaSecs, Secs, MicroSecs} = TimeStamp,
-                    S = MegaSecs * 1000000 + Secs + Int,
-                    MegaSecs1 = S div 1000000,
-                    Secs1 = S rem 1000000,
-                    {MegaSecs1, Secs1, MicroSecs};
+                    ExpireMicroSeconds = erlang:convert_time_unit(Int, second, microsecond),
+                    TimeStamp + ExpireMicroSeconds;
                 _ ->
                     never
+            catch
+                error:badarg -> never
             end;
         _ ->
             find_x_expire(TimeStamp, Els)
     end.
 
-pop_offline_messages(Acc, User, Server) ->
-    mongoose_acc:append(offline, messages, offline_messages(Acc, User, Server), Acc).
+-spec pop_offline_messages(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: mongoose_acc:t(),
+    Params :: map(),
+    Extra :: gen_hook:extra().
+pop_offline_messages(Acc, #{jid := JID}, _Extra) ->
+    {ok, mongoose_acc:append(offline, messages, offline_messages(Acc, JID), Acc)}.
 
-offline_messages(Acc, User, Server) ->
-    LUser = jid:nodeprep(User),
-    LServer = jid:nameprep(Server),
-    case pop_messages(LUser, LServer) of
+-spec offline_messages(mongoose_acc:t(), jid:jid()) ->
+          [{route, jid:jid(), jid:jid(), mongoose_acc:t()}].
+offline_messages(Acc, #jid{lserver = LServer} = JID) ->
+    HostType = mongoose_acc:host_type(Acc),
+    case pop_messages(HostType, JID) of
         {ok, Rs} ->
             lists:map(fun(R) ->
-                Packet = resend_offline_message_packet(Server, R),
+                Packet = resend_offline_message_packet(LServer, R),
                 compose_offline_message(R, Packet, Acc)
               end, Rs);
         {error, Reason} ->
-            ?ERROR_MSG("~ts@~ts: pop_messages failed with ~p.", [LUser, LServer, Reason]),
+            ?LOG_WARNING(#{what => offline_pop_failed, reason => Reason, acc => Acc}),
             []
     end.
 
-pop_messages(LUser, LServer) ->
-    case gen_server:call(srv_name(LServer), {pop_offline_messages, LUser, LServer}) of
+-spec pop_messages(mongooseim:host_type(), jid:jid()) -> {ok, [msg()]} | {error, any()}.
+pop_messages(HostType, JID) ->
+    case gen_server:call(srv_name(HostType), {pop_offline_messages, jid:to_bare(JID)}) of
         {ok, RsAll} ->
-            TimeStamp = os:timestamp(),
+            TimeStamp = erlang:system_time(microsecond),
             Rs = skip_expired_messages(TimeStamp, lists:keysort(#offline_msg.timestamp, RsAll)),
             {ok, Rs};
         Other ->
             Other
     end.
 
-get_personal_data(Acc, #jid{ user = User, server = Server }) ->
-    {ok, Messages} = mod_offline_backend:fetch_messages(User, Server),
-    [ {offline, ["timestamp", "from", "to", "packet"],
-       offline_messages_to_gdpr_format(Messages)} | Acc].
+-spec remove_user(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: mongoose_acc:t(),
+    Params :: map(),
+    Extra :: gen_hook:extra().
+remove_user(Acc, #{jid := #jid{luser = LUser, lserver = LServer}}, #{host_type := HostType}) ->
+    mod_offline_backend:remove_user(HostType, LUser, LServer),
+    {ok, Acc}.
+
+-spec remove_domain(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: mongoose_domain_api:remove_domain_acc(),
+    Params :: map(),
+    Extra :: gen_hook:extra().
+remove_domain(Acc, #{domain := Domain}, #{host_type := HostType}) ->
+    mod_offline_backend:remove_domain(HostType, Domain),
+    {ok, Acc}.
+
+-spec disco_features(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: mongoose_disco:feature_acc(),
+    Params :: map(),
+    Extra :: gen_hook:extra().
+disco_features(Acc = #{node := <<>>}, _Params, _Extra) ->
+    {ok, mongoose_disco:add_features([?NS_FEATURE_MSGOFFLINE], Acc)};
+disco_features(Acc = #{node := ?NS_FEATURE_MSGOFFLINE}, _Params, _Extra) ->
+    %% override all lesser features...
+    {ok, Acc#{result := []}};
+disco_features(Acc, _Params, _Extra) ->
+    {ok, Acc}.
+
+-spec determine_amp_strategy(Acc, Params, Extra) -> {ok, Acc} when
+    Acc :: mod_amp:amp_strategy(),
+    Params :: map(),
+    Extra :: gen_hook:extra().
+determine_amp_strategy(Strategy = #amp_strategy{deliver = [none]}, #{to := ToJID, event := initial_check}, _Params) ->
+    case ejabberd_auth:does_user_exist(ToJID) of
+        true -> {ok, Strategy#amp_strategy{deliver = [stored, none]}};
+        false -> {ok, Strategy}
+    end;
+determine_amp_strategy(Strategy, _Params, _Extra) ->
+    {ok, Strategy}.
+
+-spec get_personal_data(Acc, Params, Extra) -> {ok | stop, Acc} when
+    Acc ::  gdpr:personal_data(),
+    Params :: #{jid := jid:jid()},
+    Extra :: gen_hook:extra().
+get_personal_data(Acc, #{jid := JID}, #{host_type := HostType}) ->
+    {ok, Messages} = mod_offline_backend:fetch_messages(HostType, JID),
+    {ok, [{offline, ["timestamp", "from", "to", "packet"],
+           offline_messages_to_gdpr_format(Messages)} | Acc]}.
 
 offline_messages_to_gdpr_format(MsgList) ->
     [offline_msg_to_gdpr_format(Msg) || Msg <- MsgList].
 
 offline_msg_to_gdpr_format(#offline_msg{timestamp = TimeStamp, from = From,
                                         to = To, packet = Packet}) ->
-    SystemTime = usec:to_sec(usec:from_now(TimeStamp)),
+    SystemTime = erlang:convert_time_unit(TimeStamp, microsecond, second),
     UTCTime = calendar:system_time_to_rfc3339(SystemTime, [{offset, "Z"}]),
     UTC = list_to_binary(UTCTime),
-    {UTC, jid:to_binary(From), jid:to_binary(jid:to_bare(To)), exml:to_binary(Packet)}.
+    {UTC, jid:to_binary(From), jid:to_bare_binary(To), exml:to_binary(Packet)}.
 
 skip_expired_messages(TimeStamp, Rs) ->
     [R || R <- Rs, not is_expired_message(TimeStamp, R)].
@@ -542,59 +529,52 @@ compose_offline_message(#offline_msg{from = From, to = To, permanent_fields = Pe
     Acc = mongoose_acc:update_stanza(#{element => Packet, from_jid => From, to_jid => To}, Acc1),
     {route, From, To, Acc}.
 
-resend_offline_message_packet(Server,
+resend_offline_message_packet(LServer,
         #offline_msg{timestamp=TimeStamp, packet = Packet}) ->
-    add_timestamp(TimeStamp, Server, Packet).
+    add_timestamp(TimeStamp, LServer, Packet).
 
-add_timestamp(undefined, _Server, Packet) ->
+add_timestamp(undefined, _LServer, Packet) ->
     Packet;
-add_timestamp(TimeStamp, Server, Packet) ->
-    Time = usec:from_now(TimeStamp),
-    TimeStampXML = timestamp_xml(Server, Time),
-    xml:append_subtags(Packet, [TimeStampXML]).
+add_timestamp(TimeStamp, LServer, Packet) ->
+    TimeStampXML = timestamp_xml(LServer, TimeStamp),
+    jlib:append_subtags(Packet, [TimeStampXML]).
 
-timestamp_xml(Server, Time) ->
-    FromJID = jid:make(<<>>, Server, <<>>),
+timestamp_xml(LServer, Time) ->
+    FromJID = jid:make_noprep(<<>>, LServer, <<>>),
     TS = calendar:system_time_to_rfc3339(Time, [{offset, "Z"}, {unit, microsecond}]),
     jlib:timestamp_to_xml(TS, FromJID, <<"Offline Storage">>).
 
-remove_expired_messages(Host) ->
-    mod_offline_backend:remove_expired_messages(Host).
+-spec remove_expired_messages(mongooseim:host_type(), jid:lserver()) -> {ok, msg_count()} | {error, any()}.
+remove_expired_messages(HostType, LServer) ->
+    Result = mod_offline_backend:remove_expired_messages(HostType, LServer),
+    mongoose_lib:log_if_backend_error(Result, ?MODULE, ?LINE, [HostType]),
+    Result.
 
-remove_old_messages(Host, Days) ->
-    Timestamp = fallback_timestamp(Days, os:timestamp()),
-    mod_offline_backend:remove_old_messages(Host, Timestamp).
-
-%% #rh
-
-remove_user(Acc, User, Server) ->
-    remove_user(User, Server),
-    Acc.
-
-remove_user(User, Server) ->
-    LUser = jid:nodeprep(User),
-    LServer = jid:nameprep(Server),
-    mod_offline_backend:remove_user(LUser, LServer).
+-spec remove_old_messages(mongooseim:host_type(), jid:lserver(), non_neg_integer()) ->
+          {ok, msg_count()} | {error, any()}.
+remove_old_messages(HostType, LServer, HowManyDays) ->
+    Timestamp = fallback_timestamp(HowManyDays, erlang:system_time(microsecond)),
+    Result = mod_offline_backend:remove_old_messages(HostType, LServer, Timestamp),
+    mongoose_lib:log_if_backend_error(Result, ?MODULE, ?LINE, [HostType, Timestamp]),
+    Result.
 
 %% Warn senders that their messages have been discarded:
-discard_warn_sender(Acc, Msgs) ->
+discard_warn_sender(Msgs) ->
     lists:foreach(
-      fun(#offline_msg{from=From, to=To, packet=Packet}) ->
+      fun({Acc, #offline_msg{from=From, to=To, packet=Packet}}) ->
               ErrText = <<"Your contact offline message queue is full."
                           " The message has been discarded.">>,
               Lang = exml_query:attr(Packet, <<"xml:lang">>, <<>>),
-              amp_failed_event(Acc, From, Packet),
+              mod_amp:check_packet(Acc, offline_failed),
               {Acc1, Err} = jlib:make_error_reply(
                       Acc, Packet, mongoose_xmpp_errors:resource_constraint(Lang, ErrText)),
               ejabberd_router:route(To, From, Acc1, Err)
       end, Msgs).
 
-fallback_timestamp(Days, {MegaSecs, Secs, _MicroSecs}) ->
-    S = MegaSecs * 1000000 + Secs - 60 * 60 * 24 * Days,
-    MegaSecs1 = S div 1000000,
-    Secs1 = S rem 1000000,
-    {MegaSecs1, Secs1, 0}.
+fallback_timestamp(HowManyDays, TS_MicroSeconds) ->
+    HowManySeconds = HowManyDays * 86400,
+    HowManyMicroSeconds = erlang:convert_time_unit(HowManySeconds, second, microsecond),
+    TS_MicroSeconds - HowManyMicroSeconds.
 
-config_metrics(Host) ->
-    OptsToReport = [{backend, mnesia}], %list of tuples {option, default_value}
-    mongoose_module_metrics:opts_for_module(Host, ?MODULE, OptsToReport).
+config_metrics(HostType) ->
+    mongoose_module_metrics:opts_for_module(HostType, ?MODULE, [backend]).

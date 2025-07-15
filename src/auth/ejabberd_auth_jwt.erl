@@ -27,50 +27,66 @@
 -author('astro@spaceboyz.net').
 
 %% External exports
--behaviour(ejabberd_gen_auth).
+-behaviour(mongoose_gen_auth).
+
 -export([start/1,
          stop/1,
-         set_password/3,
+         config_spec/0,
          authorize/1,
-         check_password/3,
-         check_password/5,
-         try_register/3,
-         dirty_get_registered_users/0,
-         get_vh_registered_users/1,
-         get_vh_registered_users/2,
-         get_vh_registered_users_number/1,
-         get_vh_registered_users_number/2,
-         get_password/2,
-         get_password_s/2,
-         does_user_exist/2,
-         remove_user/2,
-         supports_sasl_module/2
+         check_password/4,
+         check_password/6,
+         does_user_exist/3,
+         supports_sasl_module/2,
+         supported_features/0
         ]).
 
+%% Config spec callbacks
+-export([process_jwt_secret/1]).
 
 -include("mongoose.hrl").
+-include("mongoose_config_spec.hrl").
 
 %%%----------------------------------------------------------------------
 %%% API
 %%%----------------------------------------------------------------------
 
--spec start(Host :: jid:server()) -> ok.
-start(Host) ->
-    UsernameKey = ejabberd_auth:get_opt(Host, jwt_username_key),
-    true = is_atom(UsernameKey) andalso UsernameKey /= undefined,
-
-    JWTSecret = get_jwt_secret(Host),
-    JWTAlgorithm = ejabberd_auth:get_opt(Host, jwt_algorithm),
-    ejabberd_auth:set_opts(Host,
-                           [{jwt_secret, JWTSecret},
-                           {jwt_algorithm, list_to_binary(JWTAlgorithm)}]),
+-spec start(HostType :: mongooseim:host_type()) -> ok.
+start(HostType) ->
+    JWTSecret = get_jwt_secret(HostType),
+    persistent_term:put({?MODULE, HostType, jwt_secret}, JWTSecret),
     ok.
 
--spec stop(Host :: jid:server()) -> ok.
-stop(_Host) ->
+-spec stop(HostType :: mongooseim:host_type()) -> ok.
+stop(_HostType) ->
+    persistent_term:erase(jwt_secret),
     ok.
 
--spec supports_sasl_module(jid:lserver(), cyrsasl:sasl_module()) -> boolean().
+-spec config_spec() -> mongoose_config_spec:config_section().
+config_spec() ->
+    #section{
+       items = #{<<"secret">> => jwt_secret_config_spec(),
+                 <<"algorithm">> => #option{type = binary,
+                                            validate = {enum, algorithms()}},
+                 <<"username_key">> => #option{type = atom,
+                                               validate = non_empty}
+                },
+       required = all
+      }.
+
+jwt_secret_config_spec() ->
+    #section{
+       items = #{<<"file">> => #option{type = string,
+                                       validate = filename},
+                 <<"env">> => #option{type = string,
+                                      validate = non_empty},
+                 <<"value">> => #option{type = binary}},
+       format_items = list,
+       process = fun ?MODULE:process_jwt_secret/1
+      }.
+
+process_jwt_secret([V]) -> V.
+
+-spec supports_sasl_module(binary(), cyrsasl:sasl_module()) -> boolean().
 supports_sasl_module(_, Module) -> Module =:= cyrsasl_plain.
 
 -spec authorize(mongoose_credentials:t()) -> {ok, mongoose_credentials:t()}
@@ -78,119 +94,67 @@ supports_sasl_module(_, Module) -> Module =:= cyrsasl_plain.
 authorize(Creds) ->
     ejabberd_auth:authorize_with_check_password(?MODULE, Creds).
 
--spec check_password(LUser :: jid:luser(),
+-spec check_password(HostType :: mongooseim:host_type(),
+                     LUser :: jid:luser(),
                      LServer :: jid:lserver(),
                      Password :: binary()) -> boolean().
-check_password(LUser, LServer, Password) ->
-    Key = case ejabberd_auth:get_opt(LServer, jwt_secret) of
+check_password(HostType, LUser, LServer, Password) ->
+    Key = case persistent_term:get({?MODULE, HostType, jwt_secret}) of
               Key1 when is_binary(Key1) -> Key1;
               {env, Var} -> list_to_binary(os:getenv(Var))
           end,
-    BinAlg = ejabberd_auth:get_opt(LServer, jwt_algorithm),
+    BinAlg = mongoose_config:get_opt([{auth, HostType}, jwt, algorithm]),
     Alg = binary_to_atom(jid:str_tolower(BinAlg), utf8),
     case jwerl:verify(Password, Alg, Key) of
         {ok, TokenData} ->
-            UserKey = ejabberd_auth:get_opt(LServer, jwt_username_key),
+            UserKey = mongoose_config:get_opt([{auth,HostType}, jwt, username_key]),
             case maps:find(UserKey, TokenData) of
                 {ok, LUser} ->
                     %% Login username matches $token_user_key in TokenData
-                    ?INFO_MSG("Successfully authenticated with JWT.~nTokenData: ~p~n", [TokenData]),
+                    ?LOG_INFO(#{what => jwt_success_auth,
+                                text => <<"Successfully authenticated with JWT">>,
+                                user => LUser, server => LServer,
+                                token => TokenData}),
                     true;
                 {ok, ExpectedUser} ->
-                    ?WARNING_MSG("Wrong JWT for user ~p /= expected ~p~n", [LUser, ExpectedUser]),
+                    ?LOG_WARNING(#{what => wrong_jwt_user,
+                                   text => <<"JWT contains wrond user">>,
+                                   expected_user => ExpectedUser,
+                                   user => LUser, server => LServer}),
                     false;
                 error ->
-                    ?WARNING_MSG("Missing key ~p in JWT ~p~n", [UserKey, TokenData]),
+                    ?LOG_WARNING(#{what => missing_jwt_key,
+                                   text => <<"Missing key {user_key} in JWT data">>,
+                                   user_key => UserKey, token => TokenData,
+                                   user => LUser, server => LServer}),
                     false
             end;
         {error, Reason} ->
-            ?WARNING_MSG("Cannot verify JWT for user ~s: ~p~n", [LUser, Reason]),
+            ?LOG_WARNING(#{what => jwt_verification_failed,
+                           text => <<"Cannot verify JWT for user">>,
+                           reason => Reason,
+                           user => LUser, server => LServer}),
             false
     end.
 
 
--spec check_password(LUser :: jid:luser(),
+-spec check_password(HostType :: mongooseim:host_type(),
+                     LUser :: jid:luser(),
                      LServer :: jid:lserver(),
                      Password :: binary(),
                      Digest :: binary(),
                      DigestGen :: fun()) -> boolean().
-check_password(LUser, LServer, Password, _Digest, _DigestGen) ->
-    check_password(LUser, LServer, Password).
+check_password(HostType, LUser, LServer, Password, _Digest, _DigestGen) ->
+    check_password(HostType, LUser, LServer, Password).
 
-
--spec set_password(LUser :: jid:luser(),
-                   LServer :: jid:lserver(),
-                   Password :: binary()) -> ok | {error, not_allowed | invalid_jid}.
-set_password(_LUser, _LServer, _Password) ->
-    {error, not_allowed}.
-
-
--spec try_register(LUser :: jid:luser(),
-                   LServer :: jid:lserver(),
-                   Password :: binary()
-                   ) -> ok | {error, exists | not_allowed}.
-try_register(_LUser, _LServer, _Password) ->
-    {error, not_allowed}.
-
-
--spec dirty_get_registered_users() -> [jid:simple_bare_jid()].
-dirty_get_registered_users() ->
-    [].
-
-
--spec get_vh_registered_users(LServer :: jid:lserver()
-                             ) -> [jid:simple_bare_jid()].
-get_vh_registered_users(_LServer) ->
-    [].
-
-
--type query_keyword() :: from | to | limit | offset | prefix.
--type query_value() :: integer() | binary().
--spec get_vh_registered_users(LServer :: jid:lserver(),
-                              Query :: [{query_keyword(), query_value()}]
-                              ) -> [jid:simple_bare_jid()].
-get_vh_registered_users(LServer, _) ->
-    get_vh_registered_users(LServer).
-
-
--spec get_vh_registered_users_number(LServer :: jid:server()
-                                    ) -> non_neg_integer().
-get_vh_registered_users_number(_LServer) ->
-    0.
-
-
--spec get_vh_registered_users_number(LServer :: jid:lserver(),
-                                     Query :: [{prefix, binary()}]
-                                     ) -> integer().
-get_vh_registered_users_number(LServer, _) ->
-    get_vh_registered_users_number(LServer).
-
-
--spec get_password(LUser :: jid:luser(),
-                   LServer :: jid:lserver()) -> binary() | false.
-get_password(_LUser, _LServer) ->
-    false.
-
-
--spec get_password_s(LUser :: jid:luser(),
-                     LServer :: jid:lserver()) -> binary().
-get_password_s(_LUser, _LServer) ->
-    <<"">>.
-
--spec does_user_exist(LUser :: jid:luser(),
-                     LServer :: jid:lserver()
-                     ) -> boolean() | {error, atom()}.
-does_user_exist(_LUser, _LServer) ->
+-spec does_user_exist(HostType :: mongooseim:host_type(),
+                      LUser :: jid:luser(),
+                      LServer :: jid:lserver()) -> boolean() | {error, atom()}.
+does_user_exist(_HostType, _LUser, _LServer) ->
     true.
 
-
-%% @doc Remove user.
-%% Note: it returns ok even if there was some problem removing the user.
--spec remove_user(LUser :: jid:luser(),
-                  LServer :: jid:lserver()
-                  ) -> ok | {error, not_allowed}.
-remove_user(_LUser, _LServer) ->
-    ok.
+-spec supported_features() -> [atom()].
+supported_features() -> [dynamic_domains].
 
 %%%----------------------------------------------------------------------
 %%% Internal helpers
@@ -198,18 +162,19 @@ remove_user(_LUser, _LServer) ->
 
 % A direct path to a file is read only once during startup,
 % a path in environment variable is read on every auth request.
-get_jwt_secret(Host) ->
-   JWTSource = ejabberd_auth:get_opt(Host, jwt_secret_source),
-   JWTSecret = ejabberd_auth:get_opt(Host, jwt_secret),
+-spec get_jwt_secret(mongooseim:host_type()) -> binary() | {env, string()}.
+get_jwt_secret(HostType) ->
+    case mongoose_config:get_opt([{auth, HostType}, jwt, secret]) of
+        {value, JWTSecret} ->
+            JWTSecret;
+        {env, Env} ->
+            {env, Env};
+        {file, Path} ->
+            {ok, JWTSecret} = file:read_file(Path),
+            JWTSecret
+    end.
 
-   case {JWTSource, JWTSecret} of
-       {undefined, JWTSecret0} when is_list(JWTSecret0) ->
-           list_to_binary(JWTSecret0);
-       {undefined, JWTSecret0} when is_binary(JWTSecret0) ->
-           JWTSecret0;
-       {{env, _} = Env, _} ->
-           Env;
-       {JWTSecretPath, _} when is_list(JWTSecretPath) ->
-           {ok, JWTSecretBin} = file:read_file(JWTSecretPath),
-           JWTSecretBin
-   end.
+algorithms() ->
+    [<<"HS256">>, <<"RS256">>, <<"ES256">>,
+     <<"HS386">>, <<"RS386">>, <<"ES386">>,
+     <<"HS512">>, <<"RS512">>, <<"ES512">>].

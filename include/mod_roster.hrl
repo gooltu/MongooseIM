@@ -18,15 +18,15 @@
 %%%
 %%%----------------------------------------------------------------------
 
--record(roster, {usj,
-                 us,
-                 jid,
-                 name = <<>>,
-                 subscription = none :: both | from | to | none | remove,
-                 ask = none,
-                 groups = [],
+-record(roster, {usj :: {jid:simple_bare_jid(), mod_roster:contact()},
+                 us :: jid:simple_bare_jid(),
+                 jid :: mod_roster:contact(),
+                 name = <<>> :: binary(),
+                 subscription = none :: mod_roster:subscription_state(),
+                 ask = none :: subscribe | unsubscribe | in | out | both | none,
+                 groups = [] :: [binary()],
                  askmessage = <<>>,
-                 xs = []}).
+                 xs = [] :: [exml:element()]}).
 
 -record(roster_version, {us,
                         version}).

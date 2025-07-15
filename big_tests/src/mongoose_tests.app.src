@@ -1,0 +1,16 @@
+{application, mongoose_tests,
+ [
+  {description, "MongooseIM big tests"},
+  {vsn, git},
+  {registered, []},
+  {applications, [
+                  kernel,
+                  stdlib,
+                  cowboy,
+                  jid,
+                  gun,
+                  fusco,
+                  escalus
+                 ]},
+  {env, []}
+ ]}.

@@ -1,3 +1,11 @@
+%%% @doc
+%% options and defaults:
+%%     * server - (required)
+%%     * path_prefix - ""
+%%     * request_timeout - 2000,
+%%     * http_opts - [] % passed to fusco
+%%%
+%%% @end
 -module(mongoose_wpool_http).
 -behaviour(mongoose_wpool).
 
@@ -5,46 +13,42 @@
 -export([start/4, stop/2]).
 -export([get_params/2]).
 
-%% --------------------------------------------------------------
-%% API
-%% --------------------------------------------------------------
+-type path_prefix() :: binary().
+-type request_timeout() :: non_neg_integer().
 
+%% --------------------------------------------------------------
+%% mongoose_wpool callbacks
+-spec init() -> ok.
 init() ->
-    case ets:info(?MODULE) of
-        undefined ->
-            Heir = case whereis(ejabberd_sup) of
-                       undefined -> [];
-                       Pid -> [{heir, Pid, undefined}]
-                   end,
-            ets:new(?MODULE,
-                    [named_table, public, {read_concurrency, true} | Heir]),
-            ok;
-        _ ->
-            ok
-    end.
+    ejabberd_sup:create_ets_table(?MODULE, [named_table, public, {read_concurrency, true}]).
 
-start(Host, Tag, WpoolOptsIn, ConnOpts) ->
-    Name = mongoose_wpool:make_pool_name(http, Host, Tag),
-    WpoolOpts = wpool_spec(Host, WpoolOptsIn, ConnOpts),
-    PathPrefix = list_to_binary(gen_mod:get_opt(path_prefix, ConnOpts, "/")),
-    RequestTimeout = gen_mod:get_opt(request_timeout, ConnOpts, 2000),
+-spec start(mongooseim:host_type_or_global(), mongoose_wpool:tag(),
+            mongoose_wpool:pool_opts(), mongoose_wpool:conn_opts()) -> {ok, pid()} | {error, any()}.
+start(HostType, Tag, WpoolOptsIn, ConnOpts) ->
+    Name = mongoose_wpool:make_pool_name(http, HostType, Tag),
+    WpoolOpts = wpool_spec(WpoolOptsIn, ConnOpts),
+    #{path_prefix := PathPrefix, request_timeout := RequestTimeout} = ConnOpts,
     case mongoose_wpool:start_sup_pool(http, Name, WpoolOpts) of
         {ok, Pid} ->
-            ets:insert(?MODULE, {{Host, Tag}, PathPrefix, RequestTimeout}),
+            ets:insert(?MODULE, {{HostType, Tag}, PathPrefix, RequestTimeout}),
             {ok, Pid};
         Other ->
             Other
     end.
 
-stop(Host, Tag) ->
-    true = ets:delete(?MODULE, {Host, Tag}),
+-spec stop(mongooseim:host_type_or_global(), mongoose_wpool:tag()) -> ok.
+stop(HostType, Tag) ->
+    true = ets:delete(?MODULE, {HostType, Tag}),
     ok.
 
--spec get_params(Host :: jid:lserver() | global, Tag :: atom()) ->
-    {ok, PathPrefix :: binary(), RequestTimeout :: non_neg_integer()}
+%% --------------------------------------------------------------
+%% Other API functions
+-spec get_params(HostType :: mongooseim:host_type_or_global(),
+                 Tag :: mongoose_wpool:tag()) ->
+    {ok, PathPrefix :: path_prefix(), RequestTimeout :: request_timeout()}
     | {error, pool_not_started}.
-get_params(Host, Tag) ->
-    case {ets:lookup(?MODULE, {Host, Tag}), Host} of
+get_params(HostType, Tag) ->
+    case {ets:lookup(?MODULE, {HostType, Tag}), HostType} of
         {[], global} -> {error, pool_not_started};
         {[], _} -> get_params(global, Tag);
         {[{_, PathPrefix, RequestTimeout}], _} -> {ok, PathPrefix, RequestTimeout}
@@ -52,11 +56,13 @@ get_params(Host, Tag) ->
 
 %% --------------------------------------------------------------
 %% Internal functions
-%% --------------------------------------------------------------
 
-wpool_spec(Host, WpoolOptsIn, ConnOpts) ->
-    TargetServer = gen_mod:get_opt(server, ConnOpts),
-    HttpOpts = gen_mod:get_opt(http_opts, ConnOpts, []),
-    Worker = {fusco, {TargetServer, HttpOpts}},
+wpool_spec(WpoolOptsIn, #{host := Host} = ConnOpts) ->
+    HTTPOpts = http_opts(ConnOpts),
+    Worker = {fusco, {Host, [{connect_options, HTTPOpts}]}},
     [{worker, Worker} | WpoolOptsIn].
 
+http_opts(#{tls := TLSOpts}) ->
+    just_tls:make_client_opts(TLSOpts);
+http_opts(#{}) ->
+    [].

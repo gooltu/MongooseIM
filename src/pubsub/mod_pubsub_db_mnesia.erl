@@ -15,7 +15,7 @@
 -include("mongoose_logger.hrl").
 -include_lib("stdlib/include/qlc.hrl").
 
--export([start/0, stop/0]).
+-export([init/2, stop/0]).
 % Funs execution
 -export([transaction/2, dirty/2]).
 % Direct #pubsub_state access
@@ -89,31 +89,23 @@
 
 %% ------------------------ Backend start/stop ------------------------
 
--spec start() -> ok.
-start() ->
-    mnesia:create_table(pubsub_state,
-                        [{disc_copies, [node()]},
-                         {type, ordered_set},
-                         {attributes, record_info(fields, pubsub_state)}]),
-    mnesia:add_table_copy(pubsub_state, node(), disc_copies),
-    mnesia:create_table(pubsub_item,
-                        [{disc_only_copies, [node()]},
-                         {attributes, record_info(fields, pubsub_item)}]),
-    mnesia:add_table_copy(pubsub_item, node(), disc_only_copies),
-    mnesia:create_table(pubsub_node,
-                        [{disc_copies, [node()]},
-                         {attributes, record_info(fields, pubsub_node)}]),
+init(_HostType, _Opts) ->
+    mongoose_mnesia:create_table(pubsub_state,
+        [{disc_copies, [node()]}, {type, ordered_set},
+         {attributes, record_info(fields, pubsub_state)}]),
+    mongoose_mnesia:create_table(pubsub_item,
+        [{disc_only_copies, [node()]},
+         {attributes, record_info(fields, pubsub_item)}]),
+    mongoose_mnesia:create_table(pubsub_node,
+        [{disc_copies, [node()]},
+         {attributes, record_info(fields, pubsub_node)}]),
     mnesia:add_table_index(pubsub_node, id),
-    mnesia:create_table(pubsub_subscription,
-                        [{disc_copies, [node()]},
-                         {attributes, record_info(fields, pubsub_subscription)},
-                         {type, set}]),
-    mnesia:add_table_copy(pubsub_subscription, node(), disc_copies),
-    CreateSubnodeTableResult = mnesia:create_table(pubsub_subnode,
-                        [{disc_copies, [node()]},
-                         {attributes, record_info(fields, pubsub_subnode)},
-                         {type, bag}]),
-    mnesia:add_table_copy(pubsub_subnode, node(), disc_copies),
+    mongoose_mnesia:create_table(pubsub_subscription,
+        [{disc_copies, [node()]}, {type, set},
+         {attributes, record_info(fields, pubsub_subscription)}]),
+    CreateSubnodeTableResult = mongoose_mnesia:create_table(pubsub_subnode,
+        [{disc_copies, [node()]}, {type, bag},
+         {attributes, record_info(fields, pubsub_subnode)}]),
     maybe_fill_subnode_table(CreateSubnodeTableResult),
     pubsub_index:init(),
     ok.
@@ -145,13 +137,13 @@ transaction(Fun, ErrorDebug, Retries) ->
         {atomic, Result} ->
             Result;
         {aborted, ReasonData} when Retries > 0 ->
-            ?WARNING_MSG("event=transaction_retry retries=~p reason=~p debug=~p",
-                         [Retries, ReasonData, ErrorDebug]),
+            ?LOG_WARNING(#{what => pubsub_transaction_retry, retries => Retries,
+                reason => ReasonData, debug => ErrorDebug}),
             timer:sleep(100),
             transaction(Fun, ErrorDebug, Retries - 1);
         {aborted, ReasonData} ->
-            ?WARNING_MSG("event=transaction_failed reason=~p debug=~p",
-                         [ReasonData, ErrorDebug]),
+            ?LOG_WARNING(#{what => pubsub_transaction_failed, reason => ReasonData,
+                debug => ErrorDebug}),
             mod_pubsub_db:db_error(ReasonData, ErrorDebug, transaction_failed)
     end.
 
@@ -405,7 +397,8 @@ extract_parents(Key, InitialNode, Parents, Depth, KnownNodesSet) ->
     CyclicNames = [Name || Name <- PPNames, sets:is_element(Name, KnownNodesSet1)],
     case CyclicNames of
         [] -> [];
-        _ -> ?WARNING_MSG("event=cyclic_nodes_detected node=~p cyclic_names=~p", [InitialNode, CyclicNames])
+        _ -> ?LOG_WARNING(#{what => pubsub_cyclic_nodes_detected,
+            pubsub_node => InitialNode, cyclic_names => CyclicNames})
     end,
     %% PPNames is ordset, so we don't need to worry about having duplicates in it.
     %% CyclicNames is usually an empty list.
@@ -448,7 +441,8 @@ extract_subnodes(Key, InitialNode, Subnodes, Depth, KnownNodesSet) ->
     CyclicNames = [Name || Name <- SSNames, sets:is_element(Name, KnownNodesSet1)],
     case CyclicNames of
         [] -> [];
-        _ -> ?WARNING_MSG("event=cyclic_nodes_detected node=~p cyclic_names=~p", [InitialNode, CyclicNames])
+        _ -> ?LOG_WARNING(#{what => pubsub_cyclic_nodes_detected,
+            pubsub_node => InitialNode, cyclic_names => CyclicNames})
     end,
     SSNamesToGet = SSNames -- CyclicNames,
     case SSNamesToGet of

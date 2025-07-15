@@ -6,7 +6,7 @@
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %% @doc This module is responsible for initialising
 %% and stopping stuff needed to handle different deprecation
-%% warinings as well as for exposing API for loging these
+%% warnings as well as for exposing API for logging these
 %% deprecations.
 %% It checks whether a specific deprecation warning is not exceeding
 %% given frequency of logging.
@@ -20,6 +20,8 @@
 %% Test API
 -export([log_with_lvl/2]).
 
+-ignore_xref([log/2]).
+
 -include("mongoose.hrl").
 
 -define(DEPRECATION_TAB, deprecations).         % ETS table name
@@ -28,6 +30,7 @@
 -type deprecation_tag() :: any().              % Specifies the deprecation
 -type log_level() :: warning | error.
 -type unix_timestamp() :: mod_mam:unix_timestamp().
+-type log_map() :: map().
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -55,15 +58,14 @@ stop() ->
 %%                   It is internally represented in microseconds
 %%                   but API requires milliseconds.
 %%      * log_level - 'warning' or 'error'
--spec log(deprecation_tag(), string(), proplists:proplist()) -> ok.
+-spec log(deprecation_tag(), log_map(), proplists:proplist()) -> ok.
 log(Tag, Msg, Opts) ->
-    Cooldown = milliseconds_to_microseconds(
-                 proplists:get_value(cooldown, Opts, default_cooldown())
-                ),
+    Ms = proplists:get_value(cooldown, Opts, default_cooldown()),
+    Cooldown = milliseconds_to_microseconds(Ms),
     LogLvl = proplists:get_value(log_level, Opts, default_log_lvl()),
     maybe_log(Tag, Msg, LogLvl, Cooldown).
 
--spec log(deprecation_tag(), string()) -> ok.
+-spec log(deprecation_tag(), log_map()) -> ok.
 log(Tag, Msg) ->
     log(Tag, Msg, []).
 
@@ -75,7 +77,7 @@ log(Tag, Msg) ->
 %% @doc Deprecation table will hold pairs in form:
 %%      {deprecation_tag(), unix_timestamp()}
 %% and will indicate at what (unix) time last deprecation
-%% warining was logged concerning a deprecation connected to
+%% warning was logged concerning a deprecation connected to
 %% the deprecation tag specified in a key
 -spec prepare_ets() -> ok.
 prepare_ets() ->
@@ -87,7 +89,7 @@ destroy_ets() ->
     ets:delete(?DEPRECATION_TAB),
     ok.
 
--spec maybe_log(deprecation_tag(), string(), log_level(), unix_timestamp()) -> ok.
+-spec maybe_log(deprecation_tag(), log_map(), log_level(), unix_timestamp()) -> ok.
 maybe_log(Tag, Msg, Lvl, Cooldown) ->
     Timestamp = case ets:lookup(?DEPRECATION_TAB, Tag) of
                              [] ->
@@ -117,12 +119,12 @@ default_cooldown() -> ?DEFAULT_COOLDOWN_HOURS * 3600000000.
 -spec default_log_lvl() -> log_level().
 default_log_lvl() -> error.
 
--spec log_with_lvl(string(), log_level()) -> ok.
+-spec log_with_lvl(log_map(), log_level()) -> ok.
 log_with_lvl(Msg, error) ->
-    ?ERROR_MSG(Msg, []);
+    ?LOG_ERROR(Msg);
 log_with_lvl(Msg, warning) ->
-    ?WARNING_MSG(Msg, []).
+    ?LOG_WARNING(Msg).
 
--spec milliseconds_to_microseconds(Milliseconds :: integer()) 
+-spec milliseconds_to_microseconds(Milliseconds :: integer())
         -> unix_timestamp().
 milliseconds_to_microseconds(N) -> N * 1000.

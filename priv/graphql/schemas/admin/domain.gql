@@ -1,0 +1,32 @@
+type DomainAdminQuery @use(services: ["service_domain_db"]) @protected{
+  "Get all enabled domains by hostType. Only for global admin"
+  domainsByHostType(hostType: String!): [DomainName!]
+    @protected(type: GLOBAL) @use
+  "Get information about the domain"
+  domainDetails(domain: DomainName!): Domain
+    @protected(type: DOMAIN, args: ["domain"]) @use
+}
+
+type DomainAdminMutation @use(services: ["service_domain_db"]) @protected{
+  "Add new domain. Only for global admin"
+  addDomain(domain: DomainName!, hostType: String!): Domain
+    @protected(type: GLOBAL) @use
+  "Remove domain. Only for global admin"
+  removeDomain(domain: DomainName!, hostType: String!): Domain
+    @protected(type: GLOBAL) @use
+  "Remove domain asynchronously. Only for global admin"
+  requestRemoveDomain(domain: DomainName!, hostType: String!): Domain
+    @protected(type: GLOBAL) @use
+  "Enable domain. Only for global admin"
+  enableDomain(domain: DomainName!): Domain
+    @protected(type: GLOBAL) @use
+  "Disable domain. Only for global admin"
+  disableDomain(domain: DomainName!): Domain
+    @protected(type: GLOBAL) @use
+  "Create or update domain admin password"
+  setDomainPassword(domain: DomainName!, password: NonEmptyString!): String
+    @protected(type: DOMAIN, args: ["domain"]) @use
+  "Delete domain admin password. Only for global admin"
+  deleteDomainPassword(domain: DomainName!): String
+    @protected(type: GLOBAL) @use
+}

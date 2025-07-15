@@ -26,8 +26,8 @@
 -include("jlib.hrl").
 -include("global_distrib_metrics.hrl").
 
--export([endpoints/0, start_link/4]).
--export([start/2, stop/1]).
+-export([start_link/3]).
+-export([start/2, stop/1, deps/2, instrumentation/1]).
 -export([init/1, handle_info/2, handle_cast/2, handle_call/3, code_change/3, terminate/2]).
 
 -define(LISTEN_RETRIES, 5). %% Number of retries in case of eaddrinuse
@@ -37,7 +37,7 @@
     socket :: mod_global_distrib_transport:t(),
     waiting_for :: header | non_neg_integer(),
     buffer = <<>> :: binary(),
-    host :: undefined | atom(),
+    host :: undefined | binary(),
     conn_id = <<>> :: binary(),
     peer :: tuple() | unknown
 }).
@@ -48,35 +48,61 @@
 %% API
 %%--------------------------------------------------------------------
 
--spec start_link(Ref :: reference(), Socket :: gen_tcp:socket(), Transport :: ranch_tcp,
+-spec start_link(Ref :: reference(), Transport :: ranch_tcp,
                  Opts :: [term()]) -> {ok, pid()}.
-start_link(Ref, Socket, ranch_tcp, Opts) ->
-    Pid = proc_lib:spawn_link(?MODULE, init, [{Ref, Socket, Opts}]),
+start_link(Ref, ranch_tcp, Opts) ->
+    Pid = proc_lib:spawn_link(?MODULE, init, [{Ref, ranch_tcp, Opts}]),
     {ok, Pid}.
 
 %%--------------------------------------------------------------------
 %% gen_mod API
 %%--------------------------------------------------------------------
 
--spec start(Host :: jid:lserver(), Opts :: proplists:proplist()) -> any().
-start(Host, Opts0) ->
-    Opts = prepare_opts(Opts0),
-    mod_global_distrib_utils:start(?MODULE, Host, Opts, fun start/0).
+-spec start(mongooseim:host_type(), gen_mod:module_opts()) -> any().
+start(_HostType, _Opts) ->
+    ChildMod = mod_global_distrib_worker_sup,
+    Child = {ChildMod, {ChildMod, start_link, []}, permanent, 10000, supervisor, [ChildMod]},
+    ejabberd_sup:start_child(Child),
+    start_listeners().
 
--spec stop(Host :: jid:lserver()) -> any().
-stop(Host) ->
-    mod_global_distrib_utils:stop(?MODULE, Host, fun stop/0).
+-spec stop(mongooseim:host_type()) -> any().
+stop(_HostType) ->
+    stop_listeners(),
+    ejabberd_sup:stop_child(mod_global_distrib_worker_sup).
+
+-spec deps(mongooseim:host_type(), gen_mod:module_opts()) -> gen_mod_deps:deps().
+deps(_HostType, Opts) ->
+    [{mod_global_distrib_utils, Opts, hard}].
+
+-spec instrumentation(mongooseim:host_type()) -> [mongoose_instrument:spec()].
+instrumentation(_HostType) ->
+    [{?GLOBAL_DISTRIB_RECV_QUEUE, #{},
+      #{metrics => #{time => histogram}}},
+     {?GLOBAL_DISTRIB_INCOMING_ESTABLISHED, #{},
+      #{metrics => #{count => spiral}}},
+     {?GLOBAL_DISTRIB_INCOMING_ERRORED, #{},
+      #{metrics => #{count => spiral}}},
+     {?GLOBAL_DISTRIB_INCOMING_CLOSED, #{},
+      #{metrics => #{count => spiral}}},
+     {?GLOBAL_DISTRIB_TRANSFER, #{},
+      #{metrics => #{time => histogram}}},
+     {?GLOBAL_DISTRIB_MESSAGES_RECEIVED, #{},
+      #{metrics => #{count => spiral}}},
+     {?GLOBAL_DISTRIB_INCOMING_FIRST_PACKET, #{},
+      #{metrics => #{count => spiral}}}].
 
 %%--------------------------------------------------------------------
 %% ranch_protocol API
 %%--------------------------------------------------------------------
 
-init({Ref, RawSocket, _Opts}) ->
+init({Ref, ranch_tcp, _Opts}) ->
     process_flag(trap_exit, true),
-    ok = ranch:accept_ack(Ref),
-    {ok, Socket} = mod_global_distrib_transport:wrap(RawSocket, opt(tls_opts)),
+    {ok, RawSocket} = ranch:handshake(Ref),
+    ConnOpts = opt(connections),
+    {ok, Socket} = mod_global_distrib_transport:wrap(RawSocket, ConnOpts, server),
     ok = mod_global_distrib_transport:setopts(Socket, [{active, once}]),
-    mongoose_metrics:update(global, ?GLOBAL_DISTRIB_INCOMING_ESTABLISHED, 1),
+    mongoose_instrument:execute(?GLOBAL_DISTRIB_INCOMING_ESTABLISHED, #{},
+                                #{count => 1, peer => mod_global_distrib_transport:peername(Socket)}),
     State = #state{socket = Socket, waiting_for = header,
                    peer = mod_global_distrib_transport:peername(Socket)},
     gen_server:enter_loop(?MODULE, [], State).
@@ -85,17 +111,19 @@ init({Ref, RawSocket, _Opts}) ->
 %% gen_server API
 %%--------------------------------------------------------------------
 
-handle_info({tcp, _Socket, RawData}, #state{socket = Socket, buffer = Buffer} = State) ->
+handle_info({Tag, _Socket, RawData}, #state{socket = Socket, buffer = Buffer} = State)
+  when Tag == tcp; Tag == ssl ->
     do_setopts_and_receive_data(Socket, Buffer, RawData, State);
-handle_info({tcp_closed, _Socket}, State) ->
+handle_info({Tag, _Socket}, State) when Tag == tcp_closed; Tag == ssl_closed ->
     {stop, normal, State};
-handle_info({tcp_error, _Socket, Reason}, State) ->
-    ?ERROR_MSG("event=incoming_global_distrib_socket_error,reason='~p',peer='~p', conn_id=~ts",
-               [Reason, State#state.peer, State#state.conn_id]),
-    mongoose_metrics:update(global, ?GLOBAL_DISTRIB_INCOMING_ERRORED(State#state.host), 1),
+handle_info({Tag, _Socket, Reason}, State) when Tag == tcp_error; Tag == ssl_error ->
+    ?LOG_ERROR(#{what => gd_incoming_socket_error, reason => Reason,
+                 text => <<"mod_global_distrib_receiver received tcp_error">>,
+                 peer => State#state.peer, conn_id => State#state.conn_id}),
+    mongoose_instrument:execute(?GLOBAL_DISTRIB_INCOMING_ERRORED, #{}, #{count => 1, host => State#state.host}),
     {stop, {error, Reason}, State};
 handle_info(Msg, State) ->
-    ?WARNING_MSG("Received unknown message ~p", [Msg]),
+    ?UNEXPECTED_INFO(Msg),
     {noreply, State}.
 
 handle_cast(_Message, _State) ->
@@ -108,9 +136,18 @@ code_change(_Version, State, _Extra) ->
     {ok, State}.
 
 terminate(Reason, State) ->
-    ?WARNING_MSG("event=incoming_global_distrib_socket_closed,peer='~p', host=~p, reason=~p conn_id=~ts",
-                 [State#state.peer, State#state.host, Reason, State#state.conn_id]),
-    mongoose_metrics:update(global, ?GLOBAL_DISTRIB_INCOMING_CLOSED(State#state.host), 1),
+    case Reason of
+        normal ->
+            ?LOG_INFO(#{what => gd_incoming_socket_closed,
+                        peer => State#state.peer, server => State#state.host,
+                        reason => Reason, conn_id => State#state.conn_id});
+        _ ->
+            ?LOG_WARNING(#{what => gd_incoming_socket_closed,
+                           peer => State#state.peer, server => State#state.host,
+                           reason => Reason, conn_id => State#state.conn_id})
+    end,
+    mongoose_instrument:execute(?GLOBAL_DISTRIB_INCOMING_CLOSED, #{},
+                                #{count => 1, host => State#state.host}),
     catch mod_global_distrib_transport:close(State#state.socket),
     ignore.
 
@@ -118,34 +155,7 @@ terminate(Reason, State) ->
 %% Helpers
 %%--------------------------------------------------------------------
 
-prepare_opts(Opts0) ->
-    case lists:keyfind(local_host, 1, Opts0) of
-        {local_host, LocalHost} ->
-            [{endpoints, [{LocalHost, 5555}]} | Opts0];
-        _ ->
-            error({missing_option, local_host}, [Opts0])
-    end.
-
--spec start() -> any().
-start() ->
-    opt(tls_opts), %% Check for required tls_opts
-    mongoose_metrics:ensure_metric(global, ?GLOBAL_DISTRIB_RECV_QUEUE_TIME, histogram),
-    mongoose_metrics:ensure_metric(global, ?GLOBAL_DISTRIB_INCOMING_ESTABLISHED, spiral),
-    mod_global_distrib_utils:ensure_metric(?GLOBAL_DISTRIB_INCOMING_ERRORED(undefined), spiral),
-    mod_global_distrib_utils:ensure_metric(?GLOBAL_DISTRIB_INCOMING_CLOSED(undefined), spiral),
-    ChildMod = mod_global_distrib_worker_sup,
-    Child = {ChildMod, {ChildMod, start_link, []}, permanent, 10000, supervisor, [ChildMod]},
-    ejabberd_sup:start_child(Child),
-    Endpoints = mod_global_distrib_utils:resolve_endpoints(opt(endpoints)),
-    ets:insert(?MODULE, {endpoints, Endpoints}),
-    start_listeners().
-
--spec stop() -> any().
-stop() ->
-    stop_listeners(),
-    ejabberd_sup:stop_child(mod_global_distrib_worker_sup).
-
--spec opt(Key :: atom()) -> term().
+-spec opt(gen_mod:opt_key() | gen_mod:key_path()) -> gen_mod:opt_value().
 opt(Key) ->
     mod_global_distrib_utils:opt(?MODULE, Key).
 
@@ -153,40 +163,23 @@ do_setopts_and_receive_data(Socket, Buffer, RawData, State) ->
     SetOptsResult = mod_global_distrib_transport:setopts(Socket, [{active, once}]),
     case SetOptsResult of
         ok ->
-            do_receive_data(Socket, Buffer, RawData, State);
+            do_receive_data(Buffer, RawData, State);
         {error, closed} ->
             {stop, normal, State};
         _ ->
             {stop, {setopts_failed, SetOptsResult}, State}
     end.
 
-do_receive_data(Socket, Buffer, RawData, State) ->
-    case mod_global_distrib_transport:recv_data(Socket, RawData) of
-         {ok, Data} ->
-            NewState = handle_buffered(State#state{buffer = <<Buffer/binary, Data/binary>>}),
-            {noreply, NewState};
-        {error, closed} ->
-            {stop, normal, State};
-        Other ->
-            {stop, {recv_data_failed, Other}, State}
-    end.
+do_receive_data(Buffer, Data, State) ->
+    NewState = handle_buffered(State#state{buffer = <<Buffer/binary, Data/binary>>}),
+    {noreply, NewState}.
 
 -spec handle_data(Data :: binary(), state()) -> state().
 handle_data(GdStart, State = #state{host = undefined}) ->
     {ok, #xmlel{name = <<"gd_start">>, attrs = Attrs}} = exml:parse(GdStart),
-    #{<<"server">> := BinHost, <<"conn_id">> := ConnId} = maps:from_list(Attrs),
-    Host = mod_global_distrib_utils:binary_to_metric_atom(BinHost),
-    mod_global_distrib_utils:ensure_metric(?GLOBAL_DISTRIB_MESSAGES_RECEIVED(Host), spiral),
-    mod_global_distrib_utils:ensure_metric(?GLOBAL_DISTRIB_TRANSFER_TIME(Host), histogram),
-    mod_global_distrib_utils:ensure_metric(
-      ?GLOBAL_DISTRIB_INCOMING_FIRST_PACKET(Host), spiral),
-    mod_global_distrib_utils:ensure_metric(
-      ?GLOBAL_DISTRIB_INCOMING_ERRORED(Host), spiral),
-    mod_global_distrib_utils:ensure_metric(
-      ?GLOBAL_DISTRIB_INCOMING_CLOSED(Host), spiral),
-    mongoose_metrics:update(global, ?GLOBAL_DISTRIB_INCOMING_FIRST_PACKET(Host), 1),
-    ?INFO_MSG("event=gd_incoming_connection server=~ts conn_id=~ts",
-              [BinHost, ConnId]),
+    #{<<"server">> := Host, <<"conn_id">> := ConnId} = Attrs,
+    mongoose_instrument:execute(?GLOBAL_DISTRIB_INCOMING_FIRST_PACKET, #{}, #{count => 1, host => Host}),
+    ?LOG_INFO(#{what => gd_incoming_connection, server => Host, conn_id => ConnId}),
     State#state{host = Host, conn_id = ConnId};
 handle_data(Data, State = #state{host = Host}) ->
     <<ClockTime:64, BinFromSize:16, _/binary>> = Data,
@@ -209,10 +202,6 @@ handle_buffered(#state{waiting_for = Size, buffer = Buffer} = State)
 handle_buffered(State) ->
     State.
 
--spec endpoints() -> [mod_global_distrib_utils:endpoint()].
-endpoints() ->
-    opt(endpoints).
-
 -spec start_listeners() -> any().
 start_listeners() ->
     [start_listener(Endpoint, ?LISTEN_RETRIES) || Endpoint <- endpoints()],
@@ -221,12 +210,14 @@ start_listeners() ->
 -spec start_listener(mod_global_distrib_utils:endpoint(),
                      RetriesLeft :: non_neg_integer()) -> any().
 start_listener({Addr, Port} = Ref, RetriesLeft) ->
-    ?INFO_MSG("Starting listener on ~s:~b", [inet:ntoa(Addr), Port]),
-    case ranch:start_listener(Ref, 10, ranch_tcp, [{ip, Addr}, {port, Port}], ?MODULE, []) of
+    ?LOG_INFO(#{what => gd_start_listener, address => Addr, port => Port}),
+    SocketOpts = [{ip, Addr}, {port, Port}],
+    RanchOpts = #{max_connections => infinity, num_acceptors => 10, socket_opts => SocketOpts},
+    case ranch:start_listener(Ref, ranch_tcp, RanchOpts, ?MODULE, []) of
         {ok, _} -> ok;
         {error, eaddrinuse} when RetriesLeft > 0 ->
-            ?ERROR_MSG("Failed to start listener on ~s:~b: address in use. Will retry in 1 second.",
-                       [inet:ntoa(Addr), Port]),
+            ?LOG_ERROR(#{what => gd_start_listener_failed, address => Addr, port => Port,
+                         text => <<"Failed to start listener: address in use. Will retry in 1 second.">>}),
             timer:sleep(?LISTEN_RETRY_DELAY),
             start_listener(Ref, RetriesLeft - 1)
     end.
@@ -234,3 +225,7 @@ start_listener({Addr, Port} = Ref, RetriesLeft) ->
 -spec stop_listeners() -> any().
 stop_listeners() ->
     lists:foreach(fun ranch:stop_listener/1, endpoints()).
+
+-spec endpoints() -> [mod_global_distrib_utils:endpoint()].
+endpoints() ->
+    opt([connections, resolved_endpoints]).

@@ -2,9 +2,13 @@
 -define(MONGOOSEIM_NS_HRL, true).
 
 -define(NS_CLIENT,              <<"jabber:client">>).
+-define(NS_SERVER,              <<"jabber:server">>).
+-define(NS_SERVER_DIALBACK,     <<"jabber:server:dialback">>).
+-define(NS_COMPONENT_ACCEPT,    <<"jabber:component:accept">>).
 -define(NS_CONFERENCE,          <<"jabber:x:conference">>).
 -define(NS_DISCO_ITEMS,         <<"http://jabber.org/protocol/disco#items">>).
 -define(NS_DISCO_INFO,          <<"http://jabber.org/protocol/disco#info">>).
+-define(NS_EXTDISCO,            <<"urn:xmpp:extdisco:2">>).
 -define(NS_VCARD,               <<"vcard-temp">>).
 -define(NS_VCARD_UPDATE,        <<"vcard-temp:x:update">>).
 -define(NS_OAUTH_0,             <<"urn:xmpp:oauth:0">>).% Defined by XEP-0235: Authorization Tokens.
@@ -39,6 +43,7 @@
 -define(NS_MUC_UNIQUE,          <<"http://jabber.org/protocol/muc#unique">>).
 -define(NS_MUC_REQUEST,         <<"http://jabber.org/protocol/muc#request">>).
 -define(NS_MUC_CONFIG,          <<"http://jabber.org/protocol/muc#roomconfig">>).
+-define(NS_MUC_STABLE_ID,       <<"http://jabber.org/protocol/muc#stable_id">>).
 -define(NS_PING,                <<"urn:xmpp:ping">>).
 -define(NS_PUBSUB,              <<"http://jabber.org/protocol/pubsub">>).
 -define(NS_PUBSUB_EVENT,        <<"http://jabber.org/protocol/pubsub#event">>).
@@ -56,10 +61,18 @@
 -define(NS_SERVERINFO,          <<"http://jabber.org/network/serverinfo">>).
 -define(NS_MAM_04,              <<"urn:xmpp:mam:1">>). % MAM 0.4.1 or 0.5
 -define(NS_MAM_06,              <<"urn:xmpp:mam:2">>).  % MAM 0.6
--define(NS_HTTP_UPLOAD_025,     <<"urn:xmpp:http:upload">>).
+-define(NS_MAM_EXTENDED,        <<"urn:xmpp:mam:2#extended">>).
+-define(NS_MAM_GC_FIELD,        <<"urn:xmpp:mam:2#groupchat-field">>).
+-define(NS_MAM_GC_AVAILABLE,    <<"urn:xmpp:mam:2#groupchat-available">>).
 -define(NS_HTTP_UPLOAD_030,     <<"urn:xmpp:http:upload:0">>).
 -define(NS_PUSH,                <<"urn:xmpp:push:0">>). % Push Notifications v0.2.1
 -define(NS_STANZAID,            <<"urn:xmpp:sid:0">>).
+-define(NS_RECEIPTS,            <<"urn:xmpp:receipts">>).
+
+-define(NS_HINTS,               <<"urn:xmpp:hints">>).
+-define(NS_CC_RULES,            <<"urn:xmpp:carbons:rules:0">>).
+-define(NS_CC_2,                <<"urn:xmpp:carbons:2">>).
+-define(NS_CC_1,                <<"urn:xmpp:carbons:1">>).
 
 -define(NS_RSM,                 <<"http://jabber.org/protocol/rsm">>).
 -define(NS_EJABBERD_CONFIG,     <<"ejabberd:config">>).
@@ -71,15 +84,16 @@
 
 -define(NS_TLS,                 <<"urn:ietf:params:xml:ns:xmpp-tls">>).
 -define(NS_SASL,                <<"urn:ietf:params:xml:ns:xmpp-sasl">>).
+-define(NS_SASL_2,              <<"urn:xmpp:sasl:2">>).
 -define(NS_SESSION,             <<"urn:ietf:params:xml:ns:xmpp-session">>).
 -define(NS_BIND,                <<"urn:ietf:params:xml:ns:xmpp-bind">>).
+-define(NS_BIND_2,              <<"urn:xmpp:bind:0">>).
+-define(NS_FAST,                <<"urn:xmpp:fast:0">>).
 
 -define(NS_FEATURE_IQAUTH,      <<"http://jabber.org/features/iq-auth">>).
 -define(NS_FEATURE_IQREGISTER,  <<"http://jabber.org/features/iq-register">>).
 -define(NS_FEATURE_COMPRESS,    <<"http://jabber.org/features/compress">>).
 -define(NS_FEATURE_MSGOFFLINE,  <<"msgoffline">>).
-
--define(NS_COMPRESS,            <<"http://jabber.org/protocol/compress">>).
 
 -define(NS_CAPS,                <<"http://jabber.org/protocol/caps">>).
 -define(NS_SHIM,                <<"http://jabber.org/protocol/shim">>).
@@ -99,11 +113,19 @@
 
 -define(JINGLE_NS, <<"urn:xmpp:jingle:1">>).
 
+-define(NS_DATA_VALIDATE, <<"http://jabber.org/protocol/xdata-validate">>).
+
+%% Custom extension to accept stanza-ids as retraction IDs
+-define(NS_ESL_RETRACT,         <<"urn:esl:message-retract-by-stanza-id:0">>).
+
 %% Erlang Solutions custom extension - token based authentication
 -define(NS_ESL_TOKEN_AUTH,      <<"erlang-solutions.com:xmpp:token-auth:0">>).
 
 %% Erlang Solutions custom extension - inbox feature
 -define(NS_ESL_INBOX,      <<"erlang-solutions.com:xmpp:inbox:0">>).
 -define(NS_ESL_INBOX_CONVERSATION, <<"erlang-solutions.com:xmpp:inbox:0#conversation">>).
+
+%% Erlang Solutions custom extension - smart_markers feature
+-define(NS_ESL_SMART_MARKERS,      <<"esl:xmpp:smart-markers:0">>).
 
 -endif.

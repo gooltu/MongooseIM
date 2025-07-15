@@ -15,7 +15,7 @@
 %%==============================================================================
 
 -module(acc_e2e_SUITE).
--compile(export_all).
+-compile([export_all, nowarn_export_all]).
 
 -include_lib("exml/include/exml.hrl").
 -include_lib("escalus/include/escalus.hrl").
@@ -63,8 +63,8 @@ suite() ->
 %%--------------------------------------------------------------------
 
 init_per_suite(Config) ->
-    {Mod, Code} = rpc(mim(), dynamic_compile, from_string, [acc_test_helper_code(Config)]),
-    rpc(mim(), code, load_binary, [Mod, "acc_test_helper.erl", Code]),
+    {Module, Binary, Filename} = code:get_object_code(acc_test_helper) ,
+    rpc(mim(), code, load_binary, [Module, Filename, Binary]),
     recreate_table(),
     escalus:init_per_suite(Config).
 
@@ -74,26 +74,26 @@ end_per_suite(Config) ->
 
 init_per_group(message, Config) ->
     % saves ref, timestamp and some attrs of acc in ets
-    add_handler(c2s_preprocessing_hook, test_save_acc, 50),
+    add_handler(user_send_packet, test_save_acc, 5),
     % checks it is the same acc
     add_handler(filter_local_packet, test_check_acc, 50),
     % checks it is the same acc and it has been stripped but keeps persistent props
     add_handler(user_receive_packet, test_check_final_acc, 50),
     Config;
 init_per_group(cache_and_strip, Config) ->
-    add_handler(c2s_preprocessing_hook, save_my_jid, 50),
+    add_handler(user_send_packet, save_my_jid, 5),
     add_handler(filter_local_packet, drop_if_jid_not_mine, 1),
     Config;
 init_per_group(_GroupName, Config) ->
     Config.
 
 end_per_group(message, _Config) ->
-    remove_handler(c2s_preprocessing_hook, test_save_acc, 50),
+    remove_handler(user_send_packet, test_save_acc, 5),
     remove_handler(filter_local_packet, test_check_acc, 50),
     remove_handler(user_receive_packet, test_check_final_acc, 50),
     ok;
 end_per_group(cache_and_strip, _Config) ->
-    remove_handler(c2s_preprocessing_hook, save_my_jid, 50),
+    remove_handler(user_send_packet, save_my_jid, 5),
     remove_handler(filter_local_packet, drop_if_jid_not_mine, 1),
     ok;
 end_per_group(_GroupName, _Config) ->
@@ -163,19 +163,14 @@ filter_local_packet_uses_recipient_values(Config) ->
 %%--------------------------------------------------------------------
 
 
-acc_test_helper_code(Config) ->
-    Dir = proplists:get_value(mim_data_dir, Config),
-    F = filename:join(Dir, "acc_test_helper.erl"),
-    {ok, Code} = file:read_file(F),
-    binary_to_list(Code).
-
 add_handler(Hook, F, Seq) ->
-    rpc(mim(), ejabberd_hooks, add, [Hook, host(), acc_test_helper, F, Seq]).
+    rpc(mim(), gen_hook, add_handler, handler(Hook, F, Seq)).
 
 remove_handler(Hook, F, Seq) ->
-    rpc(mim(), ejabberd_hooks, delete, [Hook, host(), acc_test_helper, F, Seq]).
+    rpc(mim(), gen_hook, delete_handler, handler(Hook, F, Seq)).
 
-host() -> <<"localhost">>.
+handler(Hook, F, Seq) ->
+    [Hook, domain_helper:host_type(mim), fun acc_test_helper:F/3, #{}, Seq].
 
 %% creates a temporary ets table keeping refs and some attrs of accumulators created in c2s
 recreate_table() ->

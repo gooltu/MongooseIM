@@ -1,8 +1,8 @@
 %% During dev you would use something similar to:
-%% TEST_HOSTS="mim" ./tools/travis-test.sh -c false -s false -p odbc_mssql_mnesia
+%% TEST_HOSTS="mim" ./tools/test.sh -c false -s false -p odbc_mssql_mnesia
 %%
 %% If you also want to start just mim1 node use:
-%% DEV_NODES="mim1" TEST_HOSTS="mim" ./tools/travis-test.sh -c false -s false -p odbc_mssql_mnesia
+%% DEV_NODES="mim1" TEST_HOSTS="mim" ./tools/test.sh -c false -s false -p odbc_mssql_mnesia
 %%
 %% TEST_HOSTS variable contains host names from hosts in big_tests/test.config.
 %% DEV_NODES variable contains release names from profiles in rebar.config.
@@ -12,7 +12,7 @@
 %% Valid DEV_NODES are mim1, mim2, mim3, fed1, reg1.
 %%
 %% Example with two nodes:
-%% DEV_NODES="mim1 mim2" TEST_HOSTS="mim mim2" ./tools/travis-test.sh -c false -s false -p odbc_mssql_mnesia
+%% DEV_NODES="mim1 mim2" TEST_HOSTS="mim mim2" ./tools/test.sh -c false -s false -p odbc_mssql_mnesia
 %%
 %% Environment variable PRESET_ENABLED is true by default.
 %% PRESET_ENABLED=false disables preset application and forces to run
@@ -35,7 +35,8 @@
 -record(opts, {test,
                spec,
                cover,
-               preset = all}).
+               preset = all,
+               hooks}).
 
 %% Accepted options formatted as:
 %% {opt_name, opt_index_in_opts_record, fun value_sanitizer/1}.
@@ -44,7 +45,8 @@ opts() ->
     [{test,   #opts.test,   fun quick_or_full/1},
      {spec,   #opts.spec,   fun list_to_atom/1},
      {cover,  #opts.cover,  fun bool_or_module_list/1},
-     {preset, #opts.preset, fun preset/1}].
+     {preset, #opts.preset, fun preset/1},
+     {hooks,  #opts.hooks,  fun module_list/1}].
 
 %% Raw args are 'key=val' atoms.
 %% Args are {key :: atom(), val :: string()} pairs.
@@ -66,6 +68,12 @@ main(RawArgs) ->
                 io:format("Exiting by test cases summary: ~p~n", [ExitStatusByTestCases]),
                 init:stop(ExitStatusByTestCases);
             _ when is_integer(ExitStatusByGroups) ->
+                %% FIXME: This is incorrect assumption, it ignores results of all individual
+                %% tests cases and groups w/o 'repeat_until_all_ok' flag. So we can return
+                %% false positive result here. It's not too critical, because test.sh script
+                %% recalculates return code using summarise-ct-results utility. However, it
+                %% may result in squashing ct output, since execution of run_common_test.erl
+                %% is wrapped using silent_exec.sh tool.
                 io:format("Exiting by groups summary: ~p~n",  [ExitStatusByGroups]),
                 init:stop(ExitStatusByGroups)
         end
@@ -84,13 +92,14 @@ init() ->
 
 run(#opts{test = quick, cover = Cover, spec = Spec}) ->
     do_run_quick_test(tests_to_run(Spec), Cover);
-run(#opts{test = full, spec = Spec, preset = Preset, cover = Cover}) ->
-    run_test(tests_to_run(Spec), case Preset of
-                                     all -> all;
-                                     undefined -> all;
-                                     _ when is_list(Preset) -> Preset;
-                                     _   -> [Preset]
-                                 end, Cover).
+run(#opts{test = full, spec = Spec, preset = Preset, cover = Cover, hooks = HookModules}) ->
+    run_test(tests_to_run(Spec) ++ ct_hooks(HookModules),
+             case Preset of
+                 all -> all;
+                 undefined -> all;
+                 _ when is_list(Preset) -> Preset;
+                 _   -> [Preset]
+             end, Cover).
 
 apply_preset_enabled(#opts{} = Opts) ->
     case os:getenv("PRESET_ENABLED") of
@@ -150,6 +159,11 @@ tests_to_run(TestSpec) ->
      {spec, TestSpecFile}
     ] ++ ct_opts().
 
+ct_hooks([]) ->
+    [];
+ct_hooks(HookModules) ->
+    [{ct_hooks, HookModules}].
+
 save_count(Test, Configs) ->
     Repeat = case proplists:get_value(repeat, Test) of
         undefined -> 1;
@@ -162,15 +176,16 @@ save_count(Test, Configs) ->
     file:write_file("/tmp/ct_count", integer_to_list(Repeat*Times)).
 
 run_test(Test, PresetsToRun, CoverOpts) ->
-    prepare_cover(Test, CoverOpts),
+    {ConfigFiles, Props} = get_ct_config(Test),
+    prepare_cover(Props, CoverOpts),
     error_logger:info_msg("Presets to run ~p", [PresetsToRun]),
-    {ConfigFile, Props} = get_ct_config(Test),
-    case proplists:lookup(ejabberd_presets, Props) of
-        {ejabberd_presets, Presets} ->
+    case get_presets(Props) of
+        {ok, Presets} ->
             Presets1 = case PresetsToRun of
                            all ->
                                Presets;
                            _ ->
+                               assert_all_presets_present(PresetsToRun, Presets),
                                error_logger:info_msg("Skip presets ~p",
                                                      [ preset_names(Presets) -- PresetsToRun ]),
                                lists:filter(fun({Preset,_}) ->
@@ -178,31 +193,42 @@ run_test(Test, PresetsToRun, CoverOpts) ->
                                             end, Presets)
                        end,
             Length = length(Presets1),
-            Names = preset_names(Presets),
+            Names = preset_names(Presets1),
             error_logger:info_msg("Starting test of ~p configurations: ~n~p~n",
                                   [Length, Names]),
             Zip = lists:zip(lists:seq(1, Length), Presets1),
-            R = [ run_config_test(Preset, Test, N, Length) || {N, Preset} <- Zip ],
+            R = [ run_config_test(Props, Preset, Test, N, Length) || {N, Preset} <- Zip ],
             save_count(Test, Presets1),
-            analyze_coverage(Test, CoverOpts),
+            analyze_coverage(Props, CoverOpts),
             R;
-        _ ->
-            error_logger:info_msg("Presets were not found in the config file ~ts",
-                                  [ConfigFile]),
+        {error, not_found} ->
+            error_logger:info_msg("Presets were not found in the config files ~ts",
+                                  [ConfigFiles]),
             R = do_run_quick_test(Test, CoverOpts),
-            analyze_coverage(Test, CoverOpts),
+            analyze_coverage(Props, CoverOpts),
             R
+    end.
+
+get_presets(Props) ->
+    case proplists:lookup(presets, Props) of
+        {presets, Presets} ->
+            case proplists:lookup(toml, Presets) of
+                {toml, Preset} ->
+                    {ok, Preset};
+                _ ->
+                    {error, not_found}
+            end;
+        _ ->
+            {error, not_found}
     end.
 
 get_ct_config(Opts) ->
     Spec = proplists:get_value(spec, Opts),
     Props = read_file(Spec),
-    ConfigFile = case proplists:lookup(config, Props) of
-        {config, [Config]} -> Config;
-        _                  -> "test.config"
-    end,
-    {ok, ConfigProps} = handle_file_error(ConfigFile, file:consult(ConfigFile)),
-    {ConfigFile, ConfigProps}.
+    ConfigFiles = proplists:get_value(config, Props, ["test.config"]),
+    % Apply the files in reverse, like ct will do when running the tests
+    ConfigProps = merge_vars([read_file(File) || File <- lists:reverse(ConfigFiles)]),
+    {ConfigFiles, ConfigProps}.
 
 preset_names(Presets) ->
     [Preset||{Preset, _} <- Presets].
@@ -220,8 +246,8 @@ do_run_quick_test(Test, CoverOpts) ->
             [{ok, {Ok, Failed, UserSkipped, AutoSkipped}}]
     end.
 
-run_config_test({Name, Variables}, Test, N, Tests) ->
-    enable_preset(Name, Variables, Test, N, Tests),
+run_config_test(Props, {Name, Variables}, Test, N, Tests) ->
+    enable_preset(Props, Name, Variables, N, Tests),
     load_test_modules(Test),
     Result = ct:run_test([{label, Name} | Test]),
     case Result of
@@ -231,18 +257,18 @@ run_config_test({Name, Variables}, Test, N, Tests) ->
             {ok, {Ok, Failed, UserSkipped, AutoSkipped}}
     end.
 
-enable_preset(Name, PresetVars, Test, N, Tests) ->
+enable_preset(Props, Name, PresetVars, N, Tests) ->
     %% TODO: Do this with a multicall, otherwise it's not as fast as possible (not parallelized).
     %%       A multicall requires the function to be defined on the other side, though.
     Rs = [ maybe_enable_preset_on_node(host_node(H), PresetVars,
                                        host_vars(H), host_name(H))
-           || H <- get_hosts_to_enable_preset(Test) ],
+           || H <- get_hosts_to_enable_preset(Props) ],
     [ok] = lists:usort(Rs),
     error_logger:info_msg("Configuration ~p of ~p: ~p started.~n",
                           [N, Tests, Name]).
 
 %% Specify just some nodes to run the tests on:
-%% TEST_HOSTS="mim" ./tools/travis-test.sh -p odbc_mssql_mnesia
+%% TEST_HOSTS="mim" ./tools/test.sh -p odbc_mssql_mnesia
 maybe_enable_preset_on_node(Node, PresetVars, HostVars, HostName) ->
     case is_test_host_enabled(HostName) of
         true ->
@@ -263,23 +289,50 @@ is_test_host_enabled(HostName) ->
             lists:member(atom_to_binary(HostName, utf8), BinHosts)
     end.
 
-enable_preset_on_node(Node, PresetVars, HostVars) ->
+enable_preset_on_node(Node, PresetVars, HostVarsFilePrefix) ->
     {ok, Cwd} = call(Node, file, get_cwd, []),
-    Cfg = filename:join([repo_dir(), "rel", "files", "mongooseim.cfg"]),
-    Vars = filename:join([repo_dir(), "rel", HostVars]),
-    CfgFile = filename:join([Cwd, "etc", "mongooseim.cfg"]),
-    {ok, Template} = handle_file_error(Cfg, file:read_file(Cfg)),
-    {ok, Default} = handle_file_error(Vars, file:consult(Vars)),
-    NewVars = lists:foldl(fun ({Var, Val}, Acc) ->
-                              lists:keystore(Var, 1, Acc, {Var, Val})
-                          end, Default, PresetVars),
-    %% Render twice to replace variables in variables
-    Tmp = bbmustache:render(Template, NewVars, [{key_type, atom}]),
-    NewCfgFile = bbmustache:render(Tmp, NewVars, [{key_type, atom}]),
-    ok = call(Node, file, write_file, [CfgFile, NewCfgFile]),
+    TemplatePath = filename:join([repo_dir(), "rel", "files", "mongooseim.toml"]),
+    NodeVarsPath = filename:join([repo_dir(), "rel", HostVarsFilePrefix ++ ".vars-toml.config"]),
+
+    {ok, Template} = handle_file_error(TemplatePath, file:read_file(TemplatePath)),
+    NodeVars = read_vars(NodeVarsPath),
+
+    TemplatedConfig = template_config(Template, NodeVars ++ PresetVars),
+    CfgPath = filename:join([Cwd, "etc", "mongooseim.toml"]),
+    ok = call(Node, file, write_file, [CfgPath, TemplatedConfig]),
     call(Node, application, stop, [mongooseim]),
     call(Node, application, start, [mongooseim]),
     ok.
+
+template_config(Template, RawVars) ->
+    MergedVars = ensure_binary_strings(maps:from_list(RawVars)),
+    %% Render twice to replace variables in variables
+    Tmp = bbmustache:render(Template, MergedVars, [{key_type, atom}]),
+    bbmustache:render(Tmp, MergedVars, [{key_type, atom}]).
+
+merge_vars([Vars1, Vars2|Rest]) ->
+    Vars = lists:foldl(fun ({Var, Val}, Acc) ->
+                               lists:keystore(Var, 1, Acc, {Var, Val})
+                       end, Vars1, Vars2),
+    merge_vars([Vars|Rest]);
+merge_vars([Vars]) -> Vars.
+
+read_vars(File) ->
+    {ok, Terms} = handle_file_error(File, file:consult(File)),
+    lists:flatmap(fun({Key, Val}) ->
+                          [{Key, Val}];
+                     (IncludedFile) when is_list(IncludedFile) ->
+                          Path = filename:join(filename:dirname(File), IncludedFile),
+                          read_vars(Path)
+                  end, Terms).
+
+%% bbmustache tries to iterate over lists, so we need to make them binaries
+ensure_binary_strings(Vars) ->
+    maps:map(fun(dbs, V) -> V;
+                (_K, []) -> <<"\n">>; % empty binary is considered falsey in conditions
+                (_K, V) when is_list(V) -> list_to_binary(V);
+                (_K, V) -> V
+              end, Vars).
 
 call(Node, M, F, A) ->
     case rpc:call(Node, M, F, A) of
@@ -291,67 +344,70 @@ call(Node, M, F, A) ->
             Result
     end.
 
-prepare_cover(Test, true) ->
+prepare_cover(Props, true) ->
     io:format("Preparing cover~n"),
-    prepare(Test);
+    prepare(Props);
 prepare_cover(_, _) ->
     ok.
 
-analyze_coverage(Test, true) ->
-    analyze(Test, true);
-analyze_coverage(Test, ModuleList) when is_list(ModuleList) ->
-    analyze(Test, ModuleList);
+analyze_coverage(Props, true) ->
+    analyze(Props, true);
+analyze_coverage(Props, ModuleList) when is_list(ModuleList) ->
+    analyze(Props, ModuleList);
 analyze_coverage(_, _) ->
     ok.
 
-prepare(Test) ->
-    Nodes = get_mongoose_nodes(Test),
-    maybe_compile_cover(Nodes).
+prepare(Props) ->
+    Nodes = get_mongoose_nodes(Props),
+    maybe_compile_cover(Nodes),
+    block_nodes(Props).
 
 maybe_compile_cover([]) ->
     io:format("cover: skip cover compilation~n", []),
     ok;
-maybe_compile_cover(Nodes) ->
+maybe_compile_cover([CoverNode|_] = Nodes) ->
     io:format("cover: compiling modules for nodes ~p~n", [Nodes]),
     import_code_paths(hd(Nodes)),
 
-    cover:start(Nodes),
+    cover_start(CoverNode, Nodes),
     Dir = call(hd(Nodes), code, lib_dir, [mongooseim, ebin]),
 
     %% Time is in microseconds
     {Time, Compiled} = timer:tc(fun() ->
-                            Results = cover:compile_beam_directory(Dir),
+                            Results = cover_compile_dir(CoverNode, Dir),
                             Ok = [X || X = {ok, _} <- Results],
                             NotOk = Results -- Ok,
                             #{ok => length(Ok), failed => NotOk}
                         end),
-    travis_fold("cover compiled output", fun() ->
+    github_actions_fold("cover compiled output", fun() ->
             io:format("cover: compiled ~p~n", [Compiled])
         end),
     report_progress("~nCover compilation took ~ts~n", [microseconds_to_string(Time)]),
     ok.
 
-analyze(Test, CoverOpts) ->
+analyze(Props, CoverOpts) ->
+    unblock_nodes(Props),
     io:format("Coverage analyzing~n"),
-    Nodes = get_mongoose_nodes(Test),
-    analyze(Test, CoverOpts, Nodes).
+    Nodes = get_mongoose_nodes(Props),
+    analyze(Props, CoverOpts, Nodes).
 
-analyze(_Test, _CoverOpts, []) ->
+analyze(_Props, _CoverOpts, []) ->
     ok;
-analyze(Test, CoverOpts, Nodes) ->
-    deduplicate_cover_server_console_prints(),
+analyze(_Props, CoverOpts, [CoverNode|_] = Nodes) ->
     %% Import small tests cover
     Files = filelib:wildcard(repo_dir() ++ "/_build/**/cover/*.coverdata"),
     io:format("Files: ~p", [Files]),
     report_time("Import cover data into run_common_test node", fun() ->
-            [cover:import(File) || File <- Files]
+            [cover_import(CoverNode, File) || File <- Files]
         end),
     report_time("Export merged cover data", fun() ->
-			cover:export("/tmp/mongoose_combined.coverdata")
+                        cover_export(CoverNode, "/tmp/mongoose_combined.coverdata")
 		end),
-    case os:getenv("TRAVIS_JOB_ID") of
-        false ->
-            make_html(modules_to_analyze(CoverOpts));
+    case {os:getenv("GITHUB_RUN_ID"), os:getenv("CIRCLECI")} of
+        {false, false} ->
+            Mods = modules_to_analyze(CoverNode, CoverOpts),
+            Txt = "Export HTML report for " ++ integer_to_list(length(Mods)) ++ " modules",
+            report_time(Txt, fun() -> make_html(CoverNode, Mods) end);
         _ ->
             ok
     end,
@@ -361,11 +417,11 @@ analyze(Test, CoverOpts, Nodes) ->
             ok;
         _ ->
             report_time("Stopping cover on MongooseIM nodes", fun() ->
-                        cover:stop([node()|Nodes])
+                        cover_stop(CoverNode, Nodes)
                     end)
     end.
 
-make_html(Modules) ->
+make_html(CoverNode, Modules) ->
     {ok, Root} = file:get_cwd(),
     SortScript = Root ++ "/priv/sorttable.js",
     os:cmd("cp " ++ SortScript ++ " " ++ ?CT_REPORT),
@@ -380,39 +436,49 @@ make_html(Modules) ->
     file:make_dir(CoverageDir),
     {ok, File} = file:open(FilePath, [write]),
     file:write(File, get_cover_header()),
-    Fun = fun(Module, {CAcc, NCAcc}) ->
+    Fun = fun(Module, {CAcc, NCAcc, Skipped, Failed, OK}) ->
                   FileName = lists:flatten(io_lib:format("~s.COVER.html",[Module])),
 
                   %% We assume that import_code_paths/1 was called earlier
-                  case cover:analyse(Module, module) of
+                  case cover_analyse(CoverNode, Module) of
                       {ok, {Module, {C, NC}}} ->
-                          file:write(File, row(atom_to_list(Module), C, NC, percent(C,NC),"coverage/"++FileName)),
-                          FilePathC = filename:join([CoverageDir, FileName]),
-                          catch cover:analyse_to_file(Module, FilePathC, [html]),
-                          {CAcc + C, NCAcc + NC};
+                          FilePathC = filename:join([Root, CoverageDir, FileName]),
+                          case cover_analyse_to_html_file(CoverNode, Module, FilePathC) of
+                              {ok, _} ->
+                                  file:write(File, row(atom_to_list(Module), C, NC, percent(C,NC),"coverage/"++FileName)),
+                                  {CAcc + C, NCAcc + NC, Skipped, Failed, OK + 1};
+                              Other ->
+                                  %% Do not report link, if the destination file is not written
+                                  file:write(File, row_no_link(atom_to_list(Module), C, NC, percent(C,NC))),
+                                  error_logger:error_msg("issue=cover_analyse_to_html_file_failed module=~p reason=~p",
+                                                         [Module, Other]),
+                                  {CAcc + C, NCAcc + NC, Skipped, Failed + 1, OK}
+                          end;
                       Reason ->
                           error_logger:error_msg("issue=cover_analyse_failed module=~p reason=~p",
                                                  [Module, Reason]),
-                          {CAcc, NCAcc}
+                          {CAcc, NCAcc, Skipped + 1, Failed, OK}
                   end
           end,
-    {CSum, NCSum} = lists:foldl(Fun, {0, 0}, Modules),
+    {CSum, NCSum, Skipped2, Failed2, OK2} = lists:foldl(Fun, {0, 0, 0, 0, 0}, Modules),
     file:write(File, row("Summary", CSum, NCSum, percent(CSum, NCSum), "#")),
-    file:close(File).
+    file:close(File),
+    report_progress("make_html: ok - ~p, skipped - ~p, failed - ~p~n", [OK2, Skipped2, Failed2]),
+    ok.
 
-get_hosts_to_enable_preset(Test) ->
-    Hosts = get_all_hosts(Test),
-    %% We apply preset options to `mim` and `reg` clusters
-    Clusters = group_by(fun host_cluster/1, Hosts),
-    dict:fetch(mim, Clusters) ++ dict:fetch(reg, Clusters).
+get_hosts_to_enable_preset(Props) ->
+    [Host || Host <- get_all_hosts(Props), should_enable_preset(host_cluster(Host))].
 
-get_all_hosts(Test) ->
-    {_File, Props} = get_ct_config(Test),
+should_enable_preset(mim) -> true;
+should_enable_preset(reg) -> true;
+should_enable_preset(_) -> false.
+
+get_all_hosts(Props) ->
     {hosts, Hosts} = lists:keyfind(hosts, 1, Props),
     Hosts.
 
-get_mongoose_nodes(Test) ->
-    [ host_node(H) || H <- get_all_hosts(Test), is_test_host_enabled(host_name(H)) ].
+get_mongoose_nodes(Props) ->
+    [ host_node(H) || H <- get_all_hosts(Props), is_test_host_enabled(host_name(H)) ].
 
 percent(0, _) -> 0;
 percent(C, NC) when C /= 0; NC /= 0 -> round(C / (NC+C) * 100);
@@ -429,6 +495,17 @@ row(Row, C, NC, Percent, Path) ->
         "</tr>\n"
     ].
 
+row_no_link(Row, C, NC, Percent) ->
+    [
+        "<tr>",
+        "<td>", Row, "</td>",
+        "<td>", integer_to_list(Percent), "%</td>",
+        "<td>", integer_to_list(C), "</td>",
+        "<td>", integer_to_list(NC), "</td>",
+        "<td>", integer_to_list(C+NC), "</td>",
+        "</tr>\n"
+    ].
+
 get_cover_header() ->
     "<html>\n<head></head>\n<body bgcolor=\"white\" text=\"black\" link=\"blue\" vlink=\"purple\" alink=\"red\">\n"
     "<head><script src='sorttable.js'></script></head>"
@@ -438,14 +515,21 @@ get_cover_header() ->
 
 bool_or_module_list("true") ->
     true;
+bool_or_module_list("false") ->
+    false;
+bool_or_module_list(undefined) ->
+    false;
 bool_or_module_list(ModuleList) when is_list(ModuleList) ->
-    [ list_to_atom(L) || L <- string:tokens("asd,qwe,zxc", ",") ];
-bool_or_module_list(_) ->
-    false.
+    module_list(ModuleList).
 
-modules_to_analyze(true) ->
-    lists:usort(cover:imported_modules() ++ cover:modules());
-modules_to_analyze(ModuleList) when is_list(ModuleList) ->
+module_list(undefined) ->
+    [];
+module_list(ModuleList) ->
+    [ list_to_atom(L) || L <- string:tokens(ModuleList, ", ") ].
+
+modules_to_analyze(CoverNode, true) ->
+    lists:usort(cover_all_modules(CoverNode));
+modules_to_analyze(_CoverNode, ModuleList) when is_list(ModuleList) ->
     ModuleList.
 
 add({X1, X2, X3, X4},
@@ -512,12 +596,6 @@ exit_code({_, _, _, _}) ->
 print(Handle, Fmt, Args) ->
     io:format(Handle, Fmt, Args).
 
-%% Source: https://gist.github.com/jbpotonnier/1310406
-group_by(F, L) ->
-    lists:foldr(fun ({K, V}, D) -> dict:append(K, V, D) end,
-                dict:new(),
-                [ {F(X), X} || X <- L ]).
-
 host_cluster(Host) -> host_param(cluster, Host).
 host_node(Host)    -> host_param(node, Host).
 host_vars(Host)    -> host_param(vars, Host).
@@ -526,6 +604,9 @@ host_name({HostName,_}) -> HostName.
 host_param(Name, {_, Params}) ->
     {Name, Param} = lists:keyfind(Name, 1, Params),
     Param.
+
+host_param(Name, {_, Params}, Default) ->
+    proplists:get_value(Name, Params, Default).
 
 report_time(Description, Fun) ->
 	report_progress("~nExecuting ~ts~n", [Description]),
@@ -543,19 +624,19 @@ microseconds_to_string(Microseconds) ->
     SecondsFloat = Milliseconds / 1000,
     io_lib:format("~.3f seconds", [SecondsFloat]).
 
-%% Writes onto travis console directly
+%% Writes onto GitHub actions console directly
 report_progress(Format, Args) ->
     Message = io_lib:format(Format, Args),
     file:write_file("/tmp/progress", Message, [append]).
 
-travis_fold(Description, Fun) ->
-    case os:getenv("TRAVIS_JOB_ID") of
+github_actions_fold(Description, Fun) ->
+    case os:getenv("GITHUB_RUN_ID") of
         false ->
             Fun();
         _ ->
-            io:format("travis_fold:start:~ts~n", [Description]),
+            io:format("github_actions_fold:start:~ts~n", [Description]),
             Result = Fun(),
-            io:format("travis_fold:end:~ts~n", [Description]),
+            io:format("github_actions_fold:end:~ts~n", [Description]),
             Result
     end.
 
@@ -575,16 +656,6 @@ handle_file_error(_FileName, Other) ->
     Other.
 
 %% ------------------------------------------------------------------
-
-%% cover_server process is using io:format too much.
-%% This code removes duplicate io:formats.
-%%
-%% Example of a message we want to write only once:
-%% "Analysis includes data from imported files" from cover.erl in Erlang/R19
-deduplicate_cover_server_console_prints() ->
-    %% Set a new group leader for cover_server
-    CoverPid = whereis(cover_server),
-    dedup_proxy_group_leader:start_proxy_group_leader_for(CoverPid).
 
 ct_run_dirs() ->
     filelib:wildcard("ct_report/ct_run*").
@@ -651,4 +722,107 @@ try_load_module(Module) ->
     case code:is_loaded(Module) of
         true -> already_loaded;
         _ -> code:load_file(Module)
+    end.
+
+assert_all_presets_present(PresetsToCheck, PresetConfs) ->
+    lists:foreach(fun(Preset) ->
+                    assert_preset_present(Preset, PresetConfs)
+                  end, PresetsToCheck).
+
+assert_preset_present(small_tests, _PresetConfs) ->
+    ok;
+assert_preset_present(Preset, PresetConfs) ->
+    case lists:keymember(Preset, 1, PresetConfs) of
+        true -> ok;
+        false ->
+            error_logger:error_msg("Preset not found ~p~n", [Preset]),
+            error({preset_not_found, Preset})
+    end.
+
+assert_list(X) when is_list(X) -> X.
+
+%% We use mim1 as a main node.
+%% Only the main node supports meck
+%% (other nodes should not use meck for the cover compiled modules).
+cover_start(CoverNode, Nodes) ->
+    {ok, _} = cover_call(CoverNode, start, [Nodes]),
+    CoverNode = cover_call(CoverNode, get_main_node, []),
+    ok.
+
+cover_stop(CoverNode, Nodes) ->
+    cover_call(CoverNode, stop, [Nodes]).
+
+cover_all_modules(CoverNode) ->
+    List1 = assert_list(cover_call(CoverNode, imported_modules, [])),
+    List2 = assert_list(cover_call(CoverNode, modules, [])),
+    List1 ++ List2.
+
+cover_analyse_to_html_file(CoverNode, Module, FilePathC) ->
+    catch cover_call(CoverNode, analyse_to_file, [Module, FilePathC, [html]]).
+
+cover_analyse(CoverNode, Module) ->
+    cover_call(CoverNode, analyse, [Module, module]).
+
+cover_export(CoverNode, ToFile) ->
+    cover_call(CoverNode, export, [ToFile]).
+
+cover_import(CoverNode, FromFile) ->
+    cover_call(CoverNode, import, [FromFile]).
+
+cover_compile_dir(CoverNode, Dir) ->
+    cover_call(CoverNode, compile_beam_directory, [Dir]).
+
+cover_call(CoverNode, Fun, Args) ->
+    rpc:call(CoverNode, cover, Fun, Args).
+
+block_nodes(Props) ->
+   [block_node(Node, BlockNode, Props) || {Node, BlockNode} <- block_nodes_specs(Props)],
+   ok.
+
+unblock_nodes(Props) ->
+   [unblock_node(Node, BlockNode, Props) || {Node, BlockNode} <- block_nodes_specs(Props)],
+   ok.
+
+%% Reads `blocks_hosts' parameter for the host from `test.config'.
+%% Returns a list of blocks to do like `[{mim, fed}]'.
+block_nodes_specs(Props) ->
+    EnabledHosts = [ H || H <- get_all_hosts(Props), is_test_host_enabled(host_name(H)) ],
+    [{host_name(H), BlockName}
+     || H <- EnabledHosts, BlockName <- host_param(blocks_hosts, H, []),
+        is_test_host_enabled(BlockName)].
+
+host_name_to_node(Name, Props) ->
+    Hosts = get_all_hosts(Props),
+    Host = proplists:get_value(Name, Hosts, []),
+    case proplists:get_value(node, Host) of
+        undefined ->
+            error({host_name_to_node_failed, Name, Props});
+        Node ->
+            Node
+    end.
+
+%% Do not allow node Name to talk to node BlockName
+block_node(Name, BlockName, Props) ->
+    Node = host_name_to_node(Name, Props),
+    BlockNode = host_name_to_node(BlockName, Props),
+    rpc_call(Node, erlang, set_cookie, [BlockNode, make_bad_cookie(Name, BlockNode)]),
+    rpc_call(Node, erlang, disconnect_node, [BlockNode]),
+    Cond = fun() -> lists:member(BlockNode, rpc_call(Node, erlang, nodes, [])) end,
+    wait_helper:wait_until(Cond, false).
+
+unblock_node(Name, BlockName, Props) ->
+    Node = host_name_to_node(Name, Props),
+    BlockNode = host_name_to_node(BlockName, Props),
+    DefCookie = rpc_call(Node, erlang, get_cookie, []),
+    rpc_call(Node, erlang, set_cookie, [BlockNode, DefCookie]).
+
+make_bad_cookie(Name, BlockName) ->
+    list_to_atom(atom_to_list(Name) ++ "_blocks_" ++ atom_to_list(BlockName)).
+
+rpc_call(Node, M, F, Args) ->
+    case rpc:call(Node, M, F, Args) of
+        {badrpc, Reason} ->
+            error({rpc_call_failed, Reason, Node, {M, F, Args}});
+        Res ->
+            Res
     end.

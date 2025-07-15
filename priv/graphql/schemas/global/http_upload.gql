@@ -1,0 +1,21 @@
+"""
+Type containing put url and get url for the file
+"""
+type FileUrls {
+    "Url to put the file"
+    putUrl: String
+    "Url to get the file"
+    getUrl: String
+    "Http headers"
+    headers: [Header]
+}
+
+"""
+Type containing a HTTP header
+"""
+type Header {
+    "Name"
+    name: String
+    "Value"
+    value: String
+}

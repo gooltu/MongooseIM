@@ -15,15 +15,17 @@
 %%==============================================================================
 
 -module(bosh_SUITE).
--compile(export_all).
+-compile([export_all, nowarn_export_all]).
 
 -include_lib("escalus/include/escalus.hrl").
 -include_lib("common_test/include/ct.hrl").
+-include_lib("eunit/include/eunit.hrl").
 -include_lib("exml/include/exml.hrl").
 
 -import(distributed_helper, [mim/0,
                              require_rpc_nodes/1,
                              rpc/4]).
+-import(domain_helper, [host_type/0, domain/0]).
 
 %%--------------------------------------------------------------------
 %% Suite configuration
@@ -35,28 +37,29 @@
 
 all() ->
     [
+     {group, without_bosh},
      {group, essential},
-
+     {group, essential_https},
      {group, chat},
+     {group, chat_https},
      {group, time},
      {group, acks},
-
-     {group, essential_https},
-     {group, chat_https},
+     {group, server_acks},
      {group, interleave_requests_statem}
-     ].
+    ].
 
 groups() ->
-    G = [
-         {essential, [shuffle], essential_test_cases()},
-         {essential_https, [shuffle], essential_test_cases()},
-         {chat, [shuffle], chat_test_cases()},
-         {chat_https, [shuffle], chat_test_cases()},
-         {time, [parallel], time_test_cases()},
-         {acks, [shuffle], acks_test_cases()},
-         {interleave_requests_statem, [parallel], [interleave_requests_statem]}
-        ],
-    ct_helper:repeat_all_until_all_ok(G).
+    [
+     {without_bosh, [], [reject_connection_when_mod_bosh_is_disabled]},
+     {essential, [sequence], essential_test_cases()},
+     {essential_https, [sequence], essential_test_cases()},
+     {chat, [shuffle], chat_test_cases()},
+     {chat_https, [shuffle], chat_test_cases()},
+     {time, [parallel], time_test_cases()},
+     {acks, [shuffle], acks_test_cases()},
+     {server_acks, [], [server_acks]},
+     {interleave_requests_statem, [parallel], [interleave_requests_statem]}
+    ].
 
 suite() ->
     require_rpc_nodes([mim]) ++ escalus:suite().
@@ -94,7 +97,6 @@ time_test_cases() ->
 
 acks_test_cases() ->
     [
-     server_acks,
      force_report,
      force_retransmission,
      force_cache_trimming
@@ -105,49 +107,65 @@ acks_test_cases() ->
 %%--------------------------------------------------------------------
 
 init_per_suite(Config) ->
-    escalus:init_per_suite([{escalus_user_db, {module, escalus_ejabberd}} | Config]).
+    instrument_helper:start(instrumentation_events()),
+    Config1 = dynamic_modules:save_modules(host_type(), Config),
+    escalus:init_per_suite([{escalus_user_db, {module, escalus_ejabberd}} | Config1]).
 
 end_per_suite(Config) ->
+    instrument_helper:stop(),
+    dynamic_modules:restore_modules(Config),
     escalus_fresh:clean(),
     escalus:end_per_suite(Config).
 
 init_per_group(time, Config) ->
-    NewConfig = escalus_ejabberd:setup_option(max_wait(), Config),
-    escalus_ejabberd:setup_option(inactivity(), NewConfig);
-init_per_group(essential, Config) ->
+    dynamic_modules:ensure_modules(host_type(), required_modules(time)),
+    Config;
+init_per_group(GroupName, Config) when GroupName =:= essential;
+                                       GroupName =:= without_bosh ->
+    dynamic_modules:ensure_modules(host_type(), required_modules(GroupName)),
     [{user, carol} | Config];
 init_per_group(essential_https, Config) ->
+    dynamic_modules:ensure_modules(host_type(), required_modules(essential_https)),
     [{user, carol_s} | Config];
 init_per_group(chat_https, Config) ->
+    dynamic_modules:ensure_modules(host_type(), required_modules(chat_https)),
     Config1 = escalus:create_users(Config, escalus:get_users([carol, carol_s, geralt, alice])),
     [{user, carol_s} | Config1];
-init_per_group(_GroupName, Config) ->
+init_per_group(GroupName, Config) ->
+    dynamic_modules:ensure_modules(host_type(), required_modules(GroupName)),
     Config1 = escalus:create_users(Config, escalus:get_users([carol, carol_s, geralt, alice])),
     [{user, carol} | Config1].
 
-end_per_group(time, Config) ->
-    NewConfig = escalus_ejabberd:reset_option(max_wait(), Config),
-    escalus_ejabberd:reset_option(inactivity(), NewConfig);
-end_per_group(GroupName, Config)
-    when GroupName =:= essential; GroupName =:= essential_https ->
-    Config;
+end_per_group(GroupName, _Config) when GroupName =:= time;
+                                       GroupName =:= essential;
+                                       GroupName =:= without_bosh;
+                                       GroupName =:= essential_https ->
+    ok;
 end_per_group(_GroupName, Config) ->
-    R = escalus:delete_users(Config, escalus:get_users([carol, carol_s, geralt, alice])),
-    mongoose_helper:clear_last_activity(Config, carol),
-    Config,
-    R.
+    escalus:delete_users(Config, escalus:get_users([carol, carol_s, geralt, alice])),
+    mongoose_helper:clear_last_activity(Config, carol).
 
-init_per_testcase(server_acks = CaseName, Config) ->
-    NewConfig = escalus_ejabberd:setup_option(server_acks_opt(), Config),
-    escalus:init_per_testcase(CaseName, NewConfig);
 init_per_testcase(CaseName, Config) ->
     escalus:init_per_testcase(CaseName, Config).
 
-end_per_testcase(server_acks = CaseName, Config) ->
-    NewConfig = escalus_ejabberd:reset_option(server_acks_opt(), Config),
-    escalus:end_per_testcase(CaseName, NewConfig);
 end_per_testcase(CaseName, Config) ->
     escalus:end_per_testcase(CaseName, Config).
+
+%% Module configuration per group
+
+required_modules(without_bosh) ->
+    [{mod_bosh, stopped}];
+required_modules(GroupName) ->
+    Backend = ct_helper:get_internal_database(),
+    ModOpts = config_parser_helper:mod_config(mod_bosh, #{backend => Backend}),
+    [{mod_bosh, maps:merge(ModOpts, required_bosh_opts(GroupName))}].
+
+required_bosh_opts(time) ->
+    #{max_wait => ?MAX_WAIT, inactivity => ?INACTIVITY};
+required_bosh_opts(server_acks) ->
+    #{server_acks => true};
+required_bosh_opts(_Group) ->
+    #{}.
 
 %%--------------------------------------------------------------------
 %% Tests
@@ -161,7 +179,7 @@ create_and_terminate_session(Config) ->
     %% Assert there are no BOSH sessions on the server.
     [] = get_bosh_sessions(),
 
-    Domain = ct:get_config({hosts, mim, domain}),
+    Domain = domain(),
     Body = escalus_bosh:session_creation_body(get_bosh_rid(Conn), Domain),
     ok = bosh_send_raw(Conn, Body),
     escalus_connection:get_stanza(Conn, session_creation_response),
@@ -176,37 +194,65 @@ create_and_terminate_session(Config) ->
     %% Assert the session was terminated.
     wait_for_zero_bosh_sessions().
 
-accept_higher_hold_value(Config) ->
-    #xmlel{attrs = RespAttrs} = send_specific_hold(Config, <<"2">>),
-    {<<"hold">>, <<"1">>} = lists:keyfind(<<"hold">>, 1, RespAttrs).
-
-do_not_accept_0_hold_value(Config) ->
-    #xmlel{attrs = RespAttrs} = send_specific_hold(Config, <<"0">>),
-    {<<"type">>, <<"terminate">>} = lists:keyfind(<<"type">>, 1, RespAttrs).
-
-
-send_specific_hold(Config, HoldValue) ->
-    {Server, Path, Client} = get_fusco_connection(Config),
-
+reject_connection_when_mod_bosh_is_disabled(Config) ->
+    {Domain, Path, Client} = get_fusco_connection(Config),
     Rid = rand:uniform(1000000),
-    Body0 = escalus_bosh:session_creation_body(2, <<"1.0">>, <<"en">>, Rid, Server, nil),
-    #xmlel{attrs = Attrs0} = Body0,
-    Attrs = lists:keyreplace(<<"hold">>, 1, Attrs0, {<<"hold">>, HoldValue}),
-    Body = Body0#xmlel{attrs = Attrs},
-
+    Body = escalus_bosh:session_creation_body(2, <<"1.0">>, <<"en">>, Rid, Domain, nil),
     Result = fusco_request(Client, <<"POST">>, Path, exml:to_iolist(Body)),
     {{<<"200">>, <<"OK">>}, _Headers, RespBody, _, _} = Result,
+    {ok, #xmlel{attrs = RespAttrs}} = exml:parse(RespBody),
 
-    {ok, #xmlel{attrs = RespAttrs} = Resp} = exml:parse(RespBody),
-    case lists:keyfind(<<"sid">>, 1, RespAttrs) of
-        {<<"sid">>, SID} ->
-            TerminateBody = escalus_bosh:session_termination_body(Rid + 1, SID),
-            fusco_request(Client, <<"POST">>, Path, exml:to_iolist(TerminateBody));
-        _ ->
-            skip
+    ?assertMatch(#{<<"type">> := <<"terminate">>}, RespAttrs),
+    ?assertEqual([], get_bosh_sessions()),
+    fusco_cp:stop(Client).
+
+do_not_accept_0_hold_value(Config) ->
+    {Domain, Path, Client} = get_fusco_connection(Config),
+    Rid = rand:uniform(1000000),
+    Body0 = escalus_bosh:session_creation_body(2, <<"1.0">>, <<"en">>, Rid, Domain, nil),
+    Attrs0 = Body0#xmlel.attrs,
+    Attrs = Attrs0#{<<"hold">> := <<"0">>},
+    Body = Body0#xmlel{attrs = Attrs},
+    Result = fusco_request(Client, <<"POST">>, Path, exml:to_iolist(Body)),
+    {{<<"200">>, <<"OK">>}, _Headers, RespBody, _, _} = Result,
+    {ok, #xmlel{attrs = RespAttrs}} = exml:parse(RespBody),
+
+    ?assertMatch(#{<<"type">> := <<"terminate">>}, RespAttrs),
+    ?assertEqual([], get_bosh_sessions()),
+    fusco_cp:stop(Client).
+
+accept_higher_hold_value(Config) ->
+    {Domain, Path, Client} = get_fusco_connection(Config),
+    Rid = rand:uniform(1000000),
+    Body0 = escalus_bosh:session_creation_body(2, <<"1.0">>, <<"en">>, Rid, Domain, nil),
+    Attrs0 = Body0#xmlel.attrs,
+    Attrs = Attrs0#{<<"hold">> := <<"2">>},
+    Body = Body0#xmlel{attrs = Attrs},
+    Result = fusco_request(Client, <<"POST">>, Path, exml:to_iolist(Body)),
+    {{<<"200">>, <<"OK">>}, _Headers, RespBody, _, _} = Result,
+    {ok, #xmlel{attrs = RespAttrs}} = exml:parse(RespBody),
+
+    %% Server returns its hold value, which is 1
+    #{<<"hold">> := <<"1">>, <<"sid">> := SID} = RespAttrs,
+    ?assertMatch([_], get_bosh_sessions()),
+
+    TerminateBody = escalus_bosh:session_termination_body(Rid + 1, SID),
+    Res2 = fusco_request(Client, <<"POST">>, Path, exml:to_iolist(TerminateBody)),
+    {{<<"200">>, <<"OK">>}, _, RespBody2, _, _} = Res2,
+    {ok, #xmlel{attrs = RespAttrs2}} = exml:parse(RespBody2),
+    case RespAttrs2 of
+        #{<<"type">> := <<"terminate">>} ->
+            ok;
+        #{<<"sid">> := SID} ->
+            %% Server sent stream features separately, one more request needed
+            EmptyBody = escalus_bosh:empty_body(Rid + 2, SID),
+            Res3 = fusco_request(Client, <<"POST">>, Path, exml:to_iolist(EmptyBody)),
+            {{<<"200">>, <<"OK">>}, _, RespBody3, _, _} = Res3,
+            {ok, #xmlel{attrs = RespAttrs3}} = exml:parse(RespBody3),
+            ?assertMatch(#{<<"type">> := <<"terminate">>}, RespAttrs3)
     end,
-    fusco_cp:stop(Client),
-    Resp.
+    ?assertEqual([], get_bosh_sessions()),
+    fusco_cp:stop(Client).
 
 fusco_request(Client, Method, Path, Body) ->
     fusco_request(Client, Method, Path, Body, []).
@@ -259,10 +305,17 @@ get_fusco_connection(Config) ->
     NamedSpecs = escalus_config:get_config(escalus_users, Config),
     CarolSpec = proplists:get_value(?config(user, Config), NamedSpecs),
     Server = proplists:get_value(server, CarolSpec),
+    Host = proplists:get_value(host, CarolSpec, Server),
     Path = proplists:get_value(path, CarolSpec),
     Port = proplists:get_value(port, CarolSpec),
     UseSSL = proplists:get_value(ssl, CarolSpec, false),
-    {ok, Client} = fusco_cp:start_link({binary_to_list(Server), Port, UseSSL}, [], 1),
+    Opts = case UseSSL of
+        true ->
+            [{connect_options, [{verify, verify_none}]}];
+        false ->
+            []
+    end,
+    {ok, Client} = fusco_cp:start_link({binary_to_list(Host), Port, UseSSL}, Opts, 1),
     {Server, Path, Client}.
 
 stream_error(Config) ->
@@ -296,6 +349,8 @@ interleave_requests(Config) ->
         Msg3 = <<"3rd!">>,
         Msg4 = <<"4th!">>,
 
+        TS = instrument_helper:timestamp(),
+
         send_message_with_rid(Carol, Geralt, Rid + 1, Sid, Msg2),
         send_message_with_rid(Carol, Geralt, Rid, Sid, Msg1),
 
@@ -310,6 +365,12 @@ interleave_requests(Config) ->
                        escalus_client:wait_for_stanza(Geralt)),
         escalus:assert(is_chat_message, [Msg4],
                        escalus_client:wait_for_stanza(Geralt)),
+
+        Pred = fun(#{byte_size := BS}) -> BS > 0;
+                  (#{time := Time}) -> Time > 0
+               end,
+        [instrument_helper:assert(Event, Label, Pred, #{min_timestamp => TS})
+         || {Event, Label} <- instrumentation_events()],
 
         true = is_bosh_connected(Carol)
     end).
@@ -372,7 +433,7 @@ cant_send_invalid_rid(Config) ->
         %% completes. This will leave the following message in the log:
         %%
         %% mod_bosh:forward_body:265 session not found!
-        
+
         %% NOTICE 3
         %% We enable quickfail mode, because sometimes request with invalid RID
         %% arrives before empty body req. with valid RID, so server returns an error
@@ -523,7 +584,7 @@ interrupt_long_poll_is_activity(ConfigIn) ->
         %% Wait until after the inactivity timeout (which should be less than
         %% the BOSH wait timeout).
         timer:sleep(2 * timer:seconds(?INACTIVITY)),
-              
+
         %% No disconnection should have occurred.
         escalus_assert:has_no_stanzas(Carol),
         true = is_session_alive(Sid),
@@ -627,7 +688,7 @@ reply_in_time(ConfigIn) ->
 server_acks(Config) ->
     escalus:story(Config, [{carol, 1}, {geralt, 1}], fun(Carol, Geralt) ->
         bosh_set_active(Carol, false),
-        ExpectedRid = list_to_binary(integer_to_list(get_bosh_rid(Carol))),
+        ExpectedRid = integer_to_binary(get_bosh_rid(Carol)),
         escalus_client:send(Carol, escalus_stanza:chat_to(Geralt, <<"1st!">>)),
         escalus_client:send(Carol, escalus_stanza:chat_to(Geralt, <<"2nd!">>)),
         timer:sleep(200),
@@ -833,8 +894,7 @@ wait_for_stanza(Client) ->
 
 ack_body(Body, Rid) ->
     Attrs = Body#xmlel.attrs,
-    Ack = {<<"ack">>, list_to_binary(integer_to_list(Rid))},
-    NewAttrs = lists:keystore(<<"ack">>, 1, Attrs, Ack),
+    NewAttrs = Attrs#{<<"ack">> => integer_to_binary(Rid)},
     Body#xmlel{attrs = NewAttrs}.
 
 set_client_acks(SessionPid, Enabled) ->
@@ -842,30 +902,6 @@ set_client_acks(SessionPid, Enabled) ->
 
 get_cached_responses(SessionPid) ->
     rpc(mim(), mod_bosh_socket, get_cached_responses, [SessionPid]).
-
-inactivity() ->
-    inactivity(?INACTIVITY).
-
-inactivity(Value) ->
-    {inactivity,
-     fun() -> rpc(mim(), mod_bosh, get_inactivity, []) end,
-     fun(V) -> rpc(mim(), mod_bosh, set_inactivity, [V]) end,
-     Value}.
-
-max_wait() ->
-    max_wait(?MAX_WAIT).
-
-max_wait(Value) ->
-    {max_wait,
-     fun() -> rpc(mim(), mod_bosh, get_max_wait, []) end,
-     fun(V) -> rpc(mim(), mod_bosh, set_max_wait, [V]) end,
-     Value}.
-
-server_acks_opt() ->
-    {server_acks,
-     fun() -> rpc(mim(), mod_bosh, get_server_acks, []) end,
-     fun(V) -> rpc(mim(), mod_bosh, set_server_acks, [V]) end,
-     true}.
 
 is_session_alive(Sid) ->
     BoshSessions = get_bosh_sessions(),
@@ -875,41 +911,44 @@ wait_for_session_close(Sid) ->
     wait_for_session_close(Sid, ?INACTIVITY).
 
 wait_for_session_close(Sid, LeftTime) ->
-    mongoose_helper:wait_until(fun() -> is_session_alive(Sid) end, false,
-                               #{
-                                 time_left => timer:seconds(10),
-                                 time_sleep => LeftTime, 
-                                 name => is_session_alive
-                                }).
+    wait_helper:wait_until(fun() -> is_session_alive(Sid) end, false,
+                           #{
+                             time_left => timer:seconds(10),
+                             time_sleep => LeftTime,
+                             name => is_session_alive
+                            }).
 
 wait_for_handler(Pid, Count) ->
-    mongoose_helper:wait_until(fun() -> length(get_handlers(Pid)) end, Count,
-                                #{   
-                                 time_left => timer:seconds(10),
-                                 time_sleep => timer:seconds(1),
-                                 name => get_handlers
-                                }).
+    wait_helper:wait_until(fun() -> length(get_handlers(Pid)) end, Count,
+                           #{
+                             time_left => timer:seconds(10),
+                             time_sleep => timer:seconds(1),
+                             name => get_handlers
+                            }).
 
 
 wait_for_handler(Pid, Count, LeftTime) ->
-    mongoose_helper:wait_until(fun() -> length(get_handlers(Pid)) end, Count, 
-                               #{   
-                                 time_left => LeftTime,
-                                 time_sleep => timer:seconds(1),
-                                 name => get_handlers
-                                }).
+    wait_helper:wait_until(fun() -> length(get_handlers(Pid)) end, Count,
+                           #{
+                             time_left => LeftTime,
+                             time_sleep => timer:seconds(1),
+                             name => get_handlers
+                            }).
 
 wait_until_user_has_no_stanzas(User) ->
-        mongoose_helper:wait_until(fun() -> 
-                                       escalus_assert:has_no_stanzas(User) 
-                                   end, ok, #{left_time => 2 * timer:seconds(?INACTIVITY)}).
-
-domain() ->
-    ct:get_config({hosts, mim, domain}).
+    wait_helper:wait_until(fun() ->
+                                   escalus_assert:has_no_stanzas(User)
+                           end, ok, #{left_time => 2 * timer:seconds(?INACTIVITY)}).
 
 wait_for_zero_bosh_sessions() ->
-    mongoose_helper:wait_until(fun() ->
-                                       length(get_bosh_sessions())
-                               end,
-                               0,
-                               #{name => get_bosh_sessions}).
+    wait_helper:wait_until(fun() ->
+                                   get_bosh_sessions()
+                           end,
+                           [],
+                           #{name => get_bosh_sessions}).
+
+instrumentation_events() ->
+    instrument_helper:declared_events(mod_bosh, [])
+    ++ [{c2s_message_processed, #{host_type => host_type()}},
+        {xmpp_element_out, #{host_type => host_type(), connection_type => c2s}},
+        {xmpp_element_in, #{host_type => host_type(), connection_type => c2s}}].

@@ -1,0 +1,9 @@
+"""
+ Allow user to get and revoke tokens.
+ """
+ type TokenUserMutation @protected @use(modules: ["mod_auth_token"]){
+   "Get a new token"
+   requestToken: Token @use
+   "Revoke any tokens"
+   revokeToken: String @use
+ }

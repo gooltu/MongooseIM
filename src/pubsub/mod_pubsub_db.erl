@@ -12,13 +12,15 @@
 
 -export([db_error/3, extra_debug_fun/1]).
 
+-ignore_xref([behaviour_info/1]).
+
 %%====================================================================
 %% Behaviour callbacks
 %%====================================================================
 
 %% ------------------------ Backend start/stop ------------------------
 
--callback start() -> ok.
+-callback init(HostType :: mongooseim:host_type(), gen_mod:module_opts()) -> ok.
 
 -callback stop() -> ok.
 

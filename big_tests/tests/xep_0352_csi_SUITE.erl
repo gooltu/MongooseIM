@@ -1,9 +1,11 @@
 -module(xep_0352_csi_SUITE).
 
--include_lib("exml/include/exml.hrl").
 -include_lib("escalus/include/escalus.hrl").
 
--compile([export_all]).
+-compile([export_all, nowarn_export_all]).
+
+-import(domain_helper, [host_type/0]).
+-import(config_parser_helper, [default_mod_config/1, mod_config/2]).
 
 -define(CSI_BUFFER_MAX, 10).
 
@@ -12,35 +14,40 @@ all() ->
 
 
 groups() ->
-    G = [{basic, [parallel, shuffle], all_tests()}],
-    ct_helper:repeat_all_until_all_ok(G).
+    [{basic, [parallel], all_tests()}].
 
 all_tests() ->
     [
      server_announces_csi,
      alice_is_inactive_and_no_stanza_arrived,
+     inactive_twice_does_not_reset_buffer,
      alice_gets_msgs_after_activate,
      alice_gets_msgs_after_activate_in_order,
      alice_gets_message_after_buffer_overflow,
      alice_gets_buffered_messages_after_reconnection_with_sm,
      alice_gets_buffered_messages_after_stream_resumption,
      bob_gets_msgs_from_inactive_alice,
-     alice_is_inactive_but_sends_sm_req_and_recives_ack
+     alice_is_inactive_but_sends_sm_req_and_recives_ack,
+     invalid_csi_request_returns_error
     ].
 
 suite() ->
     escalus:suite().
 
 init_per_suite(Config) ->
-    Domain = ct:get_config({hosts, mim, domain}),
-    dynamic_modules:start(Domain, mod_csi, [{buffer_max, ?CSI_BUFFER_MAX}]),
-    [{escalus_user_db, {module, escalus_ejabberd}} | escalus:init_per_suite(Config)].
+    instrument_helper:start(instrument_helper:declared_events(mod_csi)),
+    NewConfig = dynamic_modules:save_modules(host_type(), Config),
+    Backend = mongoose_helper:mnesia_or_rdbms_backend(),
+    dynamic_modules:ensure_modules(
+      host_type(), [{mod_offline, mod_config(mod_offline, #{backend => Backend})},
+                    {mod_csi, mod_config(mod_csi, #{buffer_max => ?CSI_BUFFER_MAX})}]),
+    [{escalus_user_db, {module, escalus_ejabberd}} | escalus:init_per_suite(NewConfig)].
 
 end_per_suite(Config) ->
-    Domain = ct:get_config({hosts, mim, domain}),
-    dynamic_modules:stop(Domain, mod_csi),
     escalus_fresh:clean(),
-    escalus:end_per_suite(Config).
+    dynamic_modules:restore_modules(Config),
+    escalus:end_per_suite(Config),
+    instrument_helper:stop().
 
 init_per_group(_, Config) ->
     escalus_users:update_userspec(Config, alice, stream_management, true).
@@ -57,20 +64,22 @@ end_per_testcase(CaseName, Config) ->
 server_announces_csi(Config) ->
     NewConfig = escalus_fresh:create_users(Config, [{alice, 1}]),
     Spec = escalus_users:get_userspec(NewConfig, alice),
-    Steps = [start_stream,
-             stream_features,
-             maybe_use_ssl,
-             authenticate,
-             bind,
-             session],
+    Steps = [start_stream, stream_features, maybe_use_ssl, authenticate, bind, session],
     {ok, _Client, Features} = escalus_connection:start(Spec, Steps),
     true = proplists:get_value(client_state_indication, Features).
 
+invalid_csi_request_returns_error(Config) ->
+    escalus:fresh_story(Config, [{alice, 1}], fun(Alice) ->
+        escalus:send(Alice, csi_helper:csi_stanza(<<"invalid">>)),
+        Stanza = escalus:wait_for_stanza(Alice),
+        escalus:assert(is_error, [<<"modify">>, <<"bad-request">>], Stanza)
+    end).
+
 alice_is_inactive_and_no_stanza_arrived(Config) ->
     escalus:fresh_story(Config, [{alice, 1}, {bob, 1}], fun(Alice, Bob) ->
-        given_client_is_inactive_and_messages_sent(Alice, Bob, 1),
-
-        escalus_assert:has_no_stanzas(Alice)
+        csi_helper:given_client_is_inactive_and_no_messages_arrive(Alice),
+        csi_helper:given_messages_are_sent(Alice, Bob, 1),
+        csi_helper:then_client_does_not_receive_any_message(Alice)
     end).
 
 alice_gets_msgs_after_activate(Config) ->
@@ -81,13 +90,20 @@ alice_gets_msgs_after_activate_in_order(Config) ->
 
 alice_gets_msgs_after_activate(Config, N) ->
     escalus:fresh_story(Config, [{alice, 1}, {bob, 1}], fun(Alice, Bob) ->
-        %%Given
-        Msgs = given_client_is_inactive_and_messages_sent(Alice, Bob, N),
+        csi_helper:given_client_is_inactive_and_no_messages_arrive(Alice),
+        Msgs = csi_helper:given_messages_are_sent(Alice, Bob, N),
+        csi_helper:given_client_is_active(Alice),
+        csi_helper:then_client_receives_message(Alice, Msgs),
+        assert_event(mod_csi_active, Alice)
+    end).
 
-        %%When client becomes active again
-        escalus:send(Alice, csi_stanza(<<"active">>)),
-
-        then_client_receives_message(Alice, Msgs)
+inactive_twice_does_not_reset_buffer(Config) ->
+    escalus:fresh_story(Config, [{alice, 1}, {bob, 1}], fun(Alice, Bob) ->
+        csi_helper:given_client_is_inactive_and_no_messages_arrive(Alice),
+        Msgs = csi_helper:given_messages_are_sent(Alice, Bob, 2),
+        csi_helper:given_client_is_inactive_and_no_messages_arrive(Alice),
+        csi_helper:given_client_is_active(Alice),
+        csi_helper:then_client_receives_message(Alice, Msgs)
     end).
 
 alice_gets_buffered_messages_after_reconnection_with_sm(Config) ->
@@ -99,34 +115,27 @@ alice_gets_buffered_messages_after_reconnection_with_sm(Config) ->
     Alice = Alice0#client{jid = JID},
     {ok, Bob, _} = escalus_connection:start(BobSpec),
 
-    given_client_is_inactive(Alice),
+    csi_helper:given_client_is_inactive_and_no_messages_arrive(Alice),
 
-    MsgsToAlice = given_client_is_inactive_and_messages_sent(Alice, Bob, 5),
+    MsgsToAlice = csi_helper:given_messages_are_sent(Alice, Bob, 5),
 
     %% then Alice disconnects
 
     escalus_connection:kill(Alice),
 
-    {ok, Alice2, _} = escalus_connection:start(AliceSpec),
+    ConnSteps = [start_stream, stream_features, authenticate, bind, session],
+    {ok, Alice2, _} = escalus_connection:start(AliceSpec, ConnSteps),
 
-    escalus_connection:send(Alice2, escalus_stanza:presence(<<"available">>)),
-
-    then_client_receives_message(Alice2, MsgsToAlice),
-
-    ok.
+    csi_helper:then_client_receives_message(Alice2, MsgsToAlice),
+    escalus_connection:stop(Alice2),
+    escalus_connection:stop(Bob).
 
 alice_gets_buffered_messages_after_stream_resumption(Config) ->
-    ConnSteps = [start_stream,
-                 stream_features,
-                 authenticate,
-                 bind,
-                 session,
-                 stream_resumption],
+    ConnSteps = [start_stream, stream_features, authenticate, bind, session, stream_resumption],
     NewConfig = escalus_fresh:create_users(Config, [{alice, 1}, {bob, 1}]),
     AliceSpec = escalus_users:get_userspec(NewConfig, alice),
     BobSpec = escalus_users:get_userspec(NewConfig, bob),
-    {ok, Alice0 = #client{props = AliceProps}, _} = escalus_connection:start(AliceSpec,
-                                                                             ConnSteps),
+    {ok, Alice0 = #client{props = AliceProps}, _} = escalus_connection:start(AliceSpec, ConnSteps),
     JID = make_jid_from_spec(AliceProps),
     Alice = Alice0#client{jid = JID},
 
@@ -134,27 +143,19 @@ alice_gets_buffered_messages_after_stream_resumption(Config) ->
     escalus:wait_for_stanza(Alice),
     {ok, Bob, _} = escalus_connection:start(BobSpec),
 
-    given_client_is_inactive(Alice),
+    csi_helper:given_client_is_inactive_and_no_messages_arrive(Alice),
+    MsgsToAlice = csi_helper:given_messages_are_sent(Alice, Bob, 5),
+    csi_helper:then_client_does_not_receive_any_message(Alice),
 
-    MsgsToAlice = given_client_is_inactive_and_messages_sent(Alice, Bob, 5),
-
-    %% then Alice disconnects
-
+    %% then Alice loses connection and resumes it
     escalus_connection:kill(Alice),
-
     SMID = proplists:get_value(smid, AliceProps),
-    ResumeSession = [start_stream,
-                     stream_features,
-                     authenticate,
-                     mk_resume_stream(SMID, 1)],
-
+    ResumeSession = [start_stream, stream_features, authenticate, mk_resume_stream(SMID, 1)],
     {ok, Alice2, _} = escalus_connection:start(AliceSpec, ResumeSession),
 
-    escalus_connection:send(Alice2, escalus_stanza:presence(<<"available">>)),
-
-    then_client_receives_message(Alice2, MsgsToAlice),
-
-    ok.
+    csi_helper:then_client_receives_message(Alice2, MsgsToAlice),
+    escalus_connection:stop(Alice2),
+    escalus_connection:stop(Bob).
 
 make_jid_from_spec(AliceProps) ->
     AliceUsername = proplists:get_value(username, AliceProps),
@@ -171,74 +172,42 @@ mk_resume_stream(SMID, PrevH) ->
 
 alice_gets_message_after_buffer_overflow(Config) ->
     escalus:fresh_story(Config, [{alice, 1}, {bob, 1}], fun(Alice, Bob) ->
-        Msgs = given_client_is_inactive_and_messages_sent(Alice, Bob, ?CSI_BUFFER_MAX+5),
-
+        csi_helper:given_client_is_inactive_and_no_messages_arrive(Alice),
+        Msgs = csi_helper:given_messages_are_sent(Alice, Bob, ?CSI_BUFFER_MAX + 5),
         {Flushed, Awaiting} = lists:split(?CSI_BUFFER_MAX+1, Msgs),
-
-        then_client_receives_message(Alice, Flushed),
+        csi_helper:then_client_receives_message(Alice, Flushed),
         %% and no other stanza
-        escalus_assert:has_no_stanzas(Alice),
+        csi_helper:then_client_does_not_receive_any_message(Alice),
         %% Alice activates
-        escalus:send(Alice, csi_stanza(<<"active">>)),
+        csi_helper:given_client_is_active(Alice),
         %% ands gets remaining stanzas
-        then_client_receives_message(Alice, Awaiting)
+        csi_helper:then_client_receives_message(Alice, Awaiting)
     end).
 
 bob_gets_msgs_from_inactive_alice(Config) ->
     escalus:fresh_story(Config, [{alice, 1}, {bob, 1}], fun(Alice, Bob) ->
         given_client_is_inactive_but_sends_messages(Alice, Bob, 1),
-
+        assert_event(mod_csi_inactive, Alice),
         escalus:assert(is_chat_message, escalus:wait_for_stanza(Bob))
     end).
 
 alice_is_inactive_but_sends_sm_req_and_recives_ack(Config) ->
     escalus:fresh_story(Config, [{alice,1}], fun(Alice) ->
-        given_client_is_inactive(Alice),
-
+        csi_helper:given_client_is_inactive_and_no_messages_arrive(Alice),
         escalus:send(Alice, escalus_stanza:sm_request()),
-
         escalus:assert(is_sm_ack, escalus:wait_for_stanza(Alice))
 
     end).
 
 given_client_is_inactive_but_sends_messages(Alice, Bob, N) ->
     %%Given
-    MsgsToAlice = given_client_is_inactive_and_messages_sent(Alice, Bob, N),
-
-    MsgsToBob = gen_msgs(<<"Hi, Bob">>, N),
-    send_msgs(Alice, Bob, MsgsToBob),
-    timer:sleep(1),
+    csi_helper:given_client_is_inactive_and_no_messages_arrive(Alice),
+    MsgsToAlice = csi_helper:given_messages_are_sent(Alice, Bob, N),
+    MsgsToBob = csi_helper:gen_msgs(<<"Hi, Bob">>, N),
+    csi_helper:send_msgs(Alice, Bob, MsgsToBob),
     {MsgsToAlice, MsgsToBob}.
 
-
-then_client_receives_message(Alice, Msgs) ->
-    [escalus:assert(is_chat_message, [Msg], escalus:wait_for_stanza(Alice)) ||
-     Msg <- Msgs].
-
-
-given_client_is_inactive_and_messages_sent(Alice, Bob, N) ->
-    %%Given
-    given_client_is_inactive(Alice),
-
-    timer:sleep(1000),
-
-    %%When
-    Msgs = gen_msgs(<<"Hi, Alice">>, N),
-    send_msgs(Bob, Alice, Msgs),
-    timer:sleep(timer:seconds(1)),
-    Msgs.
-
-send_msgs(From, To, Msgs) ->
-    [escalus:send(From, escalus_stanza:chat_to(To, Msg)) ||
-     Msg <- Msgs].
-
-
-gen_msgs(Prefix, N) ->
-    [<<Prefix/binary, (integer_to_binary(I))/binary>> || I <- lists:seq(1, N)].
-
-given_client_is_inactive(Alice) ->
-    escalus:send(Alice, csi_stanza(<<"inactive">>)).
-
-csi_stanza(Name) ->
-    #xmlel{name = Name,
-           attrs = [{<<"xmlns">>, <<"urn:xmpp:csi:0">>}]}.
+assert_event(Event, Client) ->
+    instrument_helper:assert_one(
+      Event, #{host_type => host_type()},
+      fun(#{count := 1, jid := JID}) -> jid:to_binary(JID) =:= escalus_client:full_jid(Client) end).

@@ -1,20 +1,24 @@
 -module(mod_keystore_mnesia).
+-behaviour(mod_keystore_backend).
 
 -export([init/2,
+         stop/1,
          init_ram_key/1,
          get_key/1]).
 
+-ignore_xref([get_key/1, init/2, init_ram_key/1]).
+
 -include("mod_keystore.hrl").
 
--spec init(Domain, Opts) -> ok when
-      Domain :: jid:server(),
-      Opts :: [any()].
-init(_Domain, _Opts) ->
-    mnesia:create_table(key,
-                        [{ram_copies, [node()]},
-                         {type, set},
-                         {attributes, record_info(fields, key)}]),
-    mnesia:add_table_copy(key, node(), ram_copies),
+-spec init(mongooseim:host_type(), gen_mod:module_opts()) -> ok.
+init(_HostType, _Opts) ->
+    mongoose_mnesia:create_table(key,
+        [{ram_copies, [node()]}, {type, set},
+         {attributes, record_info(fields, key)}]),
+    ok.
+
+-spec stop(mongooseim:host_type()) -> ok.
+stop(_HostType) ->
     ok.
 
 -spec init_ram_key(ProposedKey) -> Result when

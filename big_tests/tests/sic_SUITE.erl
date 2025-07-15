@@ -1,14 +1,12 @@
 %%%===================================================================
 %%% @copyright (C) 2011, Erlang Solutions Ltd.
-%%% @doc Suite for testing mod_offline* modules
+%%% @doc Suite for testing mod_sic module
 %%% @end
 %%%===================================================================
 
 -module(sic_SUITE).
--compile(export_all).
+-compile([export_all, nowarn_export_all]).
 
--include_lib("escalus/include/escalus.hrl").
--include_lib("common_test/include/ct.hrl").
 -include_lib("exml/include/exml.hrl").
 
 -define(NS_SIC, <<"urn:xmpp:sic:1">>).
@@ -16,6 +14,8 @@
 -import(distributed_helper, [mim/0,
                              require_rpc_nodes/1,
                              rpc/4]).
+
+-import(domain_helper, [host_type/0]).
 
 %%%===================================================================
 %%% Suite configuration
@@ -28,8 +28,7 @@ all_tests() ->
     [user_sic, forbidden_user_sic].
 
 groups() ->
-    G = [{mod_sic_tests, [sequence], all_tests()}],
-    ct_helper:repeat_all_until_all_ok(G).
+    [{mod_sic_tests, [sequence], all_tests()}].
 
 suite() ->
     require_rpc_nodes([mim]) ++ escalus:suite().
@@ -46,14 +45,15 @@ end_per_suite(Config) ->
     escalus:delete_users(Config, escalus:get_users([alice, bob])),
     escalus:end_per_suite(Config).
 
-init_per_group(mod_offline_tests, Config) ->
-    start_module(mod_sic, []),
-    Config;
+init_per_group(mod_sic_tests, Config) ->
+    Config1 = dynamic_modules:save_modules(host_type(), Config),
+    dynamic_modules:ensure_modules(host_type(), [{mod_sic, config_parser_helper:default_mod_config(mod_sic)}]),
+    Config1;
 init_per_group(_GroupName, Config) ->
     Config.
 
-end_per_group(mod_offline_tests, _Config) ->
-    stop_module(mod_sic);
+end_per_group(mod_sic_tests, Config) ->
+    dynamic_modules:restore_modules(Config);
 end_per_group(_GroupName, _Config) ->
     ok.
 
@@ -106,18 +106,10 @@ is_sic_response() ->
 %%% Helpers
 %%%===================================================================
 
-start_module(ModuleName, Options) ->
-    Args = [ct:get_config({hosts, mim, domain}), ModuleName, Options],
-    rpc(mim(), gen_mod, start_module, Args).
-
-stop_module(ModuleName) ->
-    Args = [ct:get_config({hosts, mim, domain}), ModuleName],
-    rpc(mim(), gen_mod, stop_module, Args).
-
 sic_iq_get() ->
     escalus_stanza:iq(<<"get">>, [#xmlel{
         name = <<"address">>,
-        attrs = [{<<"xmlns">>, ?NS_SIC}],
+        attrs = #{<<"xmlns">> => ?NS_SIC},
         children = []
     }]).
 

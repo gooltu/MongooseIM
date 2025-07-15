@@ -5,7 +5,7 @@
 %%%===================================================================
 
 -module(offline_SUITE).
--compile(export_all).
+-compile([export_all, nowarn_export_all]).
 
 -include_lib("escalus/include/escalus.hrl").
 -include_lib("common_test/include/ct.hrl").
@@ -15,6 +15,11 @@
 
 -define(DELAY_NS, <<"urn:xmpp:delay">>).
 -define(AFFILIATION_NS, <<"urn:xmpp:muclight:0#affiliations">>).
+-define(NS_FEATURE_MSGOFFLINE,  <<"msgoffline">>).
+
+-import(domain_helper, [host_type/0]).
+-import(mongoose_helper, [wait_for_n_offline_messages/2]).
+-import(config_parser_helper, [mod_config/2, mod_config_with_auto_backend/1]).
 
 %%%===================================================================
 %%% Suite configuration
@@ -26,7 +31,8 @@ all() ->
      {group, with_groupchat}].
 
 all_tests() ->
-    [offline_message_is_stored_and_delivered_at_login,
+    [disco_info_sm,
+     offline_message_is_stored_and_delivered_at_login,
      error_message_is_not_stored,
      groupchat_message_is_not_stored,
      headline_message_is_not_stored,
@@ -51,41 +57,59 @@ suite() ->
 %%% Init & teardown
 %%%===================================================================
 
-init_per_suite(C) -> escalus:init_per_suite(C).
-end_per_suite(C) -> escalus_fresh:clean(), escalus:end_per_suite(C).
+init_per_suite(Config0) ->
+    HostType = domain_helper:host_type(),
+    Config1 = dynamic_modules:save_modules(HostType, Config0),
+    dynamic_modules:ensure_modules(HostType, create_config()),
+    escalus:init_per_suite(Config1).
+
+-spec create_config() -> [{mod_offline, gen_mod:module_opts()}].
+create_config() ->
+    [{mod_offline, mod_config_with_auto_backend(mod_offline)}].
+
+end_per_suite(Config) ->
+    escalus_fresh:clean(),
+    dynamic_modules:restore_modules(Config),
+    escalus:end_per_suite(Config).
 
 init_per_group(with_groupchat, C) ->
-    OfflineBackend = mongoose_helper:get_backend_name(mod_offline_backend),
-    MucLightBackend = mongoose_helper:mnesia_or_rdbms_backend(),
-    Modules = [{mod_offline, [{store_groupchat_messages, true},
-                              {backend, OfflineBackend}]},
-               {mod_muc_light, [{backend, MucLightBackend}]}],
-    Config = dynamic_modules:save_modules(domain(), C),
-    dynamic_modules:ensure_modules(domain(), Modules),
+    Config = dynamic_modules:save_modules(host_type(), C),
+    dynamic_modules:ensure_modules(host_type(), with_groupchat_modules()),
     Config;
 init_per_group(chatmarkers, C) ->
-    case mongoose_helper:is_rdbms_enabled(domain())of
-        false ->  {skip, require_rdbms};
-    true->
-        Modules = [{mod_offline, [{store_groupchat_messages, true},
-                                  {backend, rdbms}]},
-                   {mod_offline_chatmarkers,[{store_groupchat_messages, true}]},
-                   {mod_muc_light, [{backend, rdbms}]}],
-        Config = dynamic_modules:save_modules(domain(), C),
-        dynamic_modules:ensure_modules(domain(), Modules),
-        Config
+    case mongoose_helper:is_rdbms_enabled(host_type()) of
+        false ->
+            {skip, require_rdbms};
+        true ->
+            Config = dynamic_modules:save_modules(host_type(), C),
+            dynamic_modules:ensure_modules(host_type(), chatmarkers_modules()),
+            Config
     end;
-
 init_per_group(_, C) -> C.
+
+with_groupchat_modules() ->
+    OfflineBackend = mongoose_helper:get_backend_name(host_type(), mod_offline),
+    MucLightBackend = mongoose_helper:mnesia_or_rdbms_backend(),
+    [{mod_offline, config_with_groupchat_modules(OfflineBackend)},
+     {mod_muc_light, mod_config(mod_muc_light, #{backend => MucLightBackend})}].
+
+config_with_groupchat_modules(Backend) ->
+    mod_config(mod_offline, #{store_groupchat_messages => true,
+        backend => Backend}).
+
+chatmarkers_modules() ->
+    [{mod_smart_markers, config_parser_helper:default_mod_config(mod_smart_markers)},
+     {mod_offline, config_with_groupchat_modules(rdbms)},
+     {mod_offline_chatmarkers,
+      mod_config(mod_offline_chatmarkers,
+                 #{store_groupchat_messages => true})},
+     {mod_muc_light, mod_config(mod_muc_light, #{backend => rdbms})}].
 
 end_per_group(Group, C) when Group =:= chatmarkers;
                              Group =:= with_groupchat ->
-    dynamic_modules:restore_modules(domain(), C),
+    dynamic_modules:restore_modules(C),
     C;
 end_per_group(_, C) -> C.
-
-domain() ->
-    ct:get_config({hosts, mim, domain}).
 
 init_per_testcase(Name, C) -> escalus:init_per_testcase(Name, C).
 end_per_testcase(Name, C) -> escalus:end_per_testcase(Name, C).
@@ -94,12 +118,22 @@ end_per_testcase(Name, C) -> escalus:end_per_testcase(Name, C).
 %%% offline tests
 %%%===================================================================
 
+disco_info_sm(Config) ->
+    escalus:fresh_story(Config, [{alice, 1}],
+        fun(Alice) ->
+                AliceJid = escalus_client:short_jid(Alice),
+                escalus:send(Alice, escalus_stanza:disco_info(AliceJid)),
+                Stanza = escalus:wait_for_stanza(Alice),
+                escalus:assert(has_feature, [?NS_FEATURE_MSGOFFLINE], Stanza),
+                escalus:assert(is_stanza_from, [AliceJid], Stanza)
+        end).
+
 offline_message_is_stored_and_delivered_at_login(Config) ->
     Story =
         fun(FreshConfig, Alice, Bob) ->
                 logout(FreshConfig, Bob),
-                escalus:send(Alice, escalus_stanza:chat_to
-                                      (Bob, <<"msgtxt">>)),
+                escalus:send(Alice, escalus_stanza:chat_to(Bob, <<"msgtxt">>)),
+                wait_for_n_offline_messages(Bob, 1),
                 NewBob = login_send_presence(FreshConfig, bob),
                 Stanzas = escalus:wait_for_stanzas(NewBob, 2),
                 escalus_new_assert:mix_match
@@ -222,9 +256,11 @@ max_offline_messages_reached(Config) ->
                 logout(FreshConfig, Alice),
                 each_client_sends_messages_to(BobsResources, Alice,
                                               {count, MessagesPerResource}),
+                wait_for_n_offline_messages(Alice, MessagesPerResource * 4),
 
                 send_message(B1, Alice, ?MAX_OFFLINE_MSGS+1),
-                Packet = escalus:wait_for_stanza(B1, 5000),
+
+                Packet = escalus:wait_for_stanza(B1),
                 escalus:assert(is_error, [<<"wait">>, <<"resource-constraint">>], Packet),
 
                 NewAlice = login_send_presence(FreshConfig, alice),
@@ -340,12 +376,6 @@ has_element_with_ns(Stanza, Element, NS) ->
 %%%===================================================================
 %%% Helpers
 %%%===================================================================
-wait_for_n_offline_messages(Client, N) ->
-    LUser = escalus_utils:jid_to_lower(escalus_client:username(Client)),
-    LServer = escalus_utils:jid_to_lower(escalus_client:server(Client)),
-    WaitFn = fun() -> mongoose_helper:total_offline_messages({LUser, LServer}) end,
-    mongoose_helper:wait_until(WaitFn, N).
-
 logout(Config, User) ->
     mongoose_helper:logout_user(Config, User).
 
@@ -376,13 +406,13 @@ make_chat_text(I) ->
     <<"Hi, Offline ", Number/binary>>.
 
 make_message_with_expiry(Target, Expiry, Text) ->
-    ExpiryBin = list_to_binary(integer_to_list(Expiry)),
+    ExpiryBin = integer_to_binary(Expiry),
     Stanza = escalus_stanza:chat_to(Target, Text),
     #xmlel{children = Children} = Stanza,
     ExpiryElem = #xmlel{name = <<"x">>,
-                        attrs = [{<<"xmlns">>, <<"jabber:x:expire">>},
-                                 {<<"seconds">>, ExpiryBin}]},
+                        attrs = #{<<"xmlns">> => <<"jabber:x:expire">>,
+                                  <<"seconds">> => ExpiryBin}},
     Stanza#xmlel{children = [ExpiryElem | Children]}.
 
-repeat(L,0) -> [];
-repeat(L,N) -> L ++ repeat(L, N-1).
+repeat(_L, 0) -> [];
+repeat(L, N) -> L ++ repeat(L, N-1).

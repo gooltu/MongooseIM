@@ -1,11 +1,11 @@
 %%%===================================================================
 %%% @doc Common listener/router for modules that use Cowboy.
 %%%
-%%% The 'modules' configuration option should be a list of
+%%% The `modules' configuration option should be a list of
 %%% {Host, BasePath, Module} or {Host, BasePath, Module, Opts} tuples,
 %%% where a Host of "_" will match any host.
 %%%
-%%% A 'middlewares' configuration option may be specified to configure
+%%% A `middlewares' configuration option may be specified to configure
 %%% Cowboy middlewares.
 %%%
 %%% Modules may export the following function to configure Cowboy
@@ -16,12 +16,13 @@
 %%% @end
 %%%===================================================================
 -module(ejabberd_cowboy).
--behavior(gen_server).
--behavior(cowboy_middleware).
+-behaviour(gen_server).
+-behaviour(cowboy_middleware).
+-behaviour(mongoose_listener).
 
-%% ejabberd_listener API
--export([socket_type/0,
-         start_listener/2]).
+%% mongoose_listener API
+-export([listener_spec/1,
+         instrumentation/1]).
 
 %% cowboy_middleware API
 -export([execute/2]).
@@ -32,60 +33,50 @@
          handle_call/3,
          handle_cast/2,
          handle_info/2,
-         code_change/3,
          terminate/2]).
 
 %% helper for internal use
 -export([ref/1, reload_dispatch/1]).
--export([start_cowboy/2, stop_cowboy/1]).
+-export([start_cowboy/4, start_cowboy/2, stop_cowboy/1]).
+
+-ignore_xref([behaviour_info/1, process/1, ref/1, reload_dispatch/1, start_cowboy/2,
+              start_cowboy/4, start_link/1, stop/0, stop_cowboy/1]).
 
 -include("mongoose.hrl").
--type options()  :: [any()].
--type path() :: iodata().
--type paths() :: [path()].
--type route() :: {path() | paths(), module(), options()}.
--type implemented_result() :: [route()].
 
--export_type([options/0]).
--export_type([path/0]).
--export_type([route/0]).
--export_type([implemented_result/0]).
-
--callback cowboy_router_paths(path(), options()) -> implemented_result().
-
--record(cowboy_state, {ref, opts = []}).
+-record(cowboy_state, {ref :: atom(), opts :: mongoose_listener:options()}).
 
 %%--------------------------------------------------------------------
-%% ejabberd_listener API
+%% mongoose_listener API
 %%--------------------------------------------------------------------
 
-socket_type() ->
-    independent.
+-spec instrumentation(mongoose_listener:options()) -> [mongoose_instrument:spec()].
+instrumentation(#{handlers := Handlers}) ->
+    [Spec || #{module := Module} <- Handlers,
+             Spec <- mongoose_http_handler:instrumentation(Module)].
 
-start_listener({Port, IP, tcp}=Listener, Opts) ->
-    Ref = ref(Listener),
-    ChildSpec = {Listener, {?MODULE, start_link,
-                            [#cowboy_state{ref = Ref, opts = Opts}]},
-                 transient, infinity, worker, [?MODULE]},
-    {ok, Pid} = supervisor:start_child(ejabberd_listeners, ChildSpec),
-    TransportOpts = gen_mod:get_opt(transport_options, Opts, []),
-    TransportOptsMap = maps:from_list(TransportOpts),
-    TransportOptsMap2 = TransportOptsMap#{socket_opts => [{port, Port}, {ip, IP}]},
-    TransportOptsMap3 = maybe_insert_max_connections(TransportOptsMap2, Opts),
-    Opts2 = gen_mod:set_opt(transport_options, Opts, TransportOptsMap3),
-    {ok, _} = start_cowboy(Ref, Opts2),
-    {ok, Pid}.
+-spec listener_spec(mongoose_listener:options()) -> supervisor:child_spec().
+listener_spec(Opts) ->
+    ListenerId = mongoose_listener:listener_id(Opts),
+    Ref = ref(ListenerId),
+    ChildSpec = #{id => ListenerId,
+                  start => {?MODULE, start_link, [#cowboy_state{ref = Ref, opts = Opts}]},
+                  restart => transient,
+                  shutdown => infinity,
+                  modules => [?MODULE]},
+    ChildSpec.
 
 reload_dispatch(Ref) ->
     gen_server:call(Ref, reload_dispatch).
 
-%% @doc gen_server for handling shutdown when started via ejabberd_listener
+%% @doc gen_server for handling shutdown when started via mongoose_listener
 -spec start_link(_) -> 'ignore' | {'error', _} | {'ok', pid()}.
 start_link(State) ->
     gen_server:start_link(?MODULE, State, []).
 
-init(State) ->
+init(#cowboy_state{ref = Ref, opts = Opts} = State) ->
     process_flag(trap_exit, true),
+    {ok, _} = start_cowboy(Ref, Opts),
     {ok, State}.
 
 handle_call(reload_dispatch, _From, #cowboy_state{ref = Ref, opts = Opts} = State) ->
@@ -99,9 +90,6 @@ handle_cast(_Request, State) ->
 
 handle_info(_Info, State) ->
     {noreply, State}.
-
-code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.
 
 terminate(_Reason, State) ->
     stop_cowboy(State#cowboy_state.ref).
@@ -117,10 +105,10 @@ handler({Port, IP, tcp}) ->
 -spec execute(cowboy_req:req(), cowboy_middleware:env()) ->
     {ok, cowboy_req:req(), cowboy_middleware:env()}.
 execute(Req, Env) ->
-    case ejabberd_config:get_local_option(cowboy_server_name) of
-        undefined ->
+    case mongoose_config:lookup_opt(http_server_name) of
+        {error, not_found} ->
             {ok, Req, Env};
-        ServerName ->
+        {ok, ServerName} ->
             {ok, cowboy_req:set_resp_header(<<"server">>, ServerName, Req), Env}
     end.
 
@@ -128,33 +116,35 @@ execute(Req, Env) ->
 %% Internal Functions
 %%--------------------------------------------------------------------
 
+-spec start_cowboy(atom(), mongoose_listener:options()) -> {ok, pid()} | {error, any()}.
 start_cowboy(Ref, Opts) ->
-    {Retries, SleepTime} = gen_mod:get_opt(retries, Opts, {20, 50}),
-    do_start_cowboy(Ref, Opts, Retries, SleepTime).
+    start_cowboy(Ref, Opts, 20, 50).
 
-
-do_start_cowboy(Ref, Opts, 0, _) ->
+-spec start_cowboy(atom(), mongoose_listener:options(),
+                   Retries :: non_neg_integer(), SleepTime :: non_neg_integer()) ->
+          {ok, pid()} | {error, any()}.
+start_cowboy(Ref, Opts, 0, _) ->
     do_start_cowboy(Ref, Opts);
-do_start_cowboy(Ref, Opts, Retries, SleepTime) ->
+start_cowboy(Ref, Opts, Retries, SleepTime) ->
     case do_start_cowboy(Ref, Opts) of
         {error, eaddrinuse} ->
             timer:sleep(SleepTime),
-            do_start_cowboy(Ref, Opts, Retries - 1, SleepTime);
+            start_cowboy(Ref, Opts, Retries - 1, SleepTime);
         Other ->
             Other
     end.
 
+-spec do_start_cowboy(atom(), mongoose_listener:options()) -> {ok, pid()} | {error, any()}.
 do_start_cowboy(Ref, Opts) ->
-    SSLOpts = gen_mod:get_opt(ssl, Opts, undefined),
-    NumAcceptors = gen_mod:get_opt(num_acceptors, Opts, 100),
-    TransportOpts0 = gen_mod:get_opt(transport_options, Opts, #{}),
-    TransportOpts = TransportOpts0#{num_acceptros => NumAcceptors},
-    Modules = gen_mod:get_opt(modules, Opts),
-    Dispatch = cowboy_router:compile(get_routes(Modules)),
-    ProtocolOpts = [{env, [{dispatch, Dispatch}]} |
-                    gen_mod:get_opt(protocol_options, Opts, [])],
-    ok = trails_store(Modules),
-    case catch start_http_or_https(SSLOpts, Ref, TransportOpts, ProtocolOpts) of
+    #{ip_tuple := IPTuple, port := Port, handlers := Handlers0,
+      transport := TransportOpts0, protocol := ProtocolOpts0} = Opts,
+    Handlers = [ Handler#{ip_tuple => IPTuple, port => Port, proto => tcp} || Handler <- Handlers0 ],
+    Routes = mongoose_http_handler:get_routes(Handlers),
+    Dispatch = cowboy_router:compile(Routes),
+    ProtocolOpts = ProtocolOpts0#{env => #{dispatch => Dispatch}},
+    TransportOpts = TransportOpts0#{socket_opts => [{port, Port}, {ip, IPTuple}]},
+    store_trails(Routes),
+    case catch start_http_or_https(Opts, Ref, TransportOpts, ProtocolOpts) of
         {error, {{shutdown,
                   {failed_to_start_child, ranch_acceptors_sup,
                    {{badmatch, {error, eaddrinuse}}, _ }}}, _}} ->
@@ -163,24 +153,22 @@ do_start_cowboy(Ref, Opts) ->
             Result
     end.
 
-start_http_or_https(undefined, Ref, TransportOpts, ProtocolOpts) ->
-    cowboy_start_http(Ref, TransportOpts, ProtocolOpts);
-start_http_or_https(SSLOpts, Ref, TransportOpts, ProtocolOpts) ->
-    SSLOptsWithVerifyFun = maybe_set_verify_fun(SSLOpts),
-    FilteredSSLOptions = filter_options(ignored_ssl_options(), SSLOptsWithVerifyFun),
-    SocketOptsWithSSL = maps:get(socket_opts, TransportOpts) ++ FilteredSSLOptions,
-    cowboy_start_https(Ref, TransportOpts#{socket_opts => SocketOptsWithSSL}, ProtocolOpts).
+start_http_or_https(#{tls := TLSOpts, hibernate_after := HibernateAfter},
+                    Ref, TransportOpts, ProtocolOpts) ->
+    SocketOpts = maps:get(socket_opts, TransportOpts),
+    SSLOpts = just_tls:make_server_opts(TLSOpts),
+    SocketOptsWithSSL = SocketOpts ++ SSLOpts ++ [{hibernate_after, HibernateAfter}],
+    cowboy_start_https(Ref, TransportOpts#{socket_opts := SocketOptsWithSSL}, ProtocolOpts);
+start_http_or_https(#{}, Ref, TransportOpts, ProtocolOpts) ->
+    cowboy_start_http(Ref, TransportOpts, ProtocolOpts).
 
 cowboy_start_http(Ref, TransportOpts, ProtocolOpts) ->
-    ProtoOpts = add_common_middleware(make_env_map(maps:from_list(ProtocolOpts))),
+    ProtoOpts = add_common_middleware(ProtocolOpts),
     cowboy:start_clear(Ref, TransportOpts, ProtoOpts).
 
 cowboy_start_https(Ref, TransportOpts, ProtocolOpts) ->
-    ProtoOpts = add_common_middleware(make_env_map(maps:from_list(ProtocolOpts))),
+    ProtoOpts = add_common_middleware(ProtocolOpts),
     cowboy:start_tls(Ref, TransportOpts, ProtoOpts).
-
-make_env_map(Map = #{ env := Env }) ->
-    Map#{ env => maps:from_list(Env) }.
 
 % We need to insert our middleware just before `cowboy_handler`,
 % so the injected response header is taken into account.
@@ -190,129 +178,36 @@ add_common_middleware(Map = #{ middlewares := Middlewares }) ->
 add_common_middleware(Map) ->
     Map#{ middlewares => [cowboy_router, ?MODULE, cowboy_handler] }.
 
-reload_dispatch(Ref, Opts) ->
-    Dispatch = cowboy_router:compile(get_routes(gen_mod:get_opt(modules, Opts))),
+reload_dispatch(Ref, #{handlers := Handlers}) ->
+    Dispatch = cowboy_router:compile(mongoose_http_handler:get_routes(Handlers)),
     cowboy:set_env(Ref, dispatch, Dispatch).
 
 stop_cowboy(Ref) ->
     cowboy:stop_listener(Ref).
 
-
 ref(Listener) ->
     Ref = handler(Listener),
     ModRef = [?MODULE_STRING, <<"_">>, Ref],
-    list_to_atom(binary_to_list(iolist_to_binary(ModRef))).
-
-%% @doc Cowboy will search for a matching Host, then for a matching Path.  If no
-%% Path matches, Cowboy will not search for another matching Host.  So, we must
-%% merge all Paths for each Host, add any wildcard Paths to each Host, and
-%% ensure that the wildcard Host is listed last.  A dict would be slightly
-%% easier to use here, but a proplist ensures that the user can influence Host
-%% ordering if other wildcards like "[...]" are used.
-get_routes(Modules) ->
-    Routes = get_routes(Modules, []),
-    WildcardPaths = proplists:get_value('_', Routes, []),
-    Merge = fun(Paths) -> Paths ++ WildcardPaths end,
-    Merged = lists:keymap(Merge, 2, proplists:delete('_', Routes)),
-    Final = Merged ++ [{'_', WildcardPaths}],
-    ?DEBUG("Configured Cowboy Routes: ~p", [Final]),
-    Final.
-
-get_routes([], Routes) ->
-    Routes;
-get_routes([{Host, BasePath, Module} | Tail], Routes) ->
-    get_routes([{Host, BasePath, Module, []} | Tail], Routes);
-get_routes([{Host, BasePath, Module, Opts} | Tail], Routes) ->
-    %% ejabberd_config tries to expand the atom '_' as a Macro, which fails.
-    %% To work around that, use "_" instead and translate it to '_' here.
-    CowboyHost = case Host of
-        "_" -> '_';
-        _ -> Host
-    end,
-    ensure_loaded_module(Module),
-    Paths = proplists:get_value(CowboyHost, Routes, []) ++
-    case erlang:function_exported(Module, cowboy_router_paths, 2) of
-        true -> Module:cowboy_router_paths(BasePath, Opts);
-        _ -> [{BasePath, Module, Opts}]
-    end,
-    get_routes(Tail, lists:keystore(CowboyHost, 1, Routes, {CowboyHost, Paths})).
-
-ensure_loaded_module(Module) ->
-    case code:ensure_loaded(Module) of
-        {module, Module} ->
-            ok;
-        Other ->
-            erlang:error(#{issue => ensure_loaded_module_failed,
-                           modue => Module,
-                           reason => Other})
-    end.
-
-ignored_ssl_options() ->
-    %% these options should be ignored if they creep into ssl section
-    [port, ip, max_connections, verify_mode].
-
-filter_options(IgnoreOpts, [Opt | Opts]) when is_atom(Opt) ->
-    case lists:member(Opt, IgnoreOpts) of
-        true  -> filter_options(IgnoreOpts, Opts);
-        false -> [Opt | filter_options(IgnoreOpts, Opts)]
-    end;
-filter_options(IgnoreOpts, [Opt | Opts]) when tuple_size(Opt) >= 1 ->
-    case lists:member(element(1, Opt), IgnoreOpts) of
-        true  -> filter_options(IgnoreOpts, Opts);
-        false -> [Opt | filter_options(IgnoreOpts, Opts)]
-    end;
-filter_options(_, []) ->
-    [].
-
-maybe_set_verify_fun(SSLOptions) ->
-    case proplists:get_value(verify_mode, SSLOptions, undefined) of
-        undefined ->
-            SSLOptions;
-        Mode ->
-            Fun = just_tls:verify_fun(Mode),
-            lists:keystore(verify_fun, 1, SSLOptions, {verify_fun, Fun})
-    end.
-
-% This functions is for backward compatibility, as previous default config
-% used max_connections tuple for all ejabberd_cowboy listeners
-maybe_insert_max_connections(TransportOpts, Opts) ->
-    Key = max_connections,
-    case gen_mod:get_opt(Key, Opts, undefined) of
-        undefined ->
-            TransportOpts;
-        Value ->
-            TransportOpts#{Key => Value}
-    end.
+    binary_to_atom(iolist_to_binary(ModRef)).
 
 %% -------------------------------------------------------------------
 %% @private
 %% @doc
-%% Store trails, this need for generate swagger documentation
-%% Add to Trails each of modules where used trails behaviour
-%% The modules must be added into `mongooseim.cfg`in `swagger` section
+%% Store trails, this is needed to generate swagger documentation.
+%% Add to Trails each of modules where the trails behaviour is used.
+%% The modules must be added into `mongooseim.toml' in the `swagger' section.
 %% @end
 %% -------------------------------------------------------------------
-trails_store(Modules) ->
+store_trails(Routes) ->
+    AllModules = lists:usort(lists:flatmap(fun({_Host, HostRoutes}) ->
+                                                   [Module || {_Path, Module, _Opts} <- HostRoutes]
+                                           end, Routes)),
+    TrailModules = lists:filter(fun(Module) ->
+                                        mongoose_lib:is_exported(Module, trails, 0)
+                                end, AllModules),
     try
-        trails:store(trails:trails(collect_trails(Modules, [])))
-    catch Class:Exception ->
-        ?WARNING_MSG("Trails Call: [~p:~p/0] catched ~p:~p~n", [?MODULE, trails_store, Class, Exception])
+        trails:store(trails:trails(TrailModules))
+    catch Class:Reason:Stacktrace ->
+              ?LOG_WARNING(#{what => store_trails_failed,
+                             class => Class, reason => Reason, stacktrace => Stacktrace})
     end.
-
-%% -------------------------------------------------------------------
-%% @private
-%% @doc
-%% Helper of store trails for collect trails modules
-%% @end
-%% -------------------------------------------------------------------
-collect_trails([], Acc) ->
-    Acc;
-collect_trails([{Host, BasePath, Module} | T], Acc) ->
-    collect_trails([{Host, BasePath, Module, []} | T], Acc);
-collect_trails([{_, _, Module, _} | T], Acc) ->
-    case erlang:function_exported(Module, trails, 0) of
-      true ->
-          collect_trails(T, [Module | Acc]);
-      _ ->
-          collect_trails(T, Acc)
-  end.

@@ -1,4 +1,4 @@
-%%% @doc Common Test Example Common Test Hook module.
+%%% @doc this hook performs server purity check after every suite
 -module(ct_mongoose_hook).
 
 %% @doc Add the following line in your *.spec file
@@ -30,29 +30,27 @@
 -import(distributed_helper, [mim/0,
                              rpc/4]).
 
--record(state, {print_group, print_case}).
-
 %% @doc Return a unique id for this CTH.
 id(_Opts) ->
     "ct_mongoose_hook_001".
 
 %% @doc Always called before any other callback function. Use this to initiate
 %% any common state.
-init(_Id, Opts) ->
-    Unfolded = proplists:unfold(Opts),
-    PrintGroup = proplists:get_value(print_group, Unfolded, false),
-    PrintCase = proplists:get_value(print_case, Unfolded, false),
-    {ok, #state{print_group = PrintGroup, print_case = PrintCase }}.
+init(_Id, _Opts) ->
+    domain_helper:insert_configured_domains(),
+    {ok, #{}}.
 
 %% @doc Called before init_per_suite is called.
-pre_init_per_suite(Suite,Config,State) ->
+pre_init_per_suite(Suite, [_|_] = Config, State) ->
     Preset = case application:get_env(common_test, test_label) of
                  {ok, Value} -> Value;
                  _ -> undefined
              end,
-    NewConfig = [{preset, Preset} | Config],
-    maybe_print_on_server(true, "SUITE", Suite, "starting"),
-    {NewConfig, State}.
+    DataDir = path_helper:data_dir(Suite, Config),
+    NewConfig = [{preset, Preset}, {mim_data_dir, DataDir} | Config],
+    {NewConfig, State};
+pre_init_per_suite(_Suite, SkipOrFail, State) ->
+    {SkipOrFail, State}.
 
 %% @doc Called after init_per_suite.
 post_init_per_suite(_Suite, _Config, Return, State) ->
@@ -64,13 +62,11 @@ pre_end_per_suite(_Suite,Config,State) ->
 
 %% @doc Called after end_per_suite.
 post_end_per_suite(Suite, Config, Return, State) ->
-    maybe_print_on_server(true, "SUITE", Suite, "finished"),
     check_server_purity(Suite, Config),
     {Return, State}.
 
 %% @doc Called before each init_per_group.
-pre_init_per_group(Group,Config,State) ->
-    maybe_print_on_server(State#state.print_group, "GROUP", Group, "starting"),
+pre_init_per_group(_Group,Config,State) ->
     {Config, State}.
 
 %% @doc Called after each init_per_group.
@@ -82,18 +78,15 @@ pre_end_per_group(_Group,Config,State) ->
     {Config, State}.
 
 %% @doc Called after each end_per_group.
-post_end_per_group(Group,_Config,Return,State) ->
-    maybe_print_on_server(State#state.print_group, "GROUP", Group, "finished"),
+post_end_per_group(_Group,_Config,Return,State) ->
     {Return, State}.
 
 %% @doc Called before each test case.
-pre_init_per_testcase(TC,Config,State) ->
-    maybe_print_on_server(State#state.print_case, "TEST CASE", TC, "starting"),
+pre_init_per_testcase(_TC,Config,State) ->
     {Config, State}.
 
 %% @doc Called after each test case.
-post_end_per_testcase(TC,_Config,Return,State) ->
-    maybe_print_on_server(State#state.print_case, "TEST CASE", TC, "finished"),
+post_end_per_testcase(_TC,_Config,Return,State) ->
     {Return, State}.
 
 %% @doc Called after post_init_per_suite, post_end_per_suite, post_init_per_group,
@@ -108,12 +101,8 @@ on_tc_skip(_TC, _Reason, State) ->
 
 %% @doc Called when the scope of the CTH is done
 terminate(_State) ->
+    domain_helper:delete_configured_domains(),
     ok.
-
-maybe_print_on_server(false, _, _, _) ->
-    ok;
-maybe_print_on_server(true, Event, EventName, EvenType) ->
-    rpc(mim(), error_logger, warning_msg, ["====== ~s ~p ~s", [Event, EventName, EvenType]]).
 
 check_server_purity(Suite, Config) ->
     case escalus_server:name(Config) of
@@ -132,14 +121,14 @@ check_server_purity(Suite, Config) ->
 
 do_check_server_purity(_Suite) ->
     Funs = [fun check_sessions/0,
-        fun check_registered_users/0,
-        fun check_registered_users_count/0,
-        fun check_offline_messages/0,
-        fun check_active_users/0,
-        fun check_privacy/0,
-        fun check_private/0,
-        fun check_vcard/0,
-        fun check_roster/0],
+            fun check_registered_users/0,
+            fun check_registered_users_count/0,
+            fun check_offline_messages/0,
+            fun check_active_users/0,
+            fun check_privacy/0,
+            fun check_private/0,
+            fun check_vcard/0,
+            fun check_roster/0],
     lists:flatmap(fun(F) -> F() end, Funs).
 
 check_sessions() ->
@@ -149,16 +138,21 @@ check_sessions() ->
     end.
 
 check_registered_users() ->
-    case rpc(mim(), ejabberd_auth, dirty_get_registered_users, []) of
-        [] -> [];
-        Users -> [{registered_users, Users}]
-    end.
+    lists:flatmap(fun check_registered_users/1, mim_domains()).
 
 check_registered_users_count() ->
-    D = ct:get_config({hosts, mim, domain}),
-    case rpc(mim(), ejabberd_auth, get_vh_registered_users_number, [D]) of
+    lists:flatmap(fun check_registered_users_count/1, mim_domains()).
+
+check_registered_users(Domain) ->
+    case rpc(mim(), ejabberd_auth, get_vh_registered_users, [Domain]) of
+        [] -> [];
+        Users -> [{registered_users, Domain, Users}]
+    end.
+
+check_registered_users_count(Domain) ->
+    case rpc(mim(), ejabberd_auth, get_vh_registered_users_number, [Domain]) of
         0 -> [];
-        N -> [{registered_users_count, N}]
+        N -> [{registered_users_count, Domain, N}]
     end.
 
 check_offline_messages() ->
@@ -179,15 +173,6 @@ check_vcard() ->
 check_roster() ->
     generic_via_mongoose_helper(total_roster_items).
 
-check_carboncopy() ->
-    D = ct:get_config({hosts, mim, domain}),
-    case rpc(mim(), gen_mod, is_loaded, [D, mod_carboncopy]) of
-        true ->
-            do_check_carboncopy();
-        _ ->
-            []
-    end.
-
 generic_via_mongoose_helper(Function) ->
     case mongoose_helper:Function() of
         0 -> [];
@@ -195,8 +180,6 @@ generic_via_mongoose_helper(Function) ->
         N -> [{Function, N}]
     end.
 
-do_check_carboncopy() ->
-    case rpc(mim(), ets, tab2list, [carboncopy]) of
-        [] -> [];
-        L -> [{remaining_carbon_copy_settings, L}]
-    end.
+mim_domains() ->
+    [ct:get_config({hosts, mim, domain}),
+     ct:get_config({hosts, mim, secondary_domain})].

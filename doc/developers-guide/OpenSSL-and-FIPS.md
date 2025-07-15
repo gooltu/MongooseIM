@@ -15,15 +15,16 @@ Currently known incompatible features are:
 Make sure the option `--enable-fips` is specified for `configure` command.
 If you want to use a different OpenSSL than the default one, specify the option `--with-ssl=PATH_TO_YOUR_OPENSSL` as well.
 Here's an example of a command for building Erlang/OTP with kerl:
-```
-KERL_CONFIGURE_OPTIONS="--enable-fips" ./kerl build 21.3 21.3-fips
+
+```bash
+KERL_CONFIGURE_OPTIONS="--enable-fips" ./kerl build 23.3 23.3-fips
 ```
 
 ### Building MongooseIM with a custom OpenSSL
 
 If you want to use a custom OpenSSL, please export the CFLAGS and LDFLAGS env vars pointing to a FIPS compliant OpenSSL before running `./rebar3 compile` or `make rel`.
 
-```
+```bash
 OPENSSL_LIB=~/openssl/lib #put your path here
 OPENSSL_INC=~/openssl/inc #put your path here
 
@@ -33,8 +34,8 @@ export CFLAGS="-I$OPENSSL_INC"
 
 ### How to enable/disable FIPS mode
 
-Find `etc/app.config` in the release directory. 
-FIPS mode is an option of the crypto application. 
+Find `etc/app.config` in the release directory.
+FIPS mode is an option of the crypto application.
 In order to enable/disable it, add the following section to `app.config`:
 
 ```erlang
@@ -45,15 +46,15 @@ where `Value` is either `true` or `false`.
 
 ## How to check if the FIPS mode is enabled
 
-#### Log message
+### Log message
 
 When MongooseIM starts, it prints the following log message if FIPS mode is enabled
 
 ```
-2015-02-25 14:30:54.501 [warning] <0.242.0>@mongoose_fips:do_notify:37 FIPS mode enabled
+2015-02-25 14:30:54.501 [warning] <0.242.0>@mongoose_fips:notify:15 FIPS mode enabled
 ```
 
-#### Run-time check
+### Run-time check
 
 Run the following function in the MongooseIM console:
 
@@ -62,13 +63,14 @@ mongoose_fips:status().
 ```
 
 The function returns:
+
+* not_supported - erlang compiled without fips support
 * not_enabled - fips_mode is not set to true in etc/app.config
 * enabled - fips_mode is set to true in etc/app.config
-* not_supported - erlang compiled without fips support
 
 ### Cipher suites difference
 
-A test using a `cipher_suites_test.sh` script (available in the tools directory) can be performed on MongooseIM with FIPS mode enabled and disabled. 
+A test using a `cipher_suites_test.sh` script (available in the tools directory) can be performed on MongooseIM with FIPS mode enabled and disabled.
 We've used `OpenSSL 1.0.1j-fips`.
 
 Here are all the cipher suites available when the **FIPS** mode is **enabled** (the list may vary for different openssl versions):
@@ -103,4 +105,3 @@ Here are all the cipher suites available when the **FIPS** mode is **disabled** 
 * ECDHE-RSA-RC4-SHA
 * RC4-SHA
 * RC4-MD5
-

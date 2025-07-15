@@ -26,72 +26,53 @@
 -module(gen_mod).
 -author('alexey@process-one.net').
 
--type dep_arguments() :: proplists:proplist().
--type deps_list() :: [
-                      {module(), dep_arguments(), gen_mod_deps:hardness()} |
-                      {module(), gen_mod_deps:hardness()} |
-                      {service, mongoose_service:service()}
-                     ].
-
--type module_deps_list() :: [
-                              {module(), dep_arguments(), gen_mod_deps:hardness()} |
-                              {module(), gen_mod_deps:hardness()}
-                             ].
-
--type service_deps_list() :: [atom()].
-
--export_type([deps_list/0]).
+-export_type([key_path/0, opt_key/0, opt_value/0, module_opts/0]).
 
 -export([
-         % Modules start & stop
-         start/0,
+         % Modules start & stop, do NOT use in the tests, use mongoose_modules API instead
          start_module/3,
-         start_backend_module/2,
-         start_backend_module/3,
          stop_module/2,
-         stop_module_keep_config/2,
-         reload_module/3,
+         does_module_support/2,
+         config_spec/1,
          % Get/set opts by host or from a list
          get_opt/2,
          get_opt/3,
-         get_opt/4,
-         set_opt/3,
+         lookup_module_opt/3,
+         get_module_opt/3,
          get_module_opt/4,
-         set_module_opt/4,
-         set_module_opts/3,
          get_module_opts/2,
-         make_subhosts/2,
-         get_opt_subhost/3,
-         get_opt_subhost/4,
-         get_module_opt_subhost/3,
-         % Get/set opts by subhost
-         get_module_opt_by_subhost/4,
-         set_module_opt_by_subhost/4,
+         get_loaded_module_opts/2,
 
+         loaded_modules/0,
          loaded_modules/1,
+         loaded_modules_with_opts/0,
          loaded_modules_with_opts/1,
-         opts_for_module/2,
+         hosts_with_module/1,
+         hosts_and_opts_with_module/1,
          get_module_proc/2,
          is_loaded/2,
          get_deps/3]).
 
 -export([is_app_running/1]). % we have to mock it in some tests
 
+-ignore_xref([loaded_modules_with_opts/0, loaded_modules_with_opts/1,
+              hosts_with_module/1, hosts_and_opts_with_module/1]).
+
 -include("mongoose.hrl").
 
--record(ejabberd_module, {
-          module_host, % {module(), jid:server()},
-          opts % list()
-         }).
+-type module_feature() :: atom().
+-type host_type() :: mongooseim:host_type().
+-type key_path() :: mongoose_config:key_path().
+-type opt_key() :: atom().
+-type opt_value() :: mongoose_config:value().
+-type module_opts() ::  #{opt_key() => opt_value()}.
 
-%% -export([behaviour_info/1]).
-%% behaviour_info(callbacks) ->
-%%     [{start, 2},
-%%      {stop, 1}];
-%% behaviour_info(_Other) ->
-%%     undefined.
--callback start(Host :: jid:server(), Opts :: list()) -> any().
--callback stop(Host :: jid:server()) -> any().
+-callback start(host_type(), module_opts()) -> any().
+-callback stop(host_type()) -> any().
+-callback hooks(host_type()) -> gen_hook:hook_list().
+-callback supported_features() -> [module_feature()].
+-callback config_spec() -> mongoose_config_spec:config_section().
+-callback instrumentation(host_type()) -> [mongoose_instrument:spec()].
 
 %% Optional callback specifying module dependencies.
 %% The dependent module can specify parameters with which the dependee should be
@@ -101,46 +82,43 @@
 %% case of cycle (in that case soft dependency may be started after the
 %% dependent module).
 %%
-%% -callback deps(Host :: jid:server(), Opts :: proplists:list()) ->
-%%     deps_list().
+%% TODO: think about getting rid of HostType param for deps/2 interface, currently
+%% it's used only by global_distrib modules (see mod_global_distrib_utils:deps/4
+%% function).
+-callback deps(host_type(), module_opts()) -> gen_mod_deps:deps().
 
--spec start() -> 'ok'.
-start() ->
-    ets:new(ejabberd_modules, [named_table, public, {keypos, #ejabberd_module.module_host},
-                               {read_concurrency, true}]),
-    ok.
+-optional_callbacks([hooks/1, config_spec/0, supported_features/0, instrumentation/1, deps/2]).
 
+%% @doc This function should be called by mongoose_modules only.
+%% To start a new module at runtime, use mongoose_modules:ensure_module/3 instead.
+-spec start_module(host_type(), module(), module_opts()) -> {ok, term()}.
+start_module(HostType, Module, Opts) ->
+    assert_loaded(HostType, Module),
+    start_module_for_host_type(HostType, Module, Opts).
 
--spec start_module(Host :: jid:server(),
-                   Module :: module(),
-                   Opts :: [any()]) -> {ok, term()} | {error, already_started}.
-start_module(Host, Module, Opts) ->
-    case is_loaded(Host, Module) of
-        true -> {error, already_started};
-        false -> start_module_for_host(Host, Module, Opts)
-    end.
-
-start_module_for_host(Host, Module, Opts0) ->
+start_module_for_host_type(HostType, Module, Opts) ->
     {links, LinksBefore} = erlang:process_info(self(), links),
-    Opts = clear_opts(Module, Opts0),
-    set_module_opts_mnesia(Host, Module, Opts),
-    ets:insert(ejabberd_modules, #ejabberd_module{module_host = {Module, Host}, opts = Opts}),
     try
-        lists:map(fun mongoose_service:assert_loaded/1, get_required_services(Host, Module, Opts)),
-        Res = Module:start(Host, Opts),
+        lists:map(fun mongoose_service:assert_loaded/1,
+                  get_required_services(HostType, Module, Opts)),
+        check_dynamic_domains_support(HostType, Module),
+        run_for_instrumentation(HostType, fun mongoose_instrument:set_up/1, Module),
+        Res = Module:start(HostType, Opts),
+        run_for_hooks(HostType, fun gen_hook:add_handlers/1, Module),
         {links, LinksAfter} = erlang:process_info(self(), links),
         case lists:sort(LinksBefore) =:= lists:sort(LinksAfter) of
             true -> ok;
             false ->
-                TravisInfo = "fail_ci_build=true ",
+                %% TODO: grepping for "fail_ci_build=true" is bad option
+                %% for ci testing, rework this.
+                CIInfo = "fail_ci_build=true ",
                 %% Note for programmers:
                 %% Never call start_link directly from your_module:start/2 function!
                 %% The process will be killed if we start modules remotely or in shell
-                ?ERROR_MSG("msg=unexpected_links ~s"
-                            " links_before=~p links_after=~p",
-                           [TravisInfo, LinksBefore, LinksAfter])
+                ?LOG_ERROR(#{what => unexpected_links, ci_info => CIInfo,
+                             links_before => LinksBefore, links_after => LinksAfter})
         end,
-        ?DEBUG("Module ~p started for ~p.", [Module, Host]),
+        ?LOG_DEBUG(#{what => module_started, module => Module, host_type => HostType}),
         % normalise result
         case Res of
             {ok, R} -> {ok, R};
@@ -148,23 +126,48 @@ start_module_for_host(Host, Module, Opts0) ->
         end
     catch
         Class:Reason:StackTrace ->
-            del_module_mnesia(Host, Module),
-            ets:delete(ejabberd_modules, {Module, Host}),
             ErrorText = io_lib:format("Problem starting the module ~p for "
-                                      "host ~p~n options: ~p~n ~p: ~p~n~p",
-                                      [Module, Host, Opts, Class, Reason,
+                                      "host_type ~p~n options: ~p~n ~p: ~p~n~p",
+                                      [Module, HostType, Opts, Class, Reason,
                                        StackTrace]),
-            ?CRITICAL_MSG(ErrorText, []),
+            ?LOG_CRITICAL(#{what => module_start_failed, module => Module,
+                            host_type => HostType, opts => Opts, class => Class,
+                            reason => Reason, stacktrace => StackTrace}),
             case is_mim_or_ct_running() of
                 true ->
                     erlang:raise(Class, Reason, StackTrace);
                 false ->
-                    ?CRITICAL_MSG("mongooseim initialization was aborted "
-                                  "because a module start failed.~n"
-                                  "The trace is ~p.", [StackTrace]),
+                    ?LOG_CRITICAL(#{what => mim_initialization_aborted,
+                                    text => <<"mongooseim initialization was aborted "
+                                              "because a module start failed.">>,
+                                    class => Class, reason => Reason,
+                                    stacktrace => StackTrace}),
                     timer:sleep(3000),
                     erlang:halt(string:substr(lists:flatten(ErrorText),
                                               1, 199))
+            end
+    end.
+
+run_for_hooks(HostType, Fun, Module) ->
+    case erlang:function_exported(Module, hooks, 1) of
+        true -> Fun(Module:hooks(HostType));
+        false -> ok
+    end.
+
+run_for_instrumentation(HostType, Fun, Module) ->
+    case erlang:function_exported(Module, instrumentation, 1) of
+        true -> Fun(Module:instrumentation(HostType));
+        false -> ok
+    end.
+
+check_dynamic_domains_support(HostType, Module) ->
+    case lists:member(HostType, ?MYHOSTS) of
+        true -> ok;
+        false ->
+            case gen_mod:does_module_support(Module, dynamic_domains) of
+                true -> ok;
+                false ->
+                    error({Module, HostType, dynamic_domains_feature_is_not_supported})
             end
     end.
 
@@ -174,19 +177,7 @@ is_mim_or_ct_running() ->
     orelse is_common_test_running().
 
 is_common_test_running() ->
-    try
-        is_list(ct:get_status())
-    catch _:_ ->
-        false
-    end.
-
--spec start_backend_module(module(), list()) -> any().
-start_backend_module(Module, Opts) ->
-    start_backend_module(Module, Opts, []).
-
-start_backend_module(Module, Opts, TrackedFuncs) ->
-    Backend = gen_mod:get_opt(backend, Opts, mnesia),
-    backend_module:create(Module, Backend, TrackedFuncs).
+    whereis(ct_util_server) =/= undefined.
 
 -spec is_app_running(_) -> boolean().
 is_app_running(AppName) ->
@@ -194,308 +185,185 @@ is_app_running(AppName) ->
     Timeout = 15000,
     lists:keymember(AppName, 1, application:which_applications(Timeout)).
 
+%% @doc This function should be called by mongoose_modules only.
+%% To stop a module at runtime, use mongoose_modules:ensure_stopped/2 instead.
+-spec stop_module(host_type(), module()) -> ok.
+stop_module(HostType, Module) ->
+    assert_loaded(HostType, Module),
+    stop_module_for_host_type(HostType, Module).
 
-%% @doc Stop the module in a host, and forget its configuration.
--spec stop_module(jid:server(), module()) ->
-    {ok, list()} | {error, not_loaded} | {error, term()}.
-stop_module(Host, Module) ->
-    case is_loaded(Host, Module) of
-        false -> {error, not_loaded};
-        true -> stop_module_for_host(Host, Module)
-    end.
-
-stop_module_for_host(Host, Module) ->
-    case stop_module_keep_config(Host, Module) of
-        {ok, Opts} ->
-            case del_module_mnesia(Host, Module) of
-                {atomic, _} -> {ok, Opts};
-                E -> {error, E}
-            end;
-        {error, E} ->
-            {error, E}
-    end.
-
-%% @doc Stop the module in a host, but keep its configuration. As the module
-%% configuration is kept in the Mnesia local_config table, when ejabberd is
-%% restarted the module will be started again. This function is useful when
-%% ejabberd is being stopped and it stops all modules.
--spec stop_module_keep_config(jid:server(), module()) -> {error, term()} | {ok, list()}.
-stop_module_keep_config(Host, Module) ->
-    Opts = opts_for_module(Host, Module),
-    case catch Module:stop(Host) of
-        {'EXIT', Reason} ->
-            ?ERROR_MSG("~p", [Reason]),
-            {error, Reason};
+-spec stop_module_for_host_type(host_type(), module()) -> ok.
+stop_module_for_host_type(HostType, Module) ->
+    run_for_hooks(HostType, fun gen_hook:delete_handlers/1, Module),
+    try Module:stop(HostType) of
         {wait, ProcList} when is_list(ProcList) ->
-            lists:foreach(fun wait_for_process/1, ProcList),
-            ets:delete(ejabberd_modules, {Module, Host}),
-            {ok, Opts};
+            lists:foreach(fun wait_for_process/1, ProcList);
         {wait, Process} ->
-            wait_for_process(Process),
-            ets:delete(ejabberd_modules, {Module, Host}),
-            {ok, Opts};
+            wait_for_process(Process);
         _ ->
-            ets:delete(ejabberd_modules, {Module, Host}),
-            {ok, Opts}
+            ok
+    catch Class:Reason:Stacktrace ->
+            ?LOG_ERROR(#{what => module_stopping_failed,
+                         host_type => HostType, stop_module => Module,
+                         class => Class, reason => Reason, stacktrace => Stacktrace}),
+            erlang:raise(Class, Reason, Stacktrace)
+    end,
+    run_for_instrumentation(HostType, fun mongoose_instrument:tear_down/1, Module).
+
+-spec does_module_support(module(), module_feature()) -> boolean().
+does_module_support(Module, Feature) ->
+    lists:member(Feature, get_supported_features(Module)).
+
+-spec get_supported_features(module()) -> [module_feature()].
+get_supported_features(Module) ->
+    %% if module is not loaded, erlang:function_exported/3 returns false
+    case erlang:function_exported(Module, supported_features, 0) of
+        true -> apply(Module, supported_features, []);
+        false -> []
     end.
 
--spec reload_module(jid:server(), module(), [any()]) -> {ok, term()} | {error, already_started}.
-reload_module(Host, Module, Opts) ->
-    stop_module_keep_config(Host, Module),
-    start_module(Host, Module, Opts).
+-spec config_spec(module()) -> mongoose_config_spec:config_section().
+config_spec(Module) ->
+    Module:config_spec().
 
 -spec wait_for_process(atom() | pid() | {atom(), atom()}) -> 'ok'.
 wait_for_process(Process) ->
     MonitorReference = erlang:monitor(process, Process),
-    wait_for_stop(Process, MonitorReference).
-
-
--spec wait_for_stop(atom() | pid() | {atom(), atom()}, reference()) -> 'ok'.
-wait_for_stop(Process, MonitorReference) ->
-    receive
-        {'DOWN', MonitorReference, _Type, _Object, _Info} ->
-            ok
-    after 5000 ->
+    case wait_for_stop(MonitorReference) of
+        ok -> ok;
+        timeout ->
             catch exit(whereis(Process), kill),
-            wait_for_stop1(MonitorReference)
+            wait_for_stop(MonitorReference),
+            ok
     end.
 
-
--spec wait_for_stop1(reference()) -> 'ok'.
-wait_for_stop1(MonitorReference) ->
+-spec wait_for_stop(reference()) -> 'ok' | timeout.
+wait_for_stop(MonitorReference) ->
     receive
         {'DOWN', MonitorReference, _Type, _Object, _Info} ->
             ok
     after 5000 ->
-            ok
+            timeout
     end.
 
-get_opt(Opt, Opts) ->
-    case lists:keysearch(Opt, 1, Opts) of
-        false ->
-            throw({undefined_option, Opt});
-        {value, {_, Val}} ->
-            Val
+-spec get_opt(opt_key() | key_path(), module_opts()) -> opt_value().
+get_opt(Path, Opts) when is_list(Path), is_map(Opts) ->
+    lists:foldl(fun maps:get/2, Opts, Path);
+get_opt(Opt, Opts) when is_map(Opts) ->
+    maps:get(Opt, Opts).
+
+-spec get_opt(opt_key() | key_path(), module_opts(), opt_value()) -> opt_value().
+get_opt(Path, Opts, Default) ->
+    try
+        get_opt(Path, Opts)
+    catch
+        error:{badkey, _} -> Default
     end.
 
-get_opt(Opt, Opts, Default) ->
-    case lists:keysearch(Opt, 1, Opts) of
-        false ->
-            Default;
-        {value, {_, Val}} ->
-            Val
-    end.
+-spec lookup_module_opt(mongooseim:host_type(), module(), opt_key() | key_path()) ->
+          {ok, opt_value()} | {error, not_found}.
+lookup_module_opt(HostType, Module, Key) ->
+    mongoose_config:lookup_opt(config_path(HostType, Module, Key)).
 
-get_opt(Opt, Opts, F, Default) ->
-    case lists:keysearch(Opt, 1, Opts) of
-        false ->
-            Default;
-        {value, {_, Val}} ->
-            F(Val)
-    end.
+-spec get_module_opt(mongooseim:host_type(), module(), opt_key() | key_path(), opt_value()) ->
+          opt_value().
+get_module_opt(HostType, Module, Key, Default) ->
+    %% Fail in dev builds.
+    %% It protects against passing something weird as a Module argument
+    %% or against wrong argument order.
+    ?ASSERT_MODULE(Module),
+    mongoose_config:get_opt(config_path(HostType, Module, Key), Default).
 
--spec set_opt(_, [tuple()], _) -> [tuple(), ...].
-set_opt(Opt, Opts, Value) ->
-    lists:keystore(Opt, 1, Opts, {Opt, Value}).
+-spec get_module_opt(mongooseim:host_type(), module(), opt_key() | key_path()) -> opt_value().
+get_module_opt(HostType, Module, Key) ->
+    mongoose_config:get_opt(config_path(HostType, Module, Key)).
 
+-spec config_path(mongooseim:host_type(), module(), opt_key() | key_path()) -> key_path().
+config_path(HostType, Module, Path) when is_list(Path) ->
+    [{modules, HostType}, Module] ++ Path;
+config_path(HostType, Module, Key) when is_atom(Key) ->
+    [{modules, HostType}, Module, Key].
 
-get_module_opt(global, Module, Opt, Default) ->
-    [Value | Values] = [get_module_opt(Host, Module, Opt, Default)
-                        || Host <- ?MYHOSTS],
-    AllSame = lists:all(fun(Other) -> Other == Value end, Values),
-    case AllSame of
-        true ->
-            Value;
-        false ->
-            Default
-    end;
-get_module_opt(Host, Module, Opt, Default) ->
-    ModuleOpts = get_module_opts(Host, Module),
-    get_opt(Opt, ModuleOpts, Default).
+-spec get_module_opts(mongooseim:host_type(), module()) -> module_opts().
+get_module_opts(HostType, Module) ->
+    ?ASSERT_MODULE(Module),
+    mongoose_config:get_opt([{modules, HostType}, Module], #{}).
 
+-spec get_loaded_module_opts(mongooseim:host_type(), module()) -> module_opts().
+get_loaded_module_opts(HostType, Module) ->
+    mongoose_config:get_opt([{modules, HostType}, Module]).
 
-get_module_opts(Host, Module) ->
-    OptsList = ets:lookup(ejabberd_modules, {Module, Host}),
-    case OptsList of
-        [] -> [];
-        [#ejabberd_module{opts = Opts} | _] -> Opts
-    end.
+-spec loaded_modules() -> [module()].
+loaded_modules() ->
+    lists:usort(lists:flatmap(fun loaded_modules/1, ?ALL_HOST_TYPES)).
 
+-spec loaded_modules(host_type()) -> [module()].
+loaded_modules(HostType) ->
+    maps:keys(mongoose_config:get_opt({modules, HostType})).
 
--spec get_module_opt_by_subhost(
-        SubHost :: jid:server(),
-        Module :: module(),
-        Opt :: term(),
-        Default :: term()) -> term().
-get_module_opt_by_subhost(SubHost, Module, Opt, Default) ->
-    {ok, Host} = mongoose_subhosts:get_host(SubHost),
-    get_module_opt(Host, Module, Opt, Default).
+-spec loaded_modules_with_opts(host_type()) -> #{module() => module_opts()}.
+loaded_modules_with_opts(HostType) ->
+    mongoose_config:get_opt({modules, HostType}).
 
+-spec loaded_modules_with_opts() -> #{host_type() => #{module() => module_opts()}}.
+loaded_modules_with_opts() ->
+    maps:from_list([{HostType, loaded_modules_with_opts(HostType)} || HostType <- ?ALL_HOST_TYPES]).
 
-%% @doc Non-atomic! You have been warned.
--spec set_module_opt(jid:server(), module(), _Opt, _Value) -> boolean().
-set_module_opt(Host, Module, Opt, Value) ->
-    case ets:lookup(ejabberd_modules, {Module, Host}) of
-        [] ->
-            false;
-        [#ejabberd_module{opts = Opts}] ->
-            Updated = set_opt(Opt, Opts, Value),
-            set_module_opts(Host, Module, Updated)
-    end.
+-spec hosts_with_module(module()) -> [host_type()].
+hosts_with_module(Module) ->
+    [HostType || HostType <- ?ALL_HOST_TYPES, is_loaded(HostType, Module)].
 
-
-%% @doc Replaces all module options
--spec set_module_opts(ejabberd:server(), module(), _Opts) -> true.
-set_module_opts(Host, Module, Opts0) ->
-    Opts = proplists:unfold(Opts0),
-    ets:insert(ejabberd_modules,
-               #ejabberd_module{module_host = {Module, Host},
-                                opts = Opts}).
-
-
--spec set_module_opt_by_subhost(
-        SubHost :: jid:server(),
-        Module :: module(),
-        Opt :: term(),
-        Value :: term()) -> boolean().
-set_module_opt_by_subhost(SubHost, Module, Opt, Value) ->
-    {ok, Host} = mongoose_subhosts:get_host(SubHost),
-    set_module_opt(Host, Module, Opt, Value).
-
--spec make_subhost(Spec :: iodata() | unicode:charlist(), Host :: jid:server()) -> jid:server().
-make_subhost(Spec, Host) ->
-    re:replace(Spec, "@HOST@", Host, [global, {return, binary}]).
-
--spec make_subhosts(Spec :: iodata() | unicode:charlist(), Host :: jid:server()) -> [jid:server()].
-make_subhosts(Spec, Host) ->
-    [make_subhost(S, Host) || S <- expand_hosts(Spec)].
-
--spec expand_hosts(iodata()) -> [iodata()].
-expand_hosts(Spec) ->
-    case re:run(Spec, "@HOSTS@") of
-        nomatch -> [Spec];
-        {match, _} -> [re:replace(Spec, "@HOSTS@", Host) || Host <- ?MYHOSTS]
-    end.
-
--spec get_opt_subhost(jid:server(), list(), list() | binary()) -> jid:server().
-get_opt_subhost(Host, Opts, Default) ->
-    get_opt_subhost(Host, host, Opts, Default).
-
--spec get_opt_subhost(jid:server(), atom(), list(), list() | binary()) -> jid:server().
-get_opt_subhost(Host, OptName, Opts, Default) ->
-    Val = get_opt(OptName, Opts, Default),
-    make_subhost(Val, Host).
-
--spec get_module_opt_subhost(jid:server(), module(), list() | binary()) -> jid:server().
-get_module_opt_subhost(Host, Module, Default) ->
-    Spec = get_module_opt(Host, Module, host, Default),
-    make_subhost(Spec, Host).
-
--spec loaded_modules(jid:server()) -> [module()].
-loaded_modules(Host) ->
-    ets:select(ejabberd_modules,
-               [{#ejabberd_module{_ = '_', module_host = {'$1', Host}},
-                 [],
-                 ['$1']}]).
-
-
--spec loaded_modules_with_opts(jid:server()) -> [{module(), list()}].
-loaded_modules_with_opts(Host) ->
-    ets:select(ejabberd_modules,
-               [{#ejabberd_module{_ = '_', module_host = {'$1', Host},
-                                  opts = '$2'},
-                 [],
-                 [{{'$1', '$2'}}]}]).
-
--spec opts_for_module(ejabberd:server(), module()) -> list().
-opts_for_module(Host, Module) ->
-    case ets:select(ejabberd_modules,
-                    [{#ejabberd_module{_ = '_',
-                                       module_host = {Module, Host},
-                                       opts = '$1'},
-                      [],
-                      [{{'$1'}}]}]) of
-        [{Opts}] -> Opts;
-        []       -> []
-    end.
-
--spec set_module_opts_mnesia(jid:server(), module(), [any()]
-                            ) -> {'aborted', _} | {'atomic', _}.
-set_module_opts_mnesia(Host, Module, Opts0) ->
-    Opts = proplists:unfold(Opts0),
-    Modules = case ejabberd_config:get_local_option({modules, Host}) of
-        undefined ->
-            [];
-        Ls ->
-            Ls
-    end,
-    Modules1 = lists:keydelete(Module, 1, Modules),
-    Modules2 = [{Module, Opts} | Modules1],
-    ejabberd_config:add_local_option({modules, Host}, Modules2).
-
-
--spec del_module_mnesia(jid:server(), module()) -> {'aborted', _} | {'atomic', _}.
-del_module_mnesia(Host, Module) ->
-    Modules = case ejabberd_config:get_local_option({modules, Host}) of
-                  undefined ->
-                      [];
-                  Ls ->
-                      Ls
-              end,
-    case lists:keydelete(Module, 1, Modules) of
-        [] ->
-            ejabberd_config:del_local_option({modules, Host});
-        OtherModules ->
-            ejabberd_config:add_local_option({modules, Host}, OtherModules)
-    end.
+-spec hosts_and_opts_with_module(module()) -> #{host_type() => module_opts()}.
+hosts_and_opts_with_module(Module) ->
+    maps:from_list(
+      lists:flatmap(fun(HostType) ->
+                            case mongoose_config:lookup_opt([{modules, HostType}, Module]) of
+                                {error, not_found} -> [];
+                                {ok, Opts} -> [{HostType, Opts}]
+                            end
+                    end, ?ALL_HOST_TYPES)).
 
 -spec get_module_proc(binary() | string(), module()) -> atom().
+%% TODO:
+%% split this interface into 2:
+%%   * create_module_proc_name/2 - which can create new atoms by calling list_to_atom/1
+%%   * get_module_proc_name/2 - which should use safe list_to_existing_atom/1 function
 get_module_proc(Host, Base) when is_binary(Host) ->
     get_module_proc(binary_to_list(Host), Base);
 get_module_proc(Host, Base) ->
     list_to_atom(atom_to_list(Base) ++ "_" ++ Host).
 
-
--spec is_loaded(Host :: binary(), Module :: atom()) -> boolean().
-is_loaded(Host, Module) ->
-    ets:member(ejabberd_modules, {Module, Host}).
-
-
--spec clear_opts(atom(), list()) -> list().
-clear_opts(Module, Opts0) ->
-    Opts = proplists:unfold(Opts0),
-    %% the module has to be loaded,
-    %% otherwise the erlang:function_exported/3 returns false
-    code:ensure_loaded(Module),
-    case erlang:function_exported(Module, clean_opts, 1) of
+-spec assert_loaded(mongooseim:host_type(), module()) -> ok.
+assert_loaded(HostType, Module) ->
+    case is_loaded(HostType, Module) of
         true ->
-            Module:clean_opts(Opts);
-        _ ->
-            Opts
+            ok;
+        false ->
+            error(#{what => module_not_loaded,
+                    text => <<"Module missing from mongoose_config">>,
+                    host_type => HostType,
+                    module => Module})
     end.
 
--spec get_deps(Host :: jid:server(), Module :: module(),
-               Opts :: proplists:proplist()) -> module_deps_list().
-get_deps(Host, Module, Opts) ->
-    %% the module has to be loaded,
-    %% otherwise the erlang:function_exported/3 returns false
-    code:ensure_loaded(Module),
-    case erlang:function_exported(Module, deps, 2) of
+-spec is_loaded(HostType :: binary(), Module :: atom()) -> boolean().
+is_loaded(HostType, Module) ->
+    maps:is_key(Module, loaded_modules_with_opts(HostType)).
+
+-spec get_deps(host_type(), module(), module_opts()) -> gen_mod_deps:module_deps().
+get_deps(HostType, Module, Opts) ->
+    case mongoose_lib:is_exported(Module, deps, 2) of
         true ->
-            Deps = Module:deps(Host, Opts),
+            Deps = Module:deps(HostType, Opts),
             lists:filter(fun(D) -> element(1, D) =/= service end, Deps);
         _ ->
             []
     end.
 
--spec get_required_services(jid:server(), module(), proplists:proplist()) -> service_deps_list().
-get_required_services(Host, Module, Options) ->
-    %% the module has to be loaded,
-    %% otherwise the erlang:function_exported/3 returns false
-    code:ensure_loaded(Module),
-    case erlang:function_exported(Module, deps, 2) of
+-spec get_required_services(host_type(), module(), module_opts()) -> [mongoose_service:service()].
+get_required_services(HostType, Module, Options) ->
+    case mongoose_lib:is_exported(Module, deps, 2) of
         true ->
-            [Service || {service, Service} <- Module:deps(Host, Options)];
+            [Service || {service, Service} <- Module:deps(HostType, Options)];
         _ ->
             []
     end.

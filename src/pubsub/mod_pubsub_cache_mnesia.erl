@@ -1,6 +1,6 @@
 -module(mod_pubsub_cache_mnesia).
 
--behaviour(mod_pubsub_cache).
+-behaviour(mod_pubsub_cache_backend).
 
 -include("pubsub.hrl").
 -include("jlib.hrl").
@@ -28,7 +28,7 @@ stop() ->
                        Publisher :: jid:jid(),
                        Payload::mod_pubsub:payload()) -> ok | {error, Reason :: term()}.
 upsert_last_item(_ServerHost, Nidx, ItemId, Publisher, Payload) ->
-    CreatedAt = os:timestamp(),
+    CreatedAt = os:system_time(microsecond),
     try mnesia:dirty_write(
         #pubsub_last_item{
         nodeid = Nidx,
@@ -63,17 +63,9 @@ delete_last_item(_ServerHost, Nidx) ->
 
 %% ------------------------ Helpers ----------------------------
 
--spec create_table() -> ok | {error, Reason :: term()}.
+-spec create_table() -> ok.
 create_table() ->
-    QueryResult = mnesia:create_table(
-        pubsub_last_item,
-        [
-            {ram_copies, [node()]},
-            {attributes, record_info(fields, pubsub_last_item)}
-        ]),
-        mnesia:add_table_copy(pubsub_last_item, node(), ram_copies),
-        process_query_result(QueryResult).
-
-process_query_result({atomic, ok}) -> ok;
-process_query_result({aborted, {already_exists, pubsub_last_item}}) -> ok;
-process_query_result({aborted, Reason}) -> {error, Reason}.
+    mongoose_mnesia:create_table(pubsub_last_item,
+        [{ram_copies, [node()]},
+         {attributes, record_info(fields, pubsub_last_item)}]),
+    ok.

@@ -30,6 +30,8 @@
          mech_new/3,
          mech_step/2]).
 
+-ignore_xref([mech_new/3]).
+
 -deprecated({'_', '_', next_major_release}).
 
 -include("mongoose.hrl").
@@ -55,11 +57,12 @@ mechanism() ->
                Creds  :: mongoose_credentials:t(),
                Socket :: term()) -> {ok, state()}.
 mech_new(Host, Creds, _Socket) ->
+    Text = <<"The DIGEST-MD5 authentication mechanism is deprecated and "
+        " will be removed in the next release, please consider using"
+        " any of the SCRAM-SHA methods or equivalent instead.">>,
     mongoose_deprecations:log(
         {?MODULE, ?FUNCTION_NAME, ?FUNCTION_ARITY},
-        "The DIGEST-MD5 authentication mechanism is deprecated and "
-        " will be removed in the next release, please consider using"
-        " any of the SCRAM-SHA methods or equivalent instead.",
+        #{what => sasl_digest_md5_deprecated, text => Text},
         [{log_level, warning}]),
     {ok, #state{step = 1,
                 nonce = mongoose_bin:gen_from_crypto(),
@@ -88,38 +91,40 @@ mech_step(#state{step = 5,
     {ok, mongoose_credentials:extend(Creds, [{username, UserName},
                                              {authzid, AuthzId},
                                              {auth_module, AuthModule}])};
-mech_step(A, B) ->
-    ?DEBUG("SASL DIGEST: A ~p B ~p", [A, B]),
+mech_step(State, Msg) ->
+    ?LOG_DEBUG(#{what => sasl_digest_error_bad_protocol, sasl_state => State, message => Msg}),
     {error, <<"bad-protocol">>}.
 
 
 authorize_if_uri_valid(State, KeyVals, Nonce) ->
-    UserName = xml:get_attr_s(<<"username">>, KeyVals),
-    DigestURI = xml:get_attr_s(<<"digest-uri">>, KeyVals),
+    UserName = get_attr_s(KeyVals, <<"username">>),
+    DigestURI = get_attr_s(KeyVals, <<"digest-uri">>),
     case is_digesturi_valid(DigestURI, State#state.host) of
         false ->
-            ?DEBUG("User login not authorized because digest-uri "
-                   "seems invalid: ~p", [DigestURI]),
+            ?LOG_DEBUG(#{what => unauthorized_login, reason => invalid_digest_uri,
+                         message => DigestURI, user => UserName}),
             {error, <<"not-authorized">>, UserName};
         true ->
             maybe_authorize(UserName, KeyVals, Nonce, State)
     end.
 
 maybe_authorize(UserName, KeyVals, Nonce, State) ->
-    AuthzId = xml:get_attr_s(<<"authzid">>, KeyVals),
+    AuthzId = get_attr_s(KeyVals, <<"authzid">>),
     LServer = mongoose_credentials:lserver(State#state.creds),
-    case ejabberd_auth:get_passterm_with_authmodule(UserName, LServer) of
-        {false, _} ->
+    HostType = mongoose_credentials:host_type(State#state.creds),
+    JID = jid:make_bare(UserName, LServer),
+    case ejabberd_auth:get_passterm_with_authmodule(HostType, JID) of
+        false ->
             {error, <<"not-authorized">>, UserName};
         {Passwd, AuthModule} ->
             DigestGen = fun(PW) -> response(KeyVals, UserName, PW, Nonce, AuthzId,
                                             <<"AUTHENTICATE">>)
                         end,
-            Request = mongoose_credentials:extend(State#state.creds,
-                                                  [{username, UserName},
-                                                   {password, <<>>},
-                                                   {digest, xml:get_attr_s(<<"response">>, KeyVals)},
-                                                   {digest_gen, DigestGen}]),
+            ExtraCreds = [{username, UserName},
+                          {password, <<>>},
+                          {digest, get_attr_s(KeyVals, <<"response">>)},
+                          {digest_gen, DigestGen}],
+            Request = mongoose_credentials:extend(State#state.creds, ExtraCreds),
             do_authorize(UserName, KeyVals, Nonce, Passwd, Request, AuthzId, AuthModule, State)
     end.
 
@@ -137,10 +142,7 @@ do_authorize(UserName, KeyVals, Nonce, Passwd, Request, AuthzId, AuthModule, Sta
                          authzid = AuthzId,
                          creds = Result}};
       {error, not_authorized} ->
-            {error, <<"not-authorized">>, UserName};
-      {error, R} ->
-            ?DEBUG("authorize error: ~p", [R]),
-            {error, <<"not-authorized">>}
+            {error, <<"not-authorized">>, UserName}
     end.
 
 -spec parse(binary()) -> 'bad' | [{binary(), binary()}].
@@ -241,11 +243,11 @@ hex(<<N, Ns/binary>>, Res) ->
                AuthzId :: binary(),
                A2Prefix :: <<_:_*96>>) -> binary().
 response(KeyVals, User, Passwd, Nonce, AuthzId, A2Prefix) ->
-    Realm = xml:get_attr_s(<<"realm">>, KeyVals),
-    CNonce = xml:get_attr_s(<<"cnonce">>, KeyVals),
-    DigestURI = xml:get_attr_s(<<"digest-uri">>, KeyVals),
-    NC = xml:get_attr_s(<<"nc">>, KeyVals),
-    QOP = xml:get_attr_s(<<"qop">>, KeyVals),
+    Realm = get_attr_s(KeyVals, <<"realm">>),
+    CNonce = get_attr_s(KeyVals, <<"cnonce">>),
+    DigestURI = get_attr_s(KeyVals, <<"digest-uri">>),
+    NC = get_attr_s(KeyVals, <<"nc">>),
+    QOP = get_attr_s(KeyVals, <<"qop">>),
     A1 = case AuthzId of
              <<>> ->
                  list_to_binary(
@@ -267,3 +269,12 @@ response(KeyVals, User, Passwd, Nonce, AuthzId, A2Prefix) ->
         NC, <<":">>, CNonce, <<":">>, QOP, <<":">>,
         hex(crypto:hash(md5, A2))],
     hex(crypto:hash(md5, T)).
+
+-spec get_attr_s([{binary(), binary()}], binary()) -> binary().
+get_attr_s(Attrs, Name) ->
+    case lists:keyfind(Name, 1, Attrs) of
+        {Name, Value} ->
+            Value;
+        false ->
+            <<>>
+    end.

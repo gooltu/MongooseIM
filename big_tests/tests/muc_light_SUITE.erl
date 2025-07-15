@@ -2,8 +2,9 @@
 
 -include_lib("escalus/include/escalus.hrl").
 -include_lib("escalus/include/escalus_xmlns.hrl").
--include_lib("common_test/include/ct.hrl").
 -include_lib("exml/include/exml.hrl").
+-include_lib("eunit/include/eunit.hrl").
+-include("mam_helper.hrl").
 
 -export([ % service
          removing_users_from_server_triggers_room_destruction/1
@@ -47,11 +48,14 @@
          destroy_room_get_disco_items_empty/1,
          destroy_room_get_disco_items_one_left/1,
          set_config/1,
+         set_partial_config/1,
          set_config_with_custom_schema/1,
          deny_config_change_that_conflicts_with_schema/1,
          assorted_config_doesnt_lead_to_duplication/1,
          remove_and_add_users/1,
+         multiple_owner_change/1,
          explicit_owner_change/1,
+         explicit_owner_handover/1,
          implicit_owner_change/1,
          edge_case_owner_change/1,
          adding_wrongly_named_user_triggers_infinite_loop/1
@@ -74,6 +78,8 @@
 
 -import(escalus_ejabberd, [rpc/3]).
 -import(muc_helper, [foreach_occupant/3, foreach_recipient/2]).
+-import(distributed_helper, [subhost_pattern/1]).
+-import(domain_helper, [host_type/0, domain/0]).
 -import(muc_light_helper, [
                            bin_aff_users/1,
                            gc_message_verify_fun/3,
@@ -86,24 +92,26 @@
                            stanza_create_room/3,
                            create_room/6,
                            stanza_aff_set/2,
-                           default_config/0,
                            user_leave/3,
-                           set_mod_config/3
-]).
+                           stanza_blocking_set/1,
+                           default_config/1,
+                           default_schema/0,
+                           eq_bjid/2,
+                           pos_int/1,
+                           cache_name/0
+                          ]).
+-import(config_parser_helper, [mod_config/2]).
 
 -include("muc_light.hrl").
 
 -define(ROOM, <<"testroom">>).
 -define(ROOM2, <<"testroom2">>).
 
--define(MUCHOST, <<"muclight.localhost">>).
-
--define(CHECK_FUN, fun mod_muc_light_room:participant_limit_check/2).
--define(BACKEND, mod_muc_light_db_backend).
+-define(MUCHOST, (muc_light_helper:muc_host())).
 
 -type ct_aff_user() :: {EscalusClient :: escalus:client(), Aff :: atom()}.
 -type ct_aff_users() :: [ct_aff_user()].
--type ct_block_item() :: {What :: atom(), Action :: atom(), Who :: binary()}.
+-type ct_block_item() :: muc_light_helper:ct_block_item().
 -type verify_fun() :: muc_helper:verify_fun().
 -type xmlel() :: exml:element().
 
@@ -140,10 +148,10 @@ groups() ->
                                disco_rooms_created_page_infinity,
                                disco_rooms_empty_page_infinity,
                                disco_rooms_empty_page_1,
+                               unauthorized_stanza,
                                rooms_in_rosters,
                                rooms_in_rosters_doesnt_break_disco_info,
-                               no_roomname_in_schema_doesnt_break_disco_and_roster,
-                               unauthorized_stanza
+                               no_roomname_in_schema_doesnt_break_disco_and_roster
                               ]},
          {occupant, [sequence], [
                                  send_message,
@@ -167,11 +175,14 @@ groups() ->
                               destroy_room_get_disco_items_empty,
                               destroy_room_get_disco_items_one_left,
                               set_config,
+                              set_partial_config,
                               set_config_with_custom_schema,
                               deny_config_change_that_conflicts_with_schema,
                               assorted_config_doesnt_lead_to_duplication,
                               remove_and_add_users,
                               explicit_owner_change,
+                              explicit_owner_handover,
+                              multiple_owner_change,
                               implicit_owner_change,
                               edge_case_owner_change,
                               adding_wrongly_named_user_triggers_infinite_loop
@@ -197,20 +208,19 @@ suite() ->
 %%--------------------------------------------------------------------
 
 init_per_suite(Config) ->
-    Host = ct:get_config({hosts, mim, domain}),
-    {ok, _} = dynamic_modules:start(Host, mod_muc_light,
-                                    [{host, binary_to_list(?MUCHOST)},
-                                     {backend, mongoose_helper:mnesia_or_rdbms_backend()},
-                                     {rooms_in_rosters, true}]),
-    Config1 = escalus:init_per_suite(Config),
-    escalus:create_users(Config1, escalus:get_users([alice, bob, kate, mike])).
+    Config1 = dynamic_modules:save_modules(host_type(), Config),
+    Config2 = escalus:init_per_suite(Config1),
+    instrument_helper:start([{user_cache_lookup, #{host_type => host_type(),
+                                                   cache_name => cache_name()}}]),
+    escalus:create_users(Config2, escalus:get_users([alice, bob, kate, mike])).
 
 end_per_suite(Config) ->
-    Host = ct:get_config({hosts, mim, domain}),
-    muc_light_helper:clear_db(),
+    HostType = host_type(),
+    muc_light_helper:clear_db(HostType),
     Config1 = escalus:delete_users(Config, escalus:get_users([alice, bob, kate, mike])),
-    dynamic_modules:stop(Host, mod_muc_light),
-    escalus:end_per_suite(Config1).
+    dynamic_modules:restore_modules(Config),
+    escalus:end_per_suite(Config1),
+    instrument_helper:stop().
 
 init_per_group(_GroupName, Config) ->
     Config.
@@ -226,48 +236,87 @@ end_per_group(_GroupName, Config) ->
                               no_roomname_in_schema_doesnt_break_disco_and_roster,
                               custom_default_config_works]).
 
-init_per_testcase(removing_users_from_server_triggers_room_destruction = CN, Config) ->
-    set_default_mod_config(),
+init_per_testcase(removing_users_from_server_triggers_room_destruction = CaseName, Config) ->
+    dynamic_modules:ensure_modules(host_type(), required_modules(CaseName)),
     Config1 = escalus:create_users(Config, escalus:get_users([carol])),
     create_room(?ROOM, ?MUCHOST, carol, [], Config1, ver(1)),
-    escalus:init_per_testcase(CN, Config1);
-init_per_testcase(CaseName, Config) when CaseName =:= disco_features_with_mam;
-                                         CaseName =:= disco_info_with_mam ->
-    set_default_mod_config(),
-    dynamic_modules:start(domain(), mod_mam_muc,
-                          [{backend, rdbms},
-                           {host, binary_to_list(?MUCHOST)}]),
-    escalus:init_per_testcase(CaseName, Config);
-init_per_testcase(disco_rooms_rsm, Config) ->
-    set_default_mod_config(),
-    set_mod_config(rooms_per_page, 1, ?MUCHOST),
+    escalus:init_per_testcase(CaseName, Config1);
+init_per_testcase(disco_rooms_rsm = CaseName, Config) ->
+    dynamic_modules:ensure_modules(host_type(), required_modules(CaseName)),
     create_room(?ROOM, ?MUCHOST, alice, [bob, kate], Config, ver(1)),
     create_room(?ROOM2, ?MUCHOST, alice, [bob, kate], Config, ver(1)),
     escalus:init_per_testcase(disco_rooms_rsm, Config);
+init_per_testcase(CaseName, Config) when CaseName =:= disco_features_with_mam;
+                                         CaseName =:= disco_info_with_mam ->
+    case mam_helper:backend() of
+        disabled ->
+            {skip, "No MAM backend available"};
+        Backend ->
+            dynamic_modules:ensure_modules(host_type(), required_modules(CaseName, Backend)),
+            create_room(?ROOM, ?MUCHOST, alice, [bob, kate], Config, ver(1)),
+            escalus:init_per_testcase(CaseName, Config)
+    end;
 init_per_testcase(CaseName, Config) ->
-    set_default_mod_config(),
-    case lists:member(CaseName, ?CUSTOM_CONFIG_CASES) of
-        true -> set_custom_config(common_custom_config());
-        _ -> ok
-    end,
+    dynamic_modules:ensure_modules(host_type(), required_modules(CaseName)),
     case lists:member(CaseName, ?ROOM_LESS_CASES) of
         false -> create_room(?ROOM, ?MUCHOST, alice, [bob, kate], Config, ver(1));
         _ -> ok
     end,
     escalus:init_per_testcase(CaseName, Config).
 
-end_per_testcase(CaseName, Config) when CaseName =:= disco_features_with_mam;
-                                        CaseName =:= disco_info_with_mam ->
-    muc_light_helper:clear_db(),
-    dynamic_modules:stop(domain(), mod_mam_muc),
-    escalus:end_per_testcase(CaseName, Config);
 end_per_testcase(CaseName, Config) ->
-    case lists:member(CaseName, ?CUSTOM_CONFIG_CASES) of
-        true -> set_custom_config(default_schema_definition());
-        _ -> ok
-    end,
-    muc_light_helper:clear_db(),
+    muc_light_helper:clear_db(host_type()),
     escalus:end_per_testcase(CaseName, Config).
+
+%% Module configuration per test case
+
+required_modules(CaseName, MAMBackend) ->
+    [{mod_mam, mam_helper:config_opts(#{backend => MAMBackend,
+                                        muc => #{host => subhost_pattern(?MUCHOST)}})} |
+     common_required_modules(CaseName)].
+
+required_modules(CaseName) ->
+    [{mod_mam, stopped} | common_required_modules(CaseName)].
+
+common_required_modules(CaseName) ->
+    BasicOpts = maps:merge(common_muc_light_opts(), muc_light_opts(CaseName)),
+    Opts = maps:merge(BasicOpts, schema_opts(CaseName)),
+    [{mod_muc_light, mod_config(mod_muc_light, Opts)}].
+
+muc_light_opts(CaseName) when CaseName =:= disco_rooms_rsm;
+                              CaseName =:= disco_rooms_empty_page_1;
+                              CaseName =:= rooms_created_page_1 ->
+    #{rooms_per_page => 1};
+muc_light_opts(CaseName) when CaseName =:= disco_rooms_empty_page_infinity;
+                              CaseName =:= disco_rooms_created_page_infinity ->
+    #{rooms_per_page => infinity};
+muc_light_opts(all_can_configure) ->
+    #{all_can_configure => true};
+muc_light_opts(create_room_with_equal_occupants) ->
+    #{equal_occupants => true};
+muc_light_opts(rooms_per_user) ->
+    #{rooms_per_user => 1};
+muc_light_opts(max_occupants) ->
+    #{max_occupants => 1};
+muc_light_opts(block_user) ->
+    #{all_can_invite => true};
+muc_light_opts(blocking_disabled) ->
+    #{blocking => false};
+muc_light_opts(multiple_owner_change) ->
+    #{allow_multiple_owners => true};
+muc_light_opts(_) ->
+    #{}.
+
+schema_opts(CaseName) ->
+    case lists:member(CaseName, ?CUSTOM_CONFIG_CASES) of
+        true -> #{config_schema => custom_schema()};
+        false -> #{}
+    end.
+
+common_muc_light_opts() ->
+    #{backend => mongoose_helper:mnesia_or_rdbms_backend(),
+      cache_affs => config_parser_helper:default_config([modules, mod_muc_light, cache_affs]),
+      rooms_in_rosters => true}.
 
 %%--------------------------------------------------------------------
 %% MUC light tests
@@ -277,7 +326,7 @@ end_per_testcase(CaseName, Config) ->
 
 removing_users_from_server_triggers_room_destruction(Config) ->
     escalus:delete_users(Config, escalus:get_users([carol])),
-    {error, not_exists} = rpc(mod_muc_light_db_backend, get_info, [{?ROOM, ?MUCHOST}]).
+    {error, not_exists} = rpc(mod_muc_light_db_backend, get_info, [host_type(), {?ROOM, ?MUCHOST}]).
 
 %% ---------------------- Disco ----------------------
 
@@ -286,9 +335,10 @@ disco_service(Config) ->
             Server = escalus_client:server(Alice),
             escalus:send(Alice, escalus_stanza:service_discovery(Server)),
             Stanza = escalus:wait_for_stanza(Alice),
-            escalus:assert(has_service, [?MUCHOST], Stanza),
-            escalus:assert(is_stanza_from,
-              [ct:get_config({hosts, mim, domain})], Stanza)
+            Query = exml_query:subelement(Stanza, <<"query">>),
+            Item = exml_query:subelement_with_attr(Query, <<"jid">>, ?MUCHOST),
+            ?assertEqual(?NS_MUC_LIGHT, exml_query:attr(Item, <<"node">>)),
+            escalus:assert(is_stanza_from, [domain()], Stanza)
         end).
 
 disco_features(Config) ->
@@ -305,64 +355,62 @@ disco_features_story(Config, HasMAM) ->
             <<"conference">> = exml_query:path(Stanza, [{element, <<"query">>},
                                                         {element, <<"identity">>},
                                                         {attr, <<"category">>}]),
-            FeaturesExpected = [?NS_MUC_LIGHT] ++ case HasMAM of
-                true -> mam_helper:namespaces();
-                false -> []
-            end,
-            FeaturesExpected = exml_query:paths(Stanza, [{element, <<"query">>},
-                                                         {element, <<"feature">>},
-                                                         {attr, <<"var">>}]),
+            check_features(Stanza, HasMAM),
             escalus:assert(is_stanza_from, [?MUCHOST], Stanza)
         end).
 
 disco_info(Config) ->
-    disco_features_story(Config, false).
+    disco_info_story(Config, false).
 
 disco_info_with_mam(Config) ->
-    disco_features_story(Config, true).
+    disco_info_story(Config, true).
 
 disco_info_story(Config, HasMAM) ->
     escalus:story(Config, [{alice, 1}], fun(Alice) ->
-            DiscoStanza = escalus_stanza:to(escalus_stanza:iq_get(?NS_DISCO_INFO, []), ?ROOM),
+            RoomJID = room_bin_jid(?ROOM),
+            DiscoStanza = escalus_stanza:to(escalus_stanza:iq_get(?NS_DISCO_INFO, []), RoomJID),
             escalus:send(Alice, DiscoStanza),
             Stanza = escalus:wait_for_stanza(Alice),
-            FeaturesExpected = [?NS_MUC_LIGHT] ++ case HasMAM of
-                true -> mam_helper:namespaces();
-                false -> []
-            end,
-            FeaturesExpected = exml_query:paths(Stanza, [{element, <<"query">>},
-                                                         {element, <<"feature">>},
-                                                         {attr, <<"var">>}]),
-            escalus:assert(is_stanza_from, [?MUCHOST], Stanza)
+            check_features(Stanza, HasMAM),
+            escalus:assert(is_stanza_from, [RoomJID], Stanza)
         end).
+
+check_features(Stanza, HasMAM) ->
+    ExpectedFeatures = expected_features(HasMAM),
+    ActualFeatures = exml_query:paths(Stanza, [{element, <<"query">>},
+                                               {element, <<"feature">>},
+                                               {attr, <<"var">>}]),
+    ?assertEqual(ExpectedFeatures, ActualFeatures).
+
+expected_features(true) ->
+    lists:sort([?NS_MUC_LIGHT | mam_helper:namespaces()]);
+expected_features(false) ->
+    [?NS_MUC_LIGHT].
 
 %% The room list is empty. Rooms_per_page set to `infinity`
 disco_rooms_empty_page_infinity(Config) ->
     escalus:story(Config, [{alice, 1}], fun(Alice) ->
-        set_mod_config(rooms_per_page, infinity, ?MUCHOST),
         [] = get_disco_rooms(Alice)
         end).
 
 %% The room list is empty. Rooms_per_page set to 1
 disco_rooms_empty_page_1(Config) ->
     escalus:story(Config, [{alice, 1}], fun(Alice) ->
-        set_mod_config(rooms_per_page, 1, ?MUCHOST),
         [] = get_disco_rooms(Alice)
         end).
 
 %% There is one room created. Rooms_per_page set to 1
 disco_rooms_created_page_1(Config) ->
-    set_mod_config(rooms_per_page, 1, ?MUCHOST),
     escalus:story(Config, [{alice, 1}], fun verify_user_has_one_room/1).
 
 %% There is one room created. Rooms_per_page set to `infinity`
 disco_rooms_created_page_infinity(Config) ->
-    set_mod_config(rooms_per_page, infinity, ?MUCHOST),
     escalus:story(Config, [{alice, 1}], fun verify_user_has_one_room/1).
 
 disco_rooms(Config) ->
     escalus:story(Config, [{alice, 1}], fun(Alice) ->
-            {ok, {?ROOM2, ?MUCHOST}} = create_room(?ROOM2, ?MUCHOST, kate, [], Config, ver(0)),
+            MucHost = ?MUCHOST,
+            {ok, {?ROOM2, MucHost}} = create_room(?ROOM2, ?MUCHOST, kate, [], Config, ver(0)),
             %% we should get 1 room, Alice is not in the second one
             [Item] = get_disco_rooms(Alice),
             ProperJID = room_bin_jid(?ROOM),
@@ -382,7 +430,7 @@ disco_rooms_rsm(Config) ->
             ProperJID = exml_query:attr(Item, <<"jid">>),
 
             RSM = #xmlel{ name = <<"set">>,
-                          attrs = [{<<"xmlns">>, ?NS_RSM}],
+                          attrs = #{<<"xmlns">> => ?NS_RSM},
                           children = [ #xmlel{ name = <<"max">>,
                                                children = [#xmlcdata{ content = <<"10">> }] },
                                        #xmlel{ name = <<"before">> } ]  },
@@ -398,7 +446,7 @@ disco_rooms_rsm(Config) ->
             BadAfter = #xmlel{ name = <<"after">>,
                                children = [#xmlcdata{ content = <<"oops@muclight.localhost">> }] },
             RSM2 = #xmlel{ name = <<"set">>,
-                          attrs = [{<<"xmlns">>, ?NS_RSM}],
+                          attrs = #{<<"xmlns">> => ?NS_RSM},
                           children = [ #xmlel{ name = <<"max">>,
                                                children = [#xmlcdata{ content = <<"10">> }] },
                                        BadAfter ]  },
@@ -414,13 +462,13 @@ rooms_in_rosters(Config) ->
             AliceU = escalus_utils:jid_to_lower(escalus_client:username(Alice)),
             AliceS = escalus_utils:jid_to_lower(escalus_client:server(Alice)),
             escalus:send(Alice, escalus_stanza:roster_get()),
-            mongoose_helper:wait_until(
+            wait_helper:wait_until(
                 fun() ->
                     distributed_helper:rpc(
                         distributed_helper:mim(),
                         mod_roster,
                         get_user_rosters_length,
-                        [AliceU, AliceS])
+                        [host_type(), jid:make(AliceU, AliceS, <<>>)])
                 end, 1, #{time_left => timer:seconds(10)}),
             RosterResult = escalus:wait_for_stanza(Alice),
             escalus_assert:is_roster_result(RosterResult),
@@ -429,7 +477,7 @@ rooms_in_rosters(Config) ->
                        RosterResult, [{element, <<"query">>}, {element, <<"item">>}]),
             ProperJID = room_bin_jid(?ROOM),
             ProperJID = exml_query:attr(Item, <<"jid">>),
-            ProperName = proplists:get_value(roomname, default_config()),
+            ProperName = proplists:get_value(<<"roomname">>, default_config(default_schema())),
             ProperName = exml_query:attr(Item, <<"name">>),
             ProperVer = ver(1),
             ProperVer = exml_query:path(Item, [{element, <<"version">>}, cdata])
@@ -454,7 +502,8 @@ rooms_in_rosters_doesnt_break_disco_info(Config) ->
 no_roomname_in_schema_doesnt_break_disco_and_roster(Config) ->
     escalus:story(Config, [{alice, 1}], fun(Alice) ->
             [DiscoItem] = get_disco_rooms(Alice),
-            ?ROOM = exml_query:attr(DiscoItem, <<"name">>),
+            ?assert_equal_extra(?ROOM, exml_query:attr(DiscoItem, <<"name">>),
+                                #{elem => DiscoItem}),
 
             escalus:send(Alice, escalus_stanza:roster_get()),
             RosterResult = escalus:wait_for_stanza(Alice),
@@ -465,7 +514,8 @@ no_roomname_in_schema_doesnt_break_disco_and_roster(Config) ->
 
 unauthorized_stanza(Config) ->
     escalus:story(Config, [{alice, 1}, {kate, 1}], fun(Alice, Kate) ->
-            {ok, {?ROOM2, ?MUCHOST}} = create_room(?ROOM2, ?MUCHOST, kate, [], Config, ver(0)),
+            MucHost = ?MUCHOST,
+            {ok, {?ROOM2, MucHost}} = create_room(?ROOM2, ?MUCHOST, kate, [], Config, ver(0)),
             MsgStanza = escalus_stanza:groupchat_to(room_bin_jid(?ROOM2), <<"malicious">>),
             escalus:send(Alice, MsgStanza),
             escalus:assert(is_error, [<<"cancel">>, <<"item-not-found">>],
@@ -477,11 +527,14 @@ unauthorized_stanza(Config) ->
 
 send_message(Config) ->
     escalus:story(Config, [{alice, 1}, {bob, 1}, {kate, 1}], fun(Alice, Bob, Kate) ->
+            TS = instrument_helper:timestamp(),
             Msg = <<"Heyah!">>,
             Id = <<"MyID">>,
             Stanza = escalus_stanza:set_id(
                        escalus_stanza:groupchat_to(room_bin_jid(?ROOM), Msg), Id),
-            foreach_occupant([Alice, Bob, Kate], Stanza, gc_message_verify_fun(?ROOM, Msg, Id))
+            foreach_occupant([Alice, Bob, Kate], Stanza, gc_message_verify_fun(?ROOM, Msg, Id)),
+            assert_cache_miss_event(TS, 1, room_bin_jid(?ROOM)),
+            assert_cache_hit_event(TS, 2, room_bin_jid(?ROOM))
         end).
 
 change_subject(Config) ->
@@ -506,7 +559,6 @@ change_roomname(Config) ->
 
 all_can_configure(Config) ->
     escalus:story(Config, [{alice, 1}, {bob, 1}, {kate, 1}], fun(Alice, Bob, Kate) ->
-            set_mod_config(all_can_configure, true, ?MUCHOST),
             ConfigChange = [{<<"roomname">>, <<"new subject">>}],
             Stanza = stanza_config_set(?ROOM, ConfigChange),
             foreach_occupant([Alice, Bob, Kate], Stanza, config_msg_verify_fun(ConfigChange))
@@ -525,7 +577,7 @@ set_config_deny(Config) ->
 get_room_config(Config) ->
     escalus:story(Config, [{alice, 1}, {bob, 1}, {kate, 1}], fun(Alice, Bob, Kate) ->
             Stanza = stanza_config_get(?ROOM, <<"oldver">>),
-            ConfigKV = [{"version", binary_to_list(ver(1))} | standard_default_config()],
+            ConfigKV = [{<<"version">>, ver(1)} | default_config(default_schema())],
             foreach_occupant([Alice, Bob, Kate], Stanza, config_iq_verify_fun(ConfigKV)),
 
             %% Empty result when user has most recent version
@@ -538,7 +590,7 @@ get_room_config(Config) ->
 custom_default_config_works(Config) ->
     escalus:story(Config, [{alice, 1}, {bob, 1}, {kate, 1}], fun(Alice, Bob, Kate) ->
             Stanza = stanza_config_get(?ROOM, <<"oldver">>),
-            ConfigKV = [{"version", binary_to_list(ver(1))} | common_custom_config()],
+            ConfigKV = [{<<"version">>, ver(1)} | default_config(custom_schema())],
             foreach_occupant([Alice, Bob, Kate], Stanza, config_iq_verify_fun(ConfigKV))
         end).
 
@@ -558,10 +610,9 @@ get_room_occupants(Config) ->
 get_room_info(Config) ->
     escalus:story(Config, [{alice, 1}, {bob, 1}, {kate, 1}], fun(Alice, Bob, Kate) ->
             Stanza = stanza_info_get(?ROOM, <<"oldver">>),
-            ConfigKV = default_config(),
-            ConfigKVBin = [{list_to_binary(atom_to_list(Key)), Val} || {Key, Val} <- ConfigKV],
+            ConfigKV = default_config(default_schema()),
             foreach_occupant([Alice, Bob, Kate], Stanza,
-                             info_iq_verify_fun(?DEFAULT_AFF_USERS, ver(1), ConfigKVBin)),
+                             info_iq_verify_fun(?DEFAULT_AFF_USERS, ver(1), ConfigKV)),
 
             escalus:send(Bob, stanza_aff_get(?ROOM, ver(1))),
             IQRes = escalus:wait_for_stanza(Bob),
@@ -581,7 +632,7 @@ leave_room(Config) ->
               end, {?DEFAULT_AFF_USERS, []}, [Alice, Bob, Kate]),
 
             % Now we verify that room is removed from DB
-            {error, not_exists} = rpc(mod_muc_light_db_backend, get_info, [{?ROOM, ?MUCHOST}])
+            {error, not_exists} = rpc(mod_muc_light_db_backend, get_info, [host_type(), {?ROOM, ?MUCHOST}])
         end).
 
 change_other_aff_deny(Config) ->
@@ -597,7 +648,6 @@ change_other_aff_deny(Config) ->
             escalus:assert(is_error, [<<"cancel">>, <<"not-allowed">>],
                            escalus:wait_for_stanza(Kate)),
 
-            set_mod_config(all_can_invite, false, ?MUCHOST),
             AffUsersChanges3 = [{Mike, member}],
             escalus:send(Kate, stanza_aff_set(?ROOM, AffUsersChanges3)),
             escalus:assert(is_error, [<<"cancel">>, <<"not-allowed">>],
@@ -630,7 +680,6 @@ create_room_unique(Config) ->
 
 create_room_with_equal_occupants(Config) ->
     escalus:story(Config, [{bob, 1}], fun(Bob) ->
-            set_mod_config(equal_occupants, true, ?MUCHOST),
             InitConfig = [{<<"roomname">>, <<"Bob's room">>}],
             escalus:send(Bob, stanza_create_room(undefined, InitConfig, [])),
             verify_aff_bcast([{Bob, member}], [{Bob, member}]),
@@ -664,8 +713,9 @@ destroy_room_get_disco_items_empty(Config) ->
 
 destroy_room_get_disco_items_one_left(Config) ->
     escalus:story(Config, [{alice, 1}, {bob, 1}, {kate, 1}], fun(Alice, Bob, Kate) ->
-        {ok, {?ROOM2, ?MUCHOST}} = create_room(?ROOM2, ?MUCHOST, kate,
-                                               [bob, alice], Config, ver(0)),
+        MucHost = ?MUCHOST,
+        {ok, {?ROOM2, MucHost}} = create_room(?ROOM2, ?MUCHOST, kate,
+                                              [bob, alice], Config, ver(0)),
         ProperJID = room_bin_jid(?ROOM2),
         %% alie destroy her room
         escalus:send(Alice, stanza_destroy_room(?ROOM)),
@@ -679,19 +729,34 @@ destroy_room_get_disco_items_one_left(Config) ->
 
 set_config(Config) ->
     escalus:story(Config, [{alice, 1}, {bob, 1}, {kate, 1}], fun(Alice, Bob, Kate) ->
+            TS = instrument_helper:timestamp(),
             ConfigChange = [{<<"roomname">>, <<"The Coven">>}],
-            escalus:send(Alice, stanza_config_set(?ROOM, ConfigChange)),
-            foreach_recipient([Alice, Bob, Kate], config_msg_verify_fun(ConfigChange)),
-            escalus:assert(is_iq_result, escalus:wait_for_stanza(Alice))
+            change_room_config(Alice, [Alice, Bob, Kate], ConfigChange),
+            assert_cache_miss_event(TS, 1, room_bin_jid(?ROOM))
+        end).
+
+set_partial_config(Config) ->
+    escalus:story(Config, [{alice, 1}, {bob, 1}, {kate, 1}], fun(Alice, Bob, Kate) ->
+            FinalRoomName = <<"The Coven">>,
+            %% Change all the config
+            ConfigChange = [{<<"roomname">>, FinalRoomName}, {<<"subject">>, <<"Evil Ravens">>}],
+            change_room_config(Alice, [Alice, Bob, Kate], ConfigChange),
+            %% Now change only the subject
+            ConfigChange2 = [{<<"subject">>, <<"Good Ravens">>}],
+            change_room_config(Alice, [Alice, Bob, Kate], ConfigChange2),
+            %% Verify that roomname is still the original change
+            escalus:send(Alice, stanza_config_get(?ROOM, ver(1))),
+            IQRes = escalus:wait_for_stanza(Alice),
+            escalus:assert(is_iq_result, IQRes),
+            RoomName = exml_query:path(IQRes, [{element, <<"query">>}, {element, <<"roomname">>}, cdata]),
+            ?assertEqual(FinalRoomName, RoomName)
         end).
 
 set_config_with_custom_schema(Config) ->
     escalus:story(Config, [{alice, 1}, {bob, 1}, {kate, 1}], fun(Alice, Bob, Kate) ->
             ConfigChange = [{<<"background">>, <<"builtin:unicorns">>},
                             {<<"music">>, <<"builtin:rainbow">>}],
-            escalus:send(Alice, stanza_config_set(?ROOM, ConfigChange)),
-            foreach_recipient([Alice, Bob, Kate], config_msg_verify_fun(ConfigChange)),
-            escalus:assert(is_iq_result, escalus:wait_for_stanza(Alice))
+            change_room_config(Alice, [Alice, Bob, Kate], ConfigChange)
         end).
 
 deny_config_change_that_conflicts_with_schema(Config) ->
@@ -707,10 +772,7 @@ assorted_config_doesnt_lead_to_duplication(Config) ->
             ConfigChange = [{<<"subject">>, <<"Elixirs">>},
                             {<<"roomname">>, <<"The Coven">>},
                             {<<"subject">>, <<"Elixirs">>}],
-            ConfigSetStanza = stanza_config_set(?ROOM, ConfigChange),
-            escalus:send(Alice, ConfigSetStanza),
-            foreach_recipient([Alice, Bob, Kate], config_msg_verify_fun(ConfigChange)),
-            escalus:assert(is_iq_result, escalus:wait_for_stanza(Alice)),
+            change_room_config(Alice, [Alice, Bob, Kate], ConfigChange),
 
             Stanza = stanza_config_get(?ROOM, <<"oldver">>),
             VerifyFun = fun(Incoming) ->
@@ -723,6 +785,7 @@ assorted_config_doesnt_lead_to_duplication(Config) ->
 
 remove_and_add_users(Config) ->
     escalus:story(Config, [{alice, 1}, {bob, 1}, {kate, 1}], fun(Alice, Bob, Kate) ->
+            TS = instrument_helper:timestamp(),
             AffUsersChanges1 = [{Bob, none}, {Kate, none}],
             escalus:send(Alice, stanza_aff_set(?ROOM, AffUsersChanges1)),
             verify_aff_bcast([{Alice, owner}], AffUsersChanges1),
@@ -730,6 +793,16 @@ remove_and_add_users(Config) ->
             AffUsersChanges2 = [{Bob, member}, {Kate, member}],
             escalus:send(Alice, stanza_aff_set(?ROOM, AffUsersChanges2)),
             verify_aff_bcast([{Alice, owner}, {Bob, member}, {Kate, member}], AffUsersChanges2),
+            escalus:assert(is_iq_result, escalus:wait_for_stanza(Alice)),
+            assert_cache_miss_event(TS, 1, room_bin_jid(?ROOM)),
+            assert_cache_hit_event(TS, 1, room_bin_jid(?ROOM))
+        end).
+
+multiple_owner_change(Config) ->
+    escalus:story(Config, [{alice, 1}, {bob, 1}, {kate, 1}], fun(Alice, Bob, Kate) ->
+            AffUsersChanges2 = [{Bob, owner}],
+            escalus:send(Alice, stanza_aff_set(?ROOM, AffUsersChanges2)),
+            verify_aff_bcast([{Alice, owner}, {Bob, owner}, {Kate, member}], AffUsersChanges2),
             escalus:assert(is_iq_result, escalus:wait_for_stanza(Alice))
         end).
 
@@ -740,6 +813,16 @@ explicit_owner_change(Config) ->
             verify_aff_bcast([{Kate, owner}], AffUsersChanges1),
             escalus:assert(is_iq_result, escalus:wait_for_stanza(Alice))
         end).
+
+explicit_owner_handover(Config) ->
+    % check that Alice looses ownership when Kate is set to owner
+    escalus:story(Config, [{alice, 1}, {bob, 1}, {kate, 1}], fun(Alice, Bob, Kate) ->
+        ReqAffUsersChanges = [{Kate, owner}],
+        escalus:send(Alice, stanza_aff_set(?ROOM, ReqAffUsersChanges)),
+        ExpectedAffUserChanges = [{Alice, member} | ReqAffUsersChanges],
+        verify_aff_bcast([{Kate, owner}, {Alice, member}, {Bob, member}], ExpectedAffUserChanges),
+        escalus:assert(is_iq_result, escalus:wait_for_stanza(Alice))
+    end).
 
 implicit_owner_change(Config) ->
     escalus:story(Config, [{alice, 1}, {bob, 1}, {kate, 1}], fun(Alice, Bob, Kate) ->
@@ -764,11 +847,12 @@ adding_wrongly_named_user_triggers_infinite_loop(Config)->
             escalus:send(Alice, generate_buggy_aff_staza(BuggyRoomName, Username)),
             timer:sleep(300),
             AUsername = lbin(escalus_users:get_username(Config, alice)),
-            Host = lbin(escalus_users:get_host(Config, alice)),
+            Host = lbin(escalus_users:get_server(Config, alice)),
             Resource = <<"res1">>,
             JID = mongoose_helper:make_jid(AUsername, Host, Resource),
+            ct:log("JID ~p", [JID]),
             SessionRecPid = rpc(ejabberd_sm, get_session, [JID]),
-            {{AUsername, Host, Resource}, {_, Pid}, _, _} = SessionRecPid,
+            {session, {_,Pid}, {AUsername, Host, Resource}, _, _, _} = SessionRecPid,
             %% maybe throws exception
             assert_process_memory_not_growing(Pid, 0, 2),
             escalus:wait_for_stanzas(Alice, 2)
@@ -779,7 +863,6 @@ adding_wrongly_named_user_triggers_infinite_loop(Config)->
 rooms_per_user(Config) ->
     escalus:story(Config, [{alice, 1}, {bob, 1}, {kate, 1}, {mike, 1}],
                   fun(Alice, Bob, Kate, Mike) ->
-            set_mod_config(rooms_per_user, 1, ?MUCHOST),
             escalus:send(Bob, stanza_create_room(undefined, [], [])),
             escalus:assert(is_error, [<<"modify">>, <<"bad-request">>],
                            escalus:wait_for_stanza(Bob)),
@@ -798,7 +881,6 @@ rooms_per_user(Config) ->
 max_occupants(Config) ->
     escalus:story(Config, [{alice, 1}, {bob, 1}, {kate, 1}, {mike, 1}],
                   fun(Alice, Bob, Kate, Mike) ->
-            set_mod_config(max_occupants, 1, ?MUCHOST),
             escalus:send(Bob, stanza_create_room(undefined, [], [{Alice, member}, {Kate, member}])),
             escalus:assert(is_error, [<<"modify">>, <<"bad-request">>],
                            escalus:wait_for_stanza(Bob)),
@@ -821,7 +903,6 @@ manage_blocklist(Config) ->
             QueryEl1 = exml_query:subelement(GetResult1, <<"query">>),
             verify_blocklist(QueryEl1, []),
             Domain = domain(),
-
             BlocklistChange1 = [{user, deny, <<"user@", Domain/binary>>},
                                 {room, deny, room_bin_jid(?ROOM)}],
             escalus:send(Alice, stanza_blocking_set(BlocklistChange1)),
@@ -880,7 +961,6 @@ block_user(Config) ->
             verify_no_stanzas([Alice, Bob, Kate]),
 
             % But Kate can add Bob to the main room!
-            set_mod_config(all_can_invite, true, ?MUCHOST),
             BobReadd = [{Bob, member}],
             SuccessStanza = stanza_aff_set(?ROOM, BobReadd),
             escalus:send(Kate, SuccessStanza),
@@ -892,12 +972,10 @@ block_user(Config) ->
 
 blocking_disabled(Config) ->
     escalus:story(Config, [{alice, 1}], fun(Alice) ->
-            set_mod_config(blocking, false, ?MUCHOST),
             escalus:send(Alice, stanza_blocking_get()),
             escalus:assert(is_error, [<<"modify">>, <<"bad-request">>],
                            escalus:wait_for_stanza(Alice)),
             Domain = domain(),
-
             BlocklistChange1 = [{user, deny, <<"user@", Domain/binary>>},
                                 {room, deny, room_bin_jid(?ROOM)}],
             escalus:send(Alice, stanza_blocking_set(BlocklistChange1)),
@@ -908,6 +986,12 @@ blocking_disabled(Config) ->
 %%--------------------------------------------------------------------
 %% Subroutines
 %%--------------------------------------------------------------------
+
+-spec change_room_config(escalus:client(), [escalus:client()], list({binary(), binary()})) -> term().
+change_room_config(User, Users, ConfigChange) ->
+    escalus:send(User, stanza_config_set(?ROOM, ConfigChange)),
+    foreach_recipient(Users, config_msg_verify_fun(ConfigChange)),
+    escalus:assert(is_iq_result, escalus:wait_for_stanza(User)).
 
 -spec get_disco_rooms(User :: escalus:client()) -> list(xmlel()).
 get_disco_rooms(User) ->
@@ -952,20 +1036,11 @@ stanza_aff_get(Room, Ver) ->
 %% IQ setters
 %%--------------------------------------------------------------------
 
--spec stanza_blocking_set(BlocklistChanges :: [ct_block_item()]) -> xmlel().
-stanza_blocking_set(BlocklistChanges) ->
-    Items = [#xmlel{ name = list_to_binary(atom_to_list(What)),
-                     attrs = [{<<"action">>, list_to_binary(atom_to_list(Action))}],
-                     children = [#xmlcdata{ content = Who }] }
-             || {What, Action, Who} <- BlocklistChanges],
-    escalus_stanza:to(escalus_stanza:iq_set(?NS_MUC_LIGHT_BLOCKING, Items), ?MUCHOST).
-
-
 -spec stanza_destroy_room(Room :: binary()) -> xmlel().
 stanza_destroy_room(Room) ->
     escalus_stanza:to(escalus_stanza:iq_set(?NS_MUC_LIGHT_DESTROY, []), room_bin_jid(Room)).
 
--spec stanza_config_set(Room :: binary(), ConfigChanges :: [{binary(), binary()}]) -> xmlel().
+-spec stanza_config_set(Room :: binary(), ConfigChanges :: [muc_light_helper:config_item()]) -> xmlel().
 stanza_config_set(Room, ConfigChanges) ->
     Items = [ kv_el(Key, Value) || {Key, Value} <- ConfigChanges],
     escalus_stanza:to(
@@ -981,7 +1056,7 @@ verify_blocklist(Query, ProperBlocklist) ->
     BlockedRooms = exml_query:subelements(Query, <<"room">>),
     BlockedUsers = exml_query:subelements(Query, <<"user">>),
     BlockedItems = [{list_to_atom(binary_to_list(What)), list_to_atom(binary_to_list(Action)), Who}
-                    || #xmlel{name = What, attrs = [{<<"action">>, Action}],
+                    || #xmlel{name = What, attrs = #{<<"action">> := Action},
                               children = [#xmlcdata{ content = Who }]}
                        <- BlockedRooms ++ BlockedUsers],
     ProperBlocklistLen = length(ProperBlocklist),
@@ -1007,7 +1082,7 @@ verify_no_stanzas(Users) ->
               {false, _} = {escalus_client:has_stanzas(User), User}
       end, Users).
 
--spec verify_config(ConfigRoot :: xmlel(), Config :: [{binary(), binary()}]) -> ok.
+-spec verify_config(ConfigRoot :: xmlel(), Config :: [muc_light_helper:config_item()]) -> ok.
 verify_config(ConfigRoot, Config) ->
     lists:foreach(
       fun({Key, Val}) ->
@@ -1018,7 +1093,7 @@ verify_config(ConfigRoot, Config) ->
 %% Verification funs generators
 %%--------------------------------------------------------------------
 
--spec config_msg_verify_fun(RoomConfig :: [{binary(), binary()}]) -> verify_fun().
+-spec config_msg_verify_fun(RoomConfig :: [muc_light_helper:config_item()]) -> verify_fun().
 config_msg_verify_fun(RoomConfig) ->
     fun(Incoming) ->
             escalus:assert(is_groupchat_message, Incoming),
@@ -1035,14 +1110,12 @@ config_msg_verify_fun(RoomConfig) ->
               end, RoomConfig)
     end.
 
--spec config_iq_verify_fun(RoomConfig :: [{string(), string()}]) -> verify_fun().
+-spec config_iq_verify_fun(RoomConfig :: [muc_light_helper:config_item()]) -> verify_fun().
 config_iq_verify_fun(RoomConfig) ->
     fun(Incoming) ->
             [Query] = exml_query:subelements(Incoming, <<"query">>),
             ?NS_MUC_LIGHT_CONFIGURATION = exml_query:attr(Query, <<"xmlns">>),
-            BinaryRoomConfig = [{list_to_binary(K), list_to_binary(V)}
-                                || {K, V} <- RoomConfig],
-            verify_config(Query, BinaryRoomConfig)
+            verify_config(Query, RoomConfig)
     end.
 
 -spec aff_iq_verify_fun(AffUsers :: ct_aff_users(), Version :: binary()) -> verify_fun().
@@ -1057,8 +1130,8 @@ aff_iq_verify_fun(AffUsers, Version) ->
     end.
 
 -spec info_iq_verify_fun(AffUsers :: ct_aff_users(), Version :: binary(),
-                         ConfigKVBin :: [{binary(), binary()}]) -> verify_fun().
-info_iq_verify_fun(AffUsers, Version, ConfigKVBin) ->
+                         ConfigKV :: [muc_light_helper:config_item()]) -> verify_fun().
+info_iq_verify_fun(AffUsers, Version, ConfigKV) ->
     BinAffUsers = bin_aff_users(AffUsers),
     fun(Incoming) ->
             [Query] = exml_query:subelements(Incoming, <<"query">>),
@@ -1068,7 +1141,7 @@ info_iq_verify_fun(AffUsers, Version, ConfigKVBin) ->
                                           {element, <<"user">>}]),
             verify_aff_users(UsersItems, BinAffUsers),
             ConfigurationEl = exml_query:subelement(Query, <<"configuration">>),
-            verify_config(ConfigurationEl, ConfigKVBin)
+            verify_config(ConfigurationEl, ConfigKV)
     end.
 
 -spec verify_user_has_one_room(User :: escalus:client()) -> any().
@@ -1105,45 +1178,26 @@ assert_process_memory_not_growing(Pid, OldMemory, Counter) ->
                  end,
   assert_process_memory_not_growing(Pid, Memory, NewCounter).
 
--spec common_custom_config() -> list().
-common_custom_config() -> [{"background", "builtin:hell"}, {"music", "builtin:screams"}].
+assert_cache_hit_event(TS, Count, Jid) ->
+    assert_cache_event(TS, Count, Jid, hits).
 
--spec default_schema_definition() -> list().
-default_schema_definition() ->
-    rpc(mod_muc_light, default_schema_definition, []).
+assert_cache_miss_event(TS, Count, Jid) ->
+    assert_cache_event(TS, Count, Jid, misses).
 
--spec standard_default_config() -> list().
-standard_default_config() ->
-    % Default schema definition is actually a proplist with the option name as a key
-    % and the default as a value, but we verify it to avoid strange errors.
-    DefaultConfig = default_schema_definition(),
-    lists:foreach(fun({K, V}) when is_list(K), is_list(V) -> ok end, DefaultConfig),
-    DefaultConfig.
+assert_cache_event(TS, Count, BinJid, CacheResult) ->
+    F = fun(#{jid := Jid, CacheResult := 1, latency := T}) ->
+            eq_bjid(Jid, BinJid) andalso pos_int(T)
+        end,
+    instrument_helper:assert(
+        user_cache_lookup,
+        #{host_type => host_type(), cache_name => cache_name()},
+        F,
+        % Due to implementation, for every lookup the event is raised two times
+        #{min_timestamp => TS, expected_count => Count * 2}
+    ).
 
--spec set_default_mod_config() -> ok.
-set_default_mod_config() ->
-    lists:foreach(
-      fun({K, V}) -> set_mod_config(K, V, ?MUCHOST) end,
-      [
-       {equal_occupants, false},
-       {rooms_per_user, infinity},
-       {blocking, true},
-       {all_can_configure, false},
-       {all_can_invite, false},
-       {max_occupants, infinity},
-       {rooms_per_page, infinity}
-      ]).
-
--spec set_custom_config(UserDefSchema :: list()) -> any().
-set_custom_config(UserDefSchema) ->
-    ConfigSchema = rpc(mod_muc_light_room_config, schema_from_definition, [UserDefSchema]),
-
-    % Valid default config is a proplist
-    [_|_] = DefaultConfig = rpc(mod_muc_light_room_config, default_from_schema, [ConfigSchema]),
-
-    set_mod_config(config_schema, ConfigSchema, ?MUCHOST),
-    set_mod_config(default_config, DefaultConfig, ?MUCHOST).
-
-domain() ->
-    ct:get_config({hosts, mim, domain}).
-
+-spec custom_schema() -> [muc_light_helper:schema_item()].
+custom_schema() ->
+    % This list needs to be sorted
+    [{<<"background">>, <<"builtin:hell">>, background, binary},
+     {<<"music">>, <<"builtin:screams">>, music, binary}].
